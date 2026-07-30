@@ -652,9 +652,22 @@ fn merge_table(dst: &mut toml_edit::Table, src: &toml_edit::Table) {
                 if let (Some(decor), Some(v)) = (decor, item.as_value_mut()) {
                     *v.decor_mut() = decor;
                 }
-                // `IndexMap::insert` keeps the *existing* key, and a comment written above
-                // a key-value line is that key's decor — so it survives too.
-                dst.insert(key, item);
+                // A comment written on its own line ABOVE a `key = value` line is the
+                // **key's** prefix decor, not the value's, and `Table::insert` installs a
+                // fresh `Key` — which silently drops it. `insert_formatted`, given the key
+                // already in the document, is the only call that keeps both decors. This
+                // matters because `config.example.toml` — the file `config init` writes —
+                // documents every field with exactly that shape, so the naive insert
+                // stripped a user's whole config of its comments on the first `config set`.
+                // Same idiom as `catalog.rs`, which has the same requirement.
+                match dst.key(key).cloned() {
+                    Some(existing) => {
+                        dst.insert_formatted(&existing, item);
+                    }
+                    None => {
+                        dst.insert(key, item);
+                    }
+                }
             }
         }
     }
@@ -1198,6 +1211,60 @@ mod tests {
         let again = Config::load_from(Some(&p), None).expect("reload");
         assert_eq!(again, c);
         assert_eq!(mode_of(&p), FILE_MODE);
+    }
+
+    /// The shape `config.example.toml` is made of: a comment on its **own line, above** a
+    /// `key = value` line, inside a table.
+    ///
+    /// This is the key's prefix decor rather than the value's, and it is the case the
+    /// sibling test above does not reach — that one covers a comment above a `[table]`
+    /// header (the table's own decor) and a trailing comment after a value (the value's
+    /// suffix decor), both of which survived even the naive `Table::insert`. `config init`
+    /// writes `config.example.toml` verbatim, and every field in it is documented in this
+    /// third shape, so getting it wrong stripped a user's entire config of its comments on
+    /// the first `apexrouter config set`.
+    #[test]
+    fn a_comment_above_a_key_survives_a_save_that_changes_that_key() {
+        let d = tmp();
+        let p = d.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "[server]\n\
+             # Data plane: the one base URL every agent on this machine points at.\n\
+             proxy_bind = \"127.0.0.1:9001\"\n\
+             # Control plane: REST + WebSocket + /metrics + the embedded web UI.\n\
+             control_bind = \"127.0.0.1:2739\"\n\
+             \n\
+             [router]\n\
+             # How many requests may be in flight at once.\n\
+             max_inflight = 3\n",
+        )
+        .expect("write");
+
+        let mut c = Config::load_from(Some(&p), None).expect("load");
+        assert_eq!(c.server.proxy_bind, "127.0.0.1:9001");
+        assert_eq!(c.router.max_inflight, 3);
+        // Change one of the documented keys: its own comment, and every sibling's, must live.
+        c.router.max_inflight = 7;
+        c.save_to(&p).expect("save");
+
+        let text = std::fs::read_to_string(&p).expect("read back");
+        for comment in [
+            "# Data plane: the one base URL every agent on this machine points at.",
+            "# Control plane: REST + WebSocket + /metrics + the embedded web UI.",
+            "# How many requests may be in flight at once.",
+        ] {
+            assert!(text.contains(comment), "above-key comment lost:\n{text}");
+        }
+        assert!(
+            text.contains("max_inflight = 7"),
+            "new value missing:\n{text}"
+        );
+        assert!(
+            text.contains("proxy_bind = \"127.0.0.1:9001\""),
+            "an untouched value must keep its value:\n{text}"
+        );
+        assert_eq!(Config::load_from(Some(&p), None).expect("reload"), c);
     }
 
     #[test]
