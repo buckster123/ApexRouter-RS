@@ -23,7 +23,7 @@
 //! `~/.vastai-gguf`, so CI stays green off this laptop. Run with `--nocapture` to read the
 //! numbers; they are the gate report.
 
-use apexrouter_core::config::{Config, EndpointsCfg};
+use apexrouter_core::config::{CompatCfg, Config, EndpointsCfg};
 use apexrouter_core::discover::{
     choose_build, discover_builds, discover_models, probe_devices, read_gguf_meta,
 };
@@ -1239,11 +1239,52 @@ fn real_legacy_usage_log_reads_cleanly_through_the_public_reader() {
             r.cost_usd,
         );
     }
-    assert_eq!(
+    // "Every legacy row must survive" is a property of the READER, so it must be measured
+    // against the legacy file alone. `read_all` merges `$STATE/usage.jsonl` on top, and on a
+    // machine where apexrouterd has ever served a request that file is non-empty — so
+    // `rows.len() == on_disk` is only true on a box that has never run the daemon. It went
+    // red for the first time during the MK1-CORE acceptance run, for a reason that has
+    // nothing to do with legacy parsing.
+    //
+    // The state-independent form of the same criterion: every line of the real legacy file is
+    // represented in the merged result. A row the mirror already duplicated is de-duped away
+    // as a *legacy* row, but the identical `usage.jsonl` row carrying the same five legacy
+    // columns is still there, so it is still "surviving" in the only sense that matters.
+    let state_only = usage::read_all(
+        &paths,
+        &CompatCfg {
+            read_legacy_state: false,
+            ..cfg.compat.clone()
+        },
+    )
+    .expect("usage::read_all without the legacy log");
+    assert!(
+        rows.len() >= state_only.len(),
+        "merging the legacy log may only ever add rows: {} merged < {} from $STATE alone",
         rows.len(),
-        on_disk,
-        "every legacy row must survive: zero failed rows is the acceptance criterion"
+        state_only.len()
     );
+    for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("every legacy line is a JSON object");
+        let want = (
+            v["timestamp"].as_str().unwrap_or_default().to_owned(),
+            v["provider"].as_str().unwrap_or_default().to_owned(),
+            v["model_id"].as_str().unwrap_or_default().to_owned(),
+            v["prompt_tokens"].as_u64().unwrap_or_default() as u32,
+            v["completion_tokens"].as_u64().unwrap_or_default() as u32,
+        );
+        assert!(
+            rows.iter().any(|r| (
+                r.timestamp.clone(),
+                r.provider.clone(),
+                r.model_id.clone(),
+                r.prompt_tokens,
+                r.completion_tokens,
+            ) == want),
+            "legacy row dropped by the reader: {line}"
+        );
+    }
 
     // The float `epoch` and the one row that has none.
     assert!(

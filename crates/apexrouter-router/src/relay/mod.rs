@@ -11,4 +11,4 @@ pub mod stream;
 
 pub use body::{normalize_path, peek, plan_body, BodyPlan, RequestPeek};
 pub use headers::{outbound_headers, response_headers};
-pub use stream::{sse_response, UsageTee};
+pub use stream::{sse_response, FinishFn, StreamOutcome, UsageTee};

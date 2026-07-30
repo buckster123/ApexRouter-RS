@@ -1461,7 +1461,8 @@ leaves the caller free to keep the old table.
 **R-02 · resolve + policy** — owns `router/src/resolve.rs`, `router/src/policy.rs`
 ```rust
 pub struct Plan { pub candidates: SmallVecLike<Candidate>, pub reason: RouteReason,
-                  pub alias: Option<Alias>, pub rewrite_model_to: Option<String> }
+                  pub alias: Option<Alias>, pub rewrite_model_to: Option<String>,
+                  pub retry: RetryPolicy }
 pub struct Candidate { pub backend: Arc<LiveBackend>, pub upstream_model: String }
 pub enum RequestClass { Models, Chat, Completion, Embedding, Rerank, Opaque }
 pub enum RouteError { NoRoute { known: Vec<String> }, NoHealthy { alias: Alias },
@@ -1477,7 +1478,10 @@ pub fn order_candidates(strategy: Strategy, cands: &mut Vec<Candidate>);
 *Acceptance*: a table test proves each of the six rules in order, including `"x"` → default
 (`LegacyModelName`) and an unknown name → `NoRoute` under `Reject`. `resolve` takes no `&mut`,
 performs no I/O, and does not allocate on the alias hit path (bench-asserted `< 200 ns`).
-`Cheapest` orders by `per_mtok`, with `Unknown` prices last.
+`Cheapest` orders by `per_mtok`, with `Unknown` prices last. **`Plan::retry` carries the matched
+route's own `[retry]` block** (`ARCHITECTURE.md` §4.2) — a test proves a non-default route's policy
+reaches the plan, that the *matched* route's policy is used rather than the default route's, and
+that rules 2/3/4, which name a backend and not a route, carry `RetryPolicy::default()`.
 
 **R-03 · headers + body plan** — owns `router/src/relay/headers.rs`, `router/src/relay/body.rs`
 ```rust
@@ -1503,8 +1507,8 @@ float formatting inside `tools[]`, is byte-identical apart from `model`. `normal
 **R-04 · attempt state machine + breaker + limits** — owns `router/src/attempt.rs`,
 `router/src/breaker.rs`, `router/src/limits.rs`
 ```rust
-pub struct PreFlight<'a> { /* candidate, body plan, headers, deadline, cfg */ }
-pub struct Committed { /* upstream Response + the InFlightGuard it owns */ }
+pub struct PreFlight<'a> { /* candidate, body plan, headers, deadline, cfg, retry */ }
+pub struct Committed { pub response: reqwest::Response, pub guard: Option<InFlightGuard> }
 pub enum Retryable { Connect(String), Timeout, Status { code: u16, retry_after: Option<Duration> } }
 /// The retry loop consumes PreFlight values and can only exit by producing a Committed.
 pub async fn attempt(p: PreFlight<'_>) -> std::result::Result<Committed, Retryable>;
@@ -1526,21 +1530,41 @@ pub struct TokenBucket { /* per-backend retry budget */ }
 *Acceptance*: a test drops a `Committed` mid-stream and asserts the permit count returns to full and
 exactly one `RequestFinished { aborted: true }` was broadcast — **the disconnect-leak regression
 test**. The breaker requires `min_volume` (5) observations before opening; half-open admits exactly
-one probe; `Retry-After` is honoured. There is no code path that calls `attempt` twice on the same
-`PreFlight` (enforced by ownership).
+one probe; `Retry-After` is honoured **when `PreFlight::retry.honor_retry_after` says to**, and is
+not even read when it does not. There is no code path that calls `attempt` twice on the same
+`PreFlight` (enforced by ownership). `Committed`'s fields are public because R-05 destructures it:
+the relay takes the response and the guard, and there is exactly one relay.
 
 **R-05 · SSE relay + usage tee** — owns `router/src/relay/stream.rs`
 ```rust
-pub fn sse_response(c: Committed, cfg: &RouterCfg, tx: broadcast::Sender<Event>,
-                    guard: InFlightGuard) -> axum::response::Response;
+/// The relay hands the guard back, plus everything it learned, exactly once — from its Drop,
+/// so a client disconnect settles the record instead of losing it. `StreamOutcome::aborted`
+/// says whether the client or the upstream went first.
+pub type FinishFn = Box<dyn FnOnce(Option<InFlightGuard>, StreamOutcome) + Send>;
+pub fn sse_response(c: Committed, cfg: &RouterCfg, on_end: FinishFn) -> axum::response::Response;
+pub struct StreamOutcome { /* bytes, newlines, usage, timings, aborted, ended_mid_stream,
+                              idle_timeout, total_ms, streamed — all pub */ }
+impl StreamOutcome {
+    pub fn prompt_tokens(&self) -> Option<TokenCount>;   // reported or None; never estimated
+    pub fn completion_tokens(&self) -> TokenCount;       // degrades to Estimated, never to zero
+    pub fn cached_tokens(&self) -> Option<u32>;
+    pub fn tok_per_s(&self) -> Option<f32>;              // READ from timings, never stopwatched
+    pub fn error(&self) -> Option<&'static str>;
+}
 pub struct UsageTee { /* rolling tail buffer, bounded */ }
 impl UsageTee { pub fn feed(&mut self, chunk: &[u8]); pub fn finish(self) -> Option<(UsageFields, Option<Timings>)>; }
 ```
+**This is the crate's only SSE relay.** R-08 calls it and owns no framing code of its own; a second
+copy of these rules is the bug this signature exists to prevent. `sse_response` builds the response
+headers (hop-by-hop dropped, streaming-only added) and R-08 stamps the observability headers onto
+what it returns.
+
 *Acceptance*: bytes are relayed **verbatim** — a fixture replay of a real llama.cpp SSE capture and
 a real Together SSE capture produces byte-identical output. `Content-Type: text/event-stream` is
 forced **only** when upstream is 2xx and already says so; a `400` JSON body on `stream:true` comes
 back as JSON. An idle gap longer than `idle_timeout_ms` aborts; there is **no total timeout**. When
-the upstream ends mid-stream, exactly one synthetic
+the upstream ends mid-stream — **including a clean EOF with no `data: [DONE]` terminator, which is a
+truncation** — exactly one synthetic
 `data: {"error":{"message":"upstream ended mid-stream","type":"upstream_unavailable"}}` frame plus
 `data: [DONE]` is emitted. The tee never delays a byte (test: measured chunk-arrival→chunk-emit
 latency < 1 ms) and a malformed tail degrades to `TokenCount::Estimated`.
@@ -1589,7 +1613,13 @@ pub async fn proxy_handler(State(r): State<Router>, req: Request) -> Response;
 *Acceptance*: `proxy_router()` merged with any other router does **not** panic (explicit test).
 The full pipeline of §4.3 is exercised against a `wiremock` upstream: routing, retry on 502,
 no-retry-after-first-byte, 413 on an oversized body, 508 on a `Via` loop, `X-ApexRouter-Route` on
-every response. The handler also **owns the `(ingress, upstream)` matrix dispatch** of
+every response. The retry loop is bounded by **`Plan::retry`** (R-02), not by
+`RetryPolicy::default()` — proven by a test where a per-route `attempts = 1` stops one candidate
+short of where the default policy succeeds, and one where a route carrying the default still fails
+over. Streaming is delegated to **R-05's `sse_response`**; this file holds no frame rules, no idle
+timeout and no tee of its own, and a raw-TCP fixture (chunk sizes 1/3/7/33/64/4096, a timing proof
+that the first chunk is not buffered, and a usage tee round trip) runs end-to-end through
+`proxy_router` against it. The handler also **owns the `(ingress, upstream)` matrix dispatch** of
 `ARCHITECTURE.md` §3.4: it records `RequestRecord.ingress`, relays for `OpenAi→OpenAi` and
 `Anthropic→Anthropic`, returns `501` with an **OpenAI-shaped** body for `OpenAi→Anthropic`, and for
 `Anthropic→OpenAi` calls into `router/src/anthropic/` — stubbed by Stage 0, filled in by **R-10**

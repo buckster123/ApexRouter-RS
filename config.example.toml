@@ -40,6 +40,13 @@ ui_dir = ""
 drain_timeout_secs = 30
 # May a mutating CLI verb start the daemon if it is not running?
 autostart = true
+# Origins allowed to read a PROXY-listener response from a browser. Empty emits no CORS
+# header at all. LocalRouter's endpoint_proxy.py defaulted to `Access-Control-Allow-Origin:
+# *` on every proxied response; ApexRouter does not, because this proxy holds credentials.
+# List an origin ("http://localhost:5173") to have it echoed back, or the single entry "*"
+# to opt back in to the old blanket behaviour. The control listener and every mutating
+# route (`POST /switch`) are never covered by this — §9.3's mutation gate governs there.
+proxy_cors_origins = []
 
 [router]
 # The alias a request lands on when it names no model, names a legacy placeholder

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::OwnedSemaphorePermit;
 
 /// Default retry budget, in tokens per minute, matching `RouterCfg::retry_budget_per_min`.
 const DEFAULT_RETRY_BUDGET_PER_MIN: u32 = 30;
@@ -365,6 +365,7 @@ pub(crate) fn test_record() -> RequestRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::Semaphore;
 
     fn global(bytes: usize) -> Arc<Semaphore> {
         Arc::new(Semaphore::new(bytes))

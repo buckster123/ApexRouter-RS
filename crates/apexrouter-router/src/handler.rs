@@ -27,8 +27,10 @@ use crate::breaker::BreakerDecision;
 use crate::errors::{map_status, openai_error};
 use crate::limits::{InFlightGuard, LimitError};
 use crate::models::{aggregate_models, one_model};
+use crate::relay::stream::is_event_stream;
 use crate::relay::{
-    normalize_path, outbound_headers, peek, plan_body, response_headers, RequestPeek,
+    normalize_path, outbound_headers, peek, plan_body, response_headers, sse_response, RequestPeek,
+    StreamOutcome,
 };
 use crate::resolve::{RequestClass, UnknownModelPolicy};
 use crate::{Router, COLLAPSE_LOG_CAPACITY, RING_CAPACITY};
@@ -37,30 +39,18 @@ use apexrouter_core::secret::Secret;
 use apexrouter_core::upstream::{join_v1, parse_timings, parse_usage, Timings, UsageFields};
 use apexrouter_protocol::{
     Alias, BackendId, CostEstimate, CredentialSource, Event, Protocol, RequestId, RequestRecord,
-    RetryPolicy, RouteReason, TokenCount, UsageRecord,
+    RouteReason, TokenCount, UsageRecord,
 };
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
-use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
-use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// The `Via` token this proxy stamps, and refuses to see twice.
 const VIA_TOKEN: &str = "apexrouter";
-/// How much of a stream's tail is kept for the usage tee. Bounded — a stream is not.
-const TEE_TAIL_BYTES: usize = 64 * 1024;
-/// The one synthetic frame emitted when an upstream dies mid-stream, plus `[DONE]`.
-const MID_STREAM_DEATH: &[u8] = concat!(
-    "data: {\"error\":{\"message\":\"upstream ended mid-stream\",",
-    "\"type\":\"upstream_unavailable\"}}\n\n",
-    "data: [DONE]\n\n"
-)
-.as_bytes();
 
 /// The axum `Router` for the PROXY listener.
 ///
@@ -130,7 +120,7 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
     // ---- /v1 normalisation ----------------------------------------------------------------
     let (path, collapsed) = normalize_path(&raw_path);
     if collapsed {
-        note_collapse(&r, &headers, &path).await;
+        note_collapse(&r, &headers, &path);
     }
 
     // ---- ingress ---------------------------------------------------------------------------
@@ -233,7 +223,10 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
     };
 
     // ---- the retry loop ---------------------------------------------------------------------------
-    let policy = RetryPolicy::default();
+    // **The route's own `[retry]` block**, carried here by `Plan::retry` (R-02). A route that
+    // declared none was compiled with `RetryPolicy::default()`, so the config-wide default is
+    // what a per-route override overrides — the key is never silently ignored.
+    let policy = plan.retry;
     // `headers_timeout_ms` is what ONE attempt gets to produce response headers, and it is
     // long by design: a non-streaming completion on a 100B model sends none until generation
     // finishes. The wall-clock budget therefore has to span every attempt the policy allows.
@@ -332,6 +325,14 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
         draft.backend = Some(meta.id.clone());
         draft.upstream_model = Some(cand.upstream_model.clone());
 
+        // …and the record that `Drop` broadcasts. `InFlightGuard::drop` returns silently
+        // when `record` is `None`, so leaving it unset made the whole abort path a no-op:
+        // a client that hung up produced no event, no ring row and no usage line, which is
+        // precisely the zombie row `ARCHITECTURE.md` §4.3 says cannot happen. `relay` seals
+        // a real record on every outcome it sees, so this only ever ships when the request
+        // task itself is cancelled mid-flight.
+        guard.record = Some(draft.seal(Outcome::abandoned()));
+
         if r.events.receiver_count() > 0 {
             let _ = r.events.send(Event::RequestStarted {
                 id,
@@ -375,28 +376,17 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
             body: body_plan,
             deadline,
             cfg: &cfg.router,
+            retry: policy,
             guard,
         };
 
         match attempt(pre).await {
-            Ok(Committed { response, guard }) => {
-                let Some(guard) = guard else {
-                    return stamp(
-                        error_response(
-                            ingress,
-                            StatusCode::BAD_GATEWAY,
-                            "upstream_unavailable",
-                            "the committed upstream response arrived without its in-flight guard",
-                        ),
-                        draft.stamp_cell(&meta.id, meta.protocol),
-                    );
-                };
+            Ok(committed) => {
                 let protocol = meta.protocol;
                 return relay(
                     r.clone(),
-                    response,
+                    committed,
                     draft,
-                    guard,
                     pk.stream,
                     cfg.router.log_usage,
                     protocol,
@@ -454,14 +444,19 @@ fn via_loops(headers: &HeaderMap) -> bool {
 /// Log a collapsed doubled `/v1` once per `(user-agent, path)`, at debug.
 ///
 /// A genuinely broken client must stay discoverable; a busy one must not flood the log.
-async fn note_collapse(r: &Router, headers: &HeaderMap, path: &str) {
+/// Synchronous: the set is touched for a few nanoseconds with nothing awaited inside, which
+/// is exactly the case a `std::sync::Mutex` is for — and it lets the same bookkeeping run
+/// from a `Drop` on the relay's finish path.
+fn note_collapse(r: &Router, headers: &HeaderMap, path: &str) {
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("-")
         .to_owned();
     let key = (ua, path.to_owned());
-    let mut seen = r.collapse_seen.lock().await;
+    // A poisoned lock means some other request panicked mid-update; the set is a debug-log
+    // de-duplicator, so carrying on with it is strictly better than propagating the panic.
+    let mut seen = r.collapse_seen.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() >= COLLAPSE_LOG_CAPACITY || !seen.insert(key.clone()) {
         return;
     }
@@ -604,15 +599,7 @@ struct RecordDraft {
 
 impl RecordDraft {
     /// Seal the record with its outcome.
-    fn seal(
-        &self,
-        status: u16,
-        streamed: bool,
-        ttft_ms: Option<u32>,
-        usage: Option<UsageFields>,
-        timings: Option<Timings>,
-        error: Option<String>,
-    ) -> RequestRecord {
+    fn seal(&self, o: Outcome) -> RequestRecord {
         RequestRecord {
             id: self.id,
             started_unix: self.started_unix,
@@ -623,20 +610,18 @@ impl RecordDraft {
             ingress: self.ingress,
             method: self.method.clone(),
             path: self.path.clone(),
-            status,
+            status: o.status,
             attempts: self.attempts,
-            streamed,
-            aborted: false,
-            ttft_ms,
+            streamed: o.streamed,
+            aborted: o.aborted,
+            ttft_ms: o.ttft_ms,
             total_ms: millis(self.started.elapsed()),
-            prompt_tokens: usage.map(|u| TokenCount::Reported(u.prompt_tokens)),
-            completion_tokens: usage.map(|u| TokenCount::Reported(u.completion_tokens)),
-            cached_tokens: usage
-                .and_then(|u| u.cached_tokens)
-                .or_else(|| timings.map(|t| t.cache_n)),
-            tok_per_s: timings.map(|t| t.predicted_per_second),
+            prompt_tokens: o.prompt_tokens,
+            completion_tokens: o.completion_tokens,
+            cached_tokens: o.cached_tokens,
+            tok_per_s: o.tok_per_s,
             cost: CostEstimate::Unknown,
-            error,
+            error: o.error,
         }
     }
 
@@ -670,42 +655,47 @@ impl RecordDraft {
 }
 
 /// Relay a committed upstream response. **Past this point there is no retry.**
-#[allow(clippy::too_many_arguments)]
+///
+/// One decision, two shapes: a stream goes to [`sse_response`] — R-05, the crate's only SSE
+/// implementation, which owns the frame rules, the idle timeout and the usage tee — and
+/// everything else is buffered here, because `X-Usage` can only carry real numbers on a body
+/// that has fully arrived.
 async fn relay(
     r: Router,
-    up: reqwest::Response,
+    mut c: Committed,
     draft: RecordDraft,
-    mut guard: InFlightGuard,
     client_asked_to_stream: bool,
     log_usage: bool,
     upstream: Protocol,
 ) -> Response {
-    guard.mark_first_byte();
+    let Some(g) = c.guard.as_mut() else {
+        return stamp(
+            error_response(
+                draft.ingress,
+                StatusCode::BAD_GATEWAY,
+                "upstream_unavailable",
+                "the committed upstream response arrived without its in-flight guard",
+            ),
+            draft.stamp_failed(),
+        );
+    };
+    g.mark_first_byte();
     let ttft_ms = Some(millis(draft.started.elapsed()));
 
-    let status = up.status();
-    let says_sse = up
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim_start().starts_with("text/event-stream"))
-        .unwrap_or(false);
     // `text/event-stream` is forced ONLY when upstream is 2xx *and* already says so: a
-    // `400 {"error":…}` on a `stream: true` request must reach the client as JSON.
-    let streaming = client_asked_to_stream && status.is_success() && says_sse;
+    // `400 {"error":…}` on a `stream: true` request must reach the client as JSON. That rule
+    // is R-05's `is_event_stream`, asked here rather than restated, so this branch and the
+    // relay's own header decoration can never disagree about what a stream is.
+    let status = c.response.status();
+    let streaming = client_asked_to_stream && is_event_stream(status, c.response.headers());
 
-    let mut head = response_headers(up.headers());
-    let idle = Duration::from_millis(r.cfg.load().router.idle_timeout_ms);
-
-    if streaming {
-        set(&mut head, "content-type", "text/event-stream");
-        set(&mut head, "cache-control", "no-cache");
-        set(&mut head, "x-accel-buffering", "no");
-        // Response headers flush before the first chunk and usage arrives in the last one,
-        // so a streaming `X-Usage` would be absent or a lie.
-        set(&mut head, "x-apexrouter-usage-deferred", "true");
-
-        let stamp_set = Stamp {
+    // The stamp is computed here because on the streaming path `draft` moves into the
+    // relay's finish callback. `insert`, never `extend`: an upstream `Via` has to be
+    // replaced by ours rather than appended to.
+    let mut marks = HeaderMap::new();
+    apply(
+        &mut marks,
+        Stamp {
             id: &draft.id,
             alias: draft.alias.as_ref(),
             reason: Some(draft.route_reason),
@@ -714,27 +704,40 @@ async fn relay(
             fallback: draft.fallback,
             ingress: draft.ingress,
             upstream: Some(upstream),
-        };
-        apply(&mut head, stamp_set);
+        },
+    );
 
-        let relay = StreamRelay {
-            inner: Some(Box::pin(up.bytes_stream())),
-            idle,
-            router: r.clone(),
-            draft,
-            guard: Some(guard),
-            status: status.as_u16(),
-            ttft_ms,
-            tail: Vec::new(),
-            log_usage,
-            done: false,
-        };
-        let body = Body::from_stream(futures_util::stream::unfold(relay, step));
-        let mut resp = Response::new(body);
-        *resp.status_mut() = status;
-        *resp.headers_mut() = head;
+    if streaming {
+        // **The one SSE relay** (R-05, `relay::stream`). It builds the response headers,
+        // owns the guard, and calls back exactly once from its `Drop` — on a clean end, an
+        // upstream death, an idle gap or a client disconnect alike, with `aborted` saying
+        // which. Nothing about framing, timeouts or the usage tee lives in this file.
+        let cfg = r.cfg.load_full();
+        let code = status.as_u16();
+        let router = r.clone();
+        let mut resp = sse_response(
+            c,
+            &cfg.router,
+            Box::new(move |guard, out| {
+                finalize(
+                    &router,
+                    &draft,
+                    guard,
+                    Outcome::streamed(code, ttft_ms, &out),
+                    log_usage,
+                );
+            }),
+        );
+        stamp_with(&mut resp, &marks);
         return resp;
     }
+
+    let Committed {
+        response: up,
+        guard,
+    } = c;
+    let mut head = response_headers(up.headers());
+    let idle = Duration::from_millis(r.cfg.load().router.idle_timeout_ms);
 
     // ---- buffered ---------------------------------------------------------------------------
     let body = match tokio::time::timeout(idle, up.bytes()).await {
@@ -744,18 +747,16 @@ async fn relay(
             finalize(
                 &r,
                 &draft,
-                Some(guard),
-                Outcome {
-                    status: StatusCode::BAD_GATEWAY.as_u16(),
-                    streamed: false,
+                guard,
+                Outcome::buffered(
+                    StatusCode::BAD_GATEWAY.as_u16(),
                     ttft_ms,
-                    usage: None,
-                    timings: None,
-                    error: Some(msg.clone()),
-                },
+                    None,
+                    None,
+                    Some(msg.clone()),
+                ),
                 log_usage,
-            )
-            .await;
+            );
             return stamp(
                 error_response(
                     draft.ingress,
@@ -770,18 +771,16 @@ async fn relay(
             finalize(
                 &r,
                 &draft,
-                Some(guard),
-                Outcome {
-                    status: StatusCode::GATEWAY_TIMEOUT.as_u16(),
-                    streamed: false,
+                guard,
+                Outcome::buffered(
+                    StatusCode::GATEWAY_TIMEOUT.as_u16(),
                     ttft_ms,
-                    usage: None,
-                    timings: None,
-                    error: Some("upstream idle timeout".to_owned()),
-                },
+                    None,
+                    None,
+                    Some("upstream idle timeout".to_owned()),
+                ),
                 log_usage,
-            )
-            .await;
+            );
             return stamp(
                 error_response(
                     draft.ingress,
@@ -815,184 +814,117 @@ async fn relay(
     finalize(
         &r,
         &draft,
-        Some(guard),
-        Outcome {
-            status: status.as_u16(),
-            streamed: false,
-            ttft_ms,
-            usage,
-            timings,
-            error: None,
-        },
+        guard,
+        Outcome::buffered(status.as_u16(), ttft_ms, usage, timings, None),
         log_usage,
-    )
-    .await;
+    );
 
     let mut resp = Response::new(Body::from(body));
     *resp.status_mut() = status;
     *resp.headers_mut() = head;
-    stamp(
-        resp,
-        Stamp {
-            id: &draft.id,
-            alias: draft.alias.as_ref(),
-            reason: Some(draft.route_reason),
-            backend: draft.backend.as_ref(),
-            attempts: draft.attempts,
-            fallback: draft.fallback,
-            ingress: draft.ingress,
-            upstream: Some(upstream),
-        },
-    )
-}
-
-/// The state the SSE relay carries between chunks.
-///
-/// It owns the `InFlightGuard`, so a client disconnect drops this struct, cancels the
-/// `reqwest` future, aborts the upstream — freeing llama.cpp's slot — and leaves exactly one
-/// `RequestFinished { aborted: true }` to the guard's `Drop`.
-struct StreamRelay {
-    inner: Option<Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>>,
-    idle: Duration,
-    router: Router,
-    draft: RecordDraft,
-    guard: Option<InFlightGuard>,
-    status: u16,
-    ttft_ms: Option<u32>,
-    /// Bounded tail, for the best-effort usage tee. Never delays a byte.
-    tail: Vec<u8>,
-    log_usage: bool,
-    done: bool,
-}
-
-impl StreamRelay {
-    /// Feed the tee. Bounded, so an hour-long stream costs 64 KiB, not an hour of bytes.
-    fn feed(&mut self, chunk: &[u8]) {
-        self.tail.extend_from_slice(chunk);
-        if self.tail.len() > TEE_TAIL_BYTES {
-            let cut = self.tail.len() - TEE_TAIL_BYTES;
-            self.tail.drain(..cut);
-        }
-    }
-}
-
-/// One step of the SSE relay. Bytes go through **verbatim** — never re-framed, because a
-/// chunk boundary may split an event and every OpenAI SDK buffers on `\n\n`.
-async fn step(mut st: StreamRelay) -> Option<(Result<Bytes, std::io::Error>, StreamRelay)> {
-    if st.done {
-        return None;
-    }
-    let next = {
-        let inner = st.inner.as_mut()?;
-        // There is NEVER a total timeout on a stream — only this inter-chunk idle gap.
-        tokio::time::timeout(st.idle, inner.next()).await
-    };
-    match next {
-        Err(_) => {
-            st.done = true;
-            finish_stream(&mut st, Some("stream idle timeout".to_owned())).await;
-            None
-        }
-        Ok(None) => {
-            st.done = true;
-            finish_stream(&mut st, None).await;
-            None
-        }
-        Ok(Some(Ok(chunk))) => {
-            st.feed(&chunk);
-            Some((Ok(chunk), st))
-        }
-        // Mid-stream upstream death has a defined client-visible behaviour: exactly one
-        // synthetic error frame plus `[DONE]`. Never a silent truncation.
-        Ok(Some(Err(e))) => {
-            st.done = true;
-            st.inner = None;
-            finish_stream(&mut st, Some(e.to_string())).await;
-            Some((Ok(Bytes::from_static(MID_STREAM_DEATH)), st))
-        }
-    }
-}
-
-/// Seal the record for a finished stream.
-async fn finish_stream(st: &mut StreamRelay, error: Option<String>) {
-    let (usage, timings) = scan_tail(&st.tail);
-    let guard = st.guard.take();
-    finalize(
-        &st.router,
-        &st.draft,
-        guard,
-        Outcome {
-            status: st.status,
-            streamed: true,
-            ttft_ms: st.ttft_ms,
-            usage,
-            timings,
-            error,
-        },
-        st.log_usage,
-    )
-    .await;
-}
-
-/// Best-effort: the last `data:` frame that carried a `usage` or `timings` object.
-///
-/// A malformed tail is not an error — the record simply degrades, which is what
-/// `TokenCount::Estimated` exists to say.
-fn scan_tail(tail: &[u8]) -> (Option<UsageFields>, Option<Timings>) {
-    let text = String::from_utf8_lossy(tail);
-    let mut usage = None;
-    let mut timings = None;
-    for line in text.lines().rev() {
-        let payload = line.strip_prefix("data:").unwrap_or(line).trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
-            continue;
-        };
-        if usage.is_none() {
-            usage = parse_usage(&v);
-        }
-        if timings.is_none() {
-            timings = parse_timings(&v);
-        }
-        if usage.is_some() && timings.is_some() {
-            break;
-        }
-    }
-    (usage, timings)
+    stamp_with(&mut resp, &marks);
+    resp
 }
 
 /// What a finished request turned out to be.
+///
+/// The token counts are already `TokenCount`s rather than raw `UsageFields`, because the two
+/// paths degrade differently: a buffered body either reported usage or did not, while a
+/// stream can estimate from its frame count. Both spellings are constructed once, here.
 struct Outcome {
     status: u16,
     streamed: bool,
+    aborted: bool,
     ttft_ms: Option<u32>,
-    usage: Option<UsageFields>,
-    timings: Option<Timings>,
+    prompt_tokens: Option<TokenCount>,
+    completion_tokens: Option<TokenCount>,
+    cached_tokens: Option<u32>,
+    tok_per_s: Option<f32>,
     error: Option<String>,
 }
 
+impl Outcome {
+    /// A buffered response, whose whole body was parsed for `usage` and `timings`.
+    fn buffered(
+        status: u16,
+        ttft_ms: Option<u32>,
+        usage: Option<UsageFields>,
+        timings: Option<Timings>,
+        error: Option<String>,
+    ) -> Outcome {
+        Outcome {
+            status,
+            streamed: false,
+            aborted: false,
+            ttft_ms,
+            prompt_tokens: usage.map(|u| TokenCount::Reported(u.prompt_tokens)),
+            completion_tokens: usage.map(|u| TokenCount::Reported(u.completion_tokens)),
+            cached_tokens: usage
+                .and_then(|u| u.cached_tokens)
+                .or_else(|| timings.map(|t| t.cache_n)),
+            tok_per_s: timings.map(|t| t.predicted_per_second),
+            error,
+        }
+    }
+
+    /// A request the client walked away from before anything could seal a real outcome.
+    ///
+    /// Armed onto the `InFlightGuard` so its `Drop` has something to broadcast. `499` is
+    /// nginx's "client closed request", which is exactly what happened; `Drop` fills in
+    /// `total_ms` and `ttft_ms` itself.
+    fn abandoned() -> Outcome {
+        Outcome {
+            status: 499,
+            streamed: false,
+            aborted: true,
+            ttft_ms: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_tokens: None,
+            tok_per_s: None,
+            error: Some("client disconnected".to_owned()),
+        }
+    }
+
+    /// A streamed response, exactly as the one SSE relay reported it.
+    ///
+    /// `aborted` comes from the relay because the relay is the only thing that knows whether
+    /// the client or the upstream went first, and the completion count degrades to
+    /// `TokenCount::Estimated` rather than to `None` when the tail carried no usage.
+    fn streamed(status: u16, ttft_ms: Option<u32>, out: &StreamOutcome) -> Outcome {
+        Outcome {
+            status,
+            streamed: out.streamed,
+            aborted: out.aborted,
+            ttft_ms,
+            prompt_tokens: out.prompt_tokens(),
+            completion_tokens: Some(out.completion_tokens()),
+            cached_tokens: out.cached_tokens(),
+            tok_per_s: out.tok_per_s(),
+            error: out.error().map(str::to_owned),
+        }
+    }
+}
+
 /// Release the guard, broadcast, ring-buffer and append the usage row — exactly once.
-async fn finalize(
+///
+/// **Synchronous on purpose.** The streaming path calls this from the relay's `Drop`, which
+/// is what makes a client that hung up mid-stream produce exactly one record — marked
+/// `aborted`, carrying whatever the tee had already read — instead of vanishing. Nothing
+/// here awaits: the ring is a `std::sync::Mutex` held for two pushes, and the usage writer
+/// appends a line.
+fn finalize(
     r: &Router,
     draft: &RecordDraft,
     guard: Option<InFlightGuard>,
     outcome: Outcome,
     log_usage: bool,
 ) {
-    let rec = draft.seal(
-        outcome.status,
-        outcome.streamed,
-        outcome.ttft_ms,
-        outcome.usage,
-        outcome.timings,
-        outcome.error,
-    );
-    // Exactly one `RequestFinished` per request: the guard broadcasts it, and its `Drop`
-    // broadcasts the `aborted: true` variant when `finish()` never ran. The handler only
-    // emits directly if there is no guard to do it — which cannot happen on a served
-    // request, and is here so a future call site cannot silently lose a record.
+    let rec = draft.seal(outcome);
+    // Exactly one `RequestFinished` per request: the guard broadcasts the record it is
+    // handed — `aborted` and all — and its `Drop` only invents one when `finish()` never
+    // ran at all. The handler emits directly if there is no guard to do it, which cannot
+    // happen on a served request and is here so a future call site cannot lose a record.
     match guard {
         Some(g) => g.finish(rec.clone()),
         None => {
@@ -1006,7 +938,9 @@ async fn finalize(
         }
     }
     {
-        let mut ring = r.ring.lock().await;
+        // A poisoned ring means another request panicked while pushing. The ring is a
+        // display buffer; carrying on with it beats turning that into a second panic.
+        let mut ring = r.ring.lock().unwrap_or_else(|e| e.into_inner());
         while ring.len() >= RING_CAPACITY {
             ring.pop_front();
         }
@@ -1086,6 +1020,19 @@ impl<'a> Stamp<'a> {
 fn stamp(mut resp: Response, s: Stamp<'_>) -> Response {
     apply(resp.headers_mut(), s);
     resp
+}
+
+/// Apply an already-rendered stamp to a response.
+///
+/// The relay renders its stamp before handing the draft to the SSE relay's finish callback,
+/// so this is what puts it on afterwards. `insert` rather than `extend`, so an upstream
+/// header of the same name — a `Via` from a proxy in front of llama.cpp — is replaced by
+/// ours rather than appended to.
+fn stamp_with(resp: &mut Response, marks: &HeaderMap) {
+    let h = resp.headers_mut();
+    for (name, value) in marks {
+        h.insert(name.clone(), value.clone());
+    }
 }
 
 /// Apply a [`Stamp`] to a header map.
@@ -1197,10 +1144,11 @@ mod tests {
     use apexrouter_core::usage::UsageWriter;
     use apexrouter_protocol::{
         Backend, BackendKind, BackendLimits, BackendSelector, Health, ModelRoute, Provenance,
-        RouteFile, RouteFilter, RouteTarget, Strategy, UpstreamModel,
+        RetryPolicy, RouteFile, RouteFilter, RouteTarget, Strategy, UpstreamModel,
     };
     use axum::body::to_bytes as body_to_bytes;
     use axum::extract::Request;
+    use futures_util::StreamExt;
     use std::sync::{Arc, OnceLock};
     use tower::ServiceExt;
     use wiremock::matchers::{method as m_method, path as m_path};
@@ -1300,7 +1248,14 @@ mod tests {
         }
     }
 
+    /// A route carrying the shipped default `[retry]` — i.e. what `routes.toml` compiles to
+    /// when it declares no `[routes.retry]` block at all.
     fn route(alias: &str, targets: Vec<&str>) -> ModelRoute {
+        route_with_retry(alias, targets, RetryPolicy::default())
+    }
+
+    /// A route with an explicit `[retry]` block, as `routes.toml` writes one.
+    fn route_with_retry(alias: &str, targets: Vec<&str>, retry: RetryPolicy) -> ModelRoute {
         ModelRoute {
             alias: Alias::parse(alias).expect("alias"),
             targets: targets
@@ -1313,7 +1268,7 @@ mod tests {
                 .collect(),
             strategy: Strategy::FirstHealthy,
             filter: RouteFilter::default(),
-            retry: RetryPolicy::default(),
+            retry,
             is_default: true,
             description: None,
         }
@@ -1539,6 +1494,155 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(header(&resp, "x-apexrouter-attempts"), Some("2"));
         assert_eq!(header(&resp, "x-apexrouter-fallback"), Some("true"));
+        assert_eq!(header(&resp, "x-apexrouter-backend"), Some("up-good"));
+    }
+
+    // ---- `routes.toml`'s `[retry]` block, which used to be silently ignored -----------------
+
+    /// A pair of upstreams: the first always 502s, the second always answers 200. How many of
+    /// them get touched is entirely a function of the route's `[retry]` block.
+    async fn bad_then_good() -> (MockServer, MockServer) {
+        let bad = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(ResponseTemplate::new(502))
+            .mount(&bad)
+            .await;
+        let good = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
+            )
+            .mount(&good)
+            .await;
+        (bad, good)
+    }
+
+    #[tokio::test]
+    async fn a_per_route_attempts_of_one_stops_where_the_default_would_have_failed_over() {
+        // `[routes.retry] attempts = 1` — the `coder` route in `routes.example.toml`.
+        // Same table, same upstreams, same request as the default-policy test below; the
+        // only difference is the config value, and it has to change the outcome.
+        let (bad, good) = bad_then_good().await;
+        let r = router_with(
+            vec![
+                backend("up-bad", &bad.uri()),
+                backend("up-good", &good.uri()),
+            ],
+            vec![route_with_retry(
+                "auto",
+                vec!["up-bad", "up-good"],
+                RetryPolicy {
+                    attempts: 1,
+                    failover: true,
+                    honor_retry_after: true,
+                },
+            )],
+        );
+        let app = proxy_router(r);
+        let resp = call(&app, post_chat(r#"{"model":"auto"}"#)).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "attempts = 1 must not reach the second candidate"
+        );
+        assert_eq!(header(&resp, "x-apexrouter-attempts"), Some("1"));
+        assert_eq!(
+            good.received_requests().await.expect("recording").len(),
+            0,
+            "the healthy backend was never supposed to be dialled"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_route_that_declares_no_retry_block_gets_the_shipped_default() {
+        // The same table with `RetryPolicy::default()` — what a `routes.toml` route with no
+        // `[routes.retry]` compiles to. Two attempts, failover on, so it succeeds.
+        let (bad, good) = bad_then_good().await;
+        let r = router_with(
+            vec![
+                backend("up-bad", &bad.uri()),
+                backend("up-good", &good.uri()),
+            ],
+            vec![route("auto", vec!["up-bad", "up-good"])],
+        );
+        let app = proxy_router(r);
+        let resp = call(&app, post_chat(r#"{"model":"auto"}"#)).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "x-apexrouter-attempts"), Some("2"));
+        assert_eq!(header(&resp, "x-apexrouter-backend"), Some("up-good"));
+        assert_eq!(
+            good.received_requests().await.expect("recording").len(),
+            1,
+            "the default policy fails over exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_route_failover_of_false_never_leaves_the_first_backend() {
+        // `attempts = 3` with `failover = false`: three tries are allowed, but none of them
+        // may go to a *different* backend, so the chain stops at one.
+        let (bad, good) = bad_then_good().await;
+        let r = router_with(
+            vec![
+                backend("up-bad", &bad.uri()),
+                backend("up-good", &good.uri()),
+            ],
+            vec![route_with_retry(
+                "auto",
+                vec!["up-bad", "up-good"],
+                RetryPolicy {
+                    attempts: 3,
+                    failover: false,
+                    honor_retry_after: true,
+                },
+            )],
+        );
+        let app = proxy_router(r);
+        let resp = call(&app, post_chat(r#"{"model":"auto"}"#)).await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(header(&resp, "x-apexrouter-attempts"), Some("1"));
+        assert_eq!(
+            good.received_requests().await.expect("recording").len(),
+            0,
+            "failover = false must not dial a second backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_route_attempts_of_three_walks_three_candidates() {
+        // The `big` route in `routes.example.toml`. The default policy would have stopped
+        // after two, leaving the third — healthy — backend untouched.
+        let (bad, good) = bad_then_good().await;
+        let worse = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&worse)
+            .await;
+
+        let r = router_with(
+            vec![
+                backend("up-bad", &bad.uri()),
+                backend("up-worse", &worse.uri()),
+                backend("up-good", &good.uri()),
+            ],
+            vec![route_with_retry(
+                "auto",
+                vec!["up-bad", "up-worse", "up-good"],
+                RetryPolicy {
+                    attempts: 3,
+                    failover: true,
+                    honor_retry_after: true,
+                },
+            )],
+        );
+        let app = proxy_router(r);
+        let resp = call(&app, post_chat(r#"{"model":"auto"}"#)).await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "x-apexrouter-attempts"), Some("3"));
         assert_eq!(header(&resp, "x-apexrouter-backend"), Some("up-good"));
     }
 
@@ -1781,22 +1885,10 @@ mod tests {
         assert_eq!(route_value(None, None), "-|-");
     }
 
-    #[test]
-    fn the_mid_stream_death_frame_is_one_error_then_done() {
-        let s = String::from_utf8_lossy(MID_STREAM_DEATH);
-        assert_eq!(s.matches("data: ").count(), 2);
-        assert!(s.contains("\"type\":\"upstream_unavailable\""));
-        assert!(s.ends_with("data: [DONE]\n\n"));
-    }
-
-    #[test]
-    fn the_tee_reads_usage_off_the_tail_and_shrugs_at_garbage() {
-        let tail = b"data: {\"choices\":[]}\n\ndata: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n";
-        let (usage, _) = scan_tail(tail);
-        assert_eq!(usage.map(|u| u.prompt_tokens), Some(5));
-        let (usage, timings) = scan_tail(b"data: not json at all\n\n");
-        assert!(usage.is_none() && timings.is_none());
-    }
+    // The synthetic mid-stream frame and the usage tee used to be duplicated here, against a
+    // second copy of the relay. There is now one relay (`relay::stream`) and one set of unit
+    // tests for those rules, in that file; what this file tests is the wiring and the
+    // end-to-end behaviour through `proxy_router`, below.
 
     #[test]
     fn the_anthropic_model_view_re_renders_the_same_rows() {
@@ -2380,10 +2472,15 @@ mod tests {
         // buffer — or buffered the whole stream — the first frame would not arrive until the
         // last one had been generated. Six frames, 120 ms apart: the first must land in a
         // small fraction of the total.
+        //
+        // The `[DONE]` terminator is part of the fixture because the relay treats an SSE
+        // stream that stops without one as a truncation and appends a synthetic frame —
+        // see `a_stream_that_stops_without_done_is_never_silently_truncated`.
         const GAP: Duration = Duration::from_millis(120);
-        let frames: Vec<Vec<u8>> = (0..6)
+        let mut frames: Vec<Vec<u8>> = (0..6)
             .map(|i| format!("data: {{\"i\":{i}}}\n\n").into_bytes())
             .collect();
+        frames.push(b"data: [DONE]\n\n".to_vec());
         let base = sse_upstream(frames.clone(), GAP).await;
         let r = router_with(
             vec![backend("up-a", &base)],
@@ -2417,6 +2514,216 @@ mod tests {
         assert!(
             first_at < total / 2,
             "the first chunk arrived at {first_at:?} of {total:?} — the relay is buffering"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_stops_without_done_is_never_silently_truncated() {
+        // ARCHITECTURE §4.4: mid-stream upstream death has a defined client-visible
+        // behaviour — exactly one synthetic frame plus `[DONE]`, never a silent truncation.
+        // `relay::stream` unit-tests the rule; this proves the shipping path is wired to it,
+        // which the handler's own former copy of the relay never did.
+        let capture = llama_capture();
+        let truncated = capture[..capture.len() - b"data: [DONE]\n\n".len()].to_vec();
+        let base = sse_upstream(vec![truncated.clone()], Duration::from_millis(0)).await;
+        let r = router_with(
+            vec![backend("up-a", &base)],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let mut rx = r.events.subscribe();
+        let app = proxy_router(r);
+        let resp = call(&app, post_chat(r#"{"model":"auto","stream":true}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("body");
+
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.starts_with(&String::from_utf8_lossy(&truncated).to_string()),
+            "the prefix must still relay verbatim"
+        );
+        assert_eq!(
+            text.matches("upstream ended mid-stream").count(),
+            1,
+            "exactly one synthetic frame"
+        );
+        assert!(text.ends_with("data: [DONE]\n\n"));
+
+        let mut record = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::RequestFinished { record: rec } = ev {
+                record = Some(rec);
+            }
+        }
+        let rec = record.expect("a RequestFinished for the truncated stream");
+        assert_eq!(rec.error.as_deref(), Some("upstream ended mid-stream"));
+        assert!(!rec.aborted, "the upstream went first, not the client");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_hangs_up_mid_stream_settles_exactly_one_aborted_record() {
+        // The end-to-end half of the disconnect-leak regression test (`attempt::tests` owns
+        // the guard-level half). The relay reports its outcome from `Drop`, so an abandoned
+        // stream is sealed by the same code path as a completed one — same permit release,
+        // same ring row, and `aborted: true` because the upstream was still open. Before the
+        // two relays were merged this path reached no telemetry at all beyond the guard's
+        // own partial record.
+        let frames: Vec<Vec<u8>> = (0..8)
+            .map(|i| format!("data: {{\"i\":{i}}}\n\n").into_bytes())
+            .collect();
+        let base = sse_upstream(frames, Duration::from_millis(40)).await;
+        let r = router_with(
+            vec![backend("up-a", &base)],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let be = r
+            .registry()
+            .get(&BackendId::parse("up-a").expect("id"))
+            .expect("backend");
+        let permits_before = be.sem.available_permits();
+        let mut rx = r.events.subscribe();
+        let app = proxy_router(r);
+
+        let resp = call(&app, post_chat(r#"{"model":"auto","stream":true}"#)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        {
+            let mut stream = resp.into_body().into_data_stream();
+            let first = stream.next().await.expect("one chunk").expect("chunk");
+            assert!(!first.is_empty());
+            // The client Ctrl-Cs here: axum drops the body, which drops the relay.
+        }
+
+        let mut finished = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::RequestFinished { record } = ev {
+                finished.push(record);
+            }
+        }
+        assert_eq!(
+            finished.len(),
+            1,
+            "exactly one record, never two and never none"
+        );
+        assert!(
+            finished[0].aborted,
+            "the upstream was still open, so the client left first"
+        );
+        assert!(finished[0].streamed);
+        assert_eq!(
+            be.inflight.load(Ordering::Acquire),
+            0,
+            "the in-flight gauge came back"
+        );
+        assert_eq!(
+            be.sem.available_permits(),
+            permits_before,
+            "the permit came back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_hangs_up_waiting_for_a_buffered_body_is_recorded_too() {
+        // The buffered twin of the test above, and the one that proves `guard.record` is
+        // armed: the request task is cancelled while `relay` is awaiting the upstream body,
+        // so nothing in `relay` runs at all and the guard's `Drop` is the only thing left to
+        // speak. It used to have a `None` record and therefore said nothing — a GPU
+        // generating for a client that had already gone, invisible in every surface.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf).await;
+            // Headers, then a body that never completes.
+            let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n1\r\n{\r\n";
+            let _ = sock.write_all(head).await;
+            let _ = sock.flush().await;
+            futures_util::future::pending::<()>().await;
+        });
+
+        let r = router_with(
+            vec![backend("up-a", &format!("http://{addr}"))],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let be = r
+            .registry()
+            .get(&BackendId::parse("up-a").expect("id"))
+            .expect("backend");
+        let permits_before = be.sem.available_permits();
+        let mut rx = r.events.subscribe();
+        let app = proxy_router(r);
+
+        let handle =
+            tokio::spawn(async move { call(&app, post_chat(r#"{"model":"auto"}"#)).await });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let mut finished = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::RequestFinished { record } = ev {
+                finished.push(record);
+            }
+        }
+        assert_eq!(
+            finished.len(),
+            1,
+            "a cancelled request still gets one record"
+        );
+        assert!(finished[0].aborted);
+        assert_eq!(finished[0].status, 499, "nginx's client-closed-request");
+        assert_eq!(
+            finished[0].backend.as_ref().map(BackendId::as_str),
+            Some("up-a"),
+            "the record names the backend that was working on it"
+        );
+        assert_eq!(be.inflight.load(Ordering::Acquire), 0);
+        assert_eq!(be.sem.available_permits(), permits_before);
+    }
+
+    #[tokio::test]
+    async fn a_stream_with_no_reported_usage_degrades_to_estimated_never_to_nothing() {
+        // §4.4: "when the provider emits nothing the record degrades to
+        // `TokenCount::Estimated`". llama.cpp without `stream_options.include_usage` is
+        // exactly that case, and it is the common one.
+        let mut s = String::new();
+        for tok in ["Hel", "lo", "!"] {
+            s.push_str(&format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{tok}\"}}}}]}}\n\n"
+            ));
+        }
+        s.push_str("data: [DONE]\n\n");
+        let base = sse_upstream(vec![s.into_bytes()], Duration::from_millis(0)).await;
+        let r = router_with(
+            vec![backend("up-a", &base)],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let mut rx = r.events.subscribe();
+        let app = proxy_router(r);
+        let resp = call(&app, post_chat(r#"{"model":"auto","stream":true}"#)).await;
+        let _ = body_to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+
+        let mut record = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::RequestFinished { record: rec } = ev {
+                record = Some(rec);
+            }
+        }
+        let rec = record.expect("a RequestFinished");
+        assert!(rec.prompt_tokens.is_none(), "a prompt cannot be estimated");
+        assert!(
+            matches!(rec.completion_tokens, Some(TokenCount::Estimated(n)) if n > 0),
+            "got {:?} — a stream with no usage degrades, it does not report a silent zero",
+            rec.completion_tokens
         );
     }
 

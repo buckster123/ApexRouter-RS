@@ -14,15 +14,14 @@
 //!   its `Drop` emits `RequestFinished { aborted: true }` when `finish()` was never called.
 //!   A client Ctrl-C therefore cannot leak a permit or a zombie UI row.
 
-// The modules below belong to other work units and hold surface that later stages consume:
-// `CompiledRoute::retry` (nobody can read it until `Plan` carries a `RetryPolicy`), the
-// `anthropic` stubs R-10 fills in during Stage 5, and helpers the server crate calls. Every
-// one of them trips `dead_code`/`unused_variables` today. The allow is deliberately
-// per-module rather than crate-wide, so `lib.rs` and `handler.rs` — the two files this unit
-// owns — stay fully linted. Each line comes off as its owning unit wires its surface up.
+// The modules still carrying `#[allow(unused)]` hold surface that later stages consume: the
+// `anthropic` stubs R-10 fills in during Stage 5, and helpers the server crate calls. Each
+// one trips `dead_code`/`unused_variables` today. The allow is deliberately per-module rather
+// than crate-wide, so everything already wired up stays fully linted, and **each line comes
+// off as its owning unit's surface is consumed** — `attempt`, `limits` and `relay` lost
+// theirs when the handler was wired to the one SSE relay and to `Plan::retry`.
 #[allow(unused)]
 pub mod anthropic;
-#[allow(unused)]
 pub mod attempt;
 #[allow(unused)]
 pub mod breaker;
@@ -31,7 +30,6 @@ pub mod compat;
 #[allow(unused)]
 pub mod errors;
 pub mod handler;
-#[allow(unused)]
 pub mod limits;
 #[allow(unused)]
 pub mod models;
@@ -39,7 +37,6 @@ pub mod models;
 pub mod policy;
 #[allow(unused)]
 pub mod registry;
-#[allow(unused)]
 pub mod relay;
 #[allow(unused)]
 pub mod resolve;
@@ -57,9 +54,9 @@ use apexrouter_core::config::Config;
 use apexrouter_core::usage::UsageWriter;
 use apexrouter_protocol::{Alias, Event, RequestRecord, RouteFile};
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex, Semaphore};
+use tokio::sync::{broadcast, Semaphore};
 
 /// How many finished requests the in-process ring keeps for `GET /v1/requests`.
 const RING_CAPACITY: usize = 1_000;
@@ -80,6 +77,11 @@ pub struct RouterInner {
     /// GLOBAL byte budget, not just a request count.
     inflight_bytes: Arc<Semaphore>,
     /// Recent requests, for `GET /v1/requests` and the live table.
+    ///
+    /// A **`std::sync::Mutex`**, not tokio's: the streaming relay seals its record from the
+    /// response body's `Drop`, which is synchronous, and that is what makes a client
+    /// disconnect land in the ring instead of disappearing. Nothing is ever awaited while it
+    /// is held — the critical section is a `pop_front` and a `push_back`.
     ring: Mutex<VecDeque<RequestRecord>>,
     /// The broadcast every surface subscribes to.
     events: broadcast::Sender<Event>,

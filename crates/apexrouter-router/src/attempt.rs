@@ -27,6 +27,7 @@ use crate::limits::InFlightGuard;
 use crate::relay::body::BodyPlan;
 use crate::resolve::Candidate;
 use apexrouter_core::config::RouterCfg;
+use apexrouter_protocol::RetryPolicy;
 use bytes::Bytes;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, Method, Response};
@@ -54,6 +55,10 @@ pub struct PreFlight<'a> {
     pub deadline: Instant,
     /// Timeouts and budgets.
     pub cfg: &'a RouterCfg,
+    /// The **route's own** `[retry]` block, carried here by `Plan::retry` (R-02). `attempts`
+    /// and `failover` bound the caller's loop; `honor_retry_after` is consumed here, because
+    /// this is where an upstream `Retry-After` is read.
+    pub retry: RetryPolicy,
     /// The permit, the byte budget, the gauge and the partial record. Moves into the
     /// [`Committed`] on success; released when this attempt fails.
     pub guard: InFlightGuard,
@@ -130,6 +135,7 @@ pub async fn attempt(p: PreFlight<'_>) -> std::result::Result<Committed, Retryab
         body,
         deadline,
         cfg,
+        retry,
         mut guard,
     } = p;
     let breaker = &candidate.backend.breaker;
@@ -180,7 +186,13 @@ pub async fn attempt(p: PreFlight<'_>) -> std::result::Result<Committed, Retryab
 
     let code = response.status().as_u16();
     if is_retryable_status(code) {
-        let retry_after = parse_retry_after(response.headers());
+        // `honor_retry_after = false` means the route does not want an upstream dictating
+        // when we come back, so the header is not even read.
+        let retry_after = if retry.honor_retry_after {
+            parse_retry_after(response.headers())
+        } else {
+            None
+        };
         breaker.record(false);
         // An upstream that says when to come back is telling us it is saturated, not
         // flaky. Honour it exactly, without waiting for a quorum.
@@ -254,6 +266,7 @@ mod tests {
             body: BodyPlan::Passthrough(Bytes::from_static(b"{\"model\":\"x\"}")),
             deadline: Instant::now() + Duration::from_secs(30),
             cfg,
+            retry: RetryPolicy::default(),
             guard,
         }
     }
@@ -467,6 +480,49 @@ mod tests {
             }
             other => panic!("Retry-After must open the breaker, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn honor_retry_after_false_leaves_the_breaker_cool_down_alone() {
+        // The third knob in a route's `[retry]` block. With it off, the upstream does not
+        // get to dictate a two-minute cool-down on a backend the operator pinned.
+        let server = MockServer::start().await;
+        Mock::given(m("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "120"))
+            .mount(&server)
+            .await;
+
+        let b = test_backend("live", 1);
+        let cand = candidate_for(&b);
+        let http = Client::new();
+        let cfg = RouterCfg::default();
+        let (tx, _rx) = broadcast::channel(8);
+
+        let guard = guard_for(&b, &tx).await;
+        let mut p = preflight(
+            &cand,
+            &http,
+            &cfg,
+            format!("{}/v1/chat/completions", server.uri()),
+            guard,
+        );
+        p.retry = RetryPolicy {
+            honor_retry_after: false,
+            ..RetryPolicy::default()
+        };
+        let err = attempt(p).await.expect_err("429 is still retryable");
+        match err {
+            Retryable::Status { code, retry_after } => {
+                assert_eq!(code, 429);
+                assert_eq!(retry_after, None, "the header was not to be read");
+            }
+            other => panic!("expected Status, got {other:?}"),
+        }
+        assert_eq!(
+            b.breaker.check(),
+            BreakerDecision::Allow,
+            "one 429 is below min_volume, and no Retry-After was honoured"
+        );
     }
 
     #[tokio::test]

@@ -31,7 +31,9 @@
 use crate::policy::order_candidates;
 use crate::registry::LiveBackend;
 use crate::table::{CompiledRoute, RoutingTable};
-use apexrouter_protocol::{Alias, BackendId, Health, RouteFilter, RouteReason, Strategy};
+use apexrouter_protocol::{
+    Alias, BackendId, Health, RetryPolicy, RouteFilter, RouteReason, Strategy,
+};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -60,6 +62,15 @@ pub struct Plan {
     /// `Some` only when the outbound `"model"` differs from what the client sent. This is
     /// the **only** key the body rewriter is allowed to touch.
     pub rewrite_model_to: Option<String>,
+    /// **The route's own `[retry]` block**, carried to the attempt state machine.
+    ///
+    /// Rule 1 and rules 5/6 take it from the matched `CompiledRoute`. Rules 2, 3 and 4 route
+    /// without a route — an explicit pin and a bare upstream id name a backend, not an alias
+    /// — so they carry `RetryPolicy::default()`, which is also what a route that declared no
+    /// `[retry]` block was compiled with. Without this field the config key parses, compiles
+    /// and is then silently ignored, which is the exact class of bug this project exists to
+    /// eliminate.
+    pub retry: RetryPolicy,
 }
 
 /// One dispatchable target.
@@ -204,6 +215,9 @@ impl RoutingTable {
             reason: RouteReason::ExplicitPin,
             alias: None,
             rewrite_model_to: Some(upstream.to_owned()),
+            // A pin names no route, so there is no `[retry]` block to honour. The one
+            // candidate makes `failover` moot in any case.
+            retry: RetryPolicy::default(),
         })
     }
 
@@ -245,6 +259,9 @@ impl RoutingTable {
             // The client already named the upstream id, so the body passes through
             // untouched — this is the zero-copy path R-03 depends on.
             rewrite_model_to: None,
+            // Rules 3 and 4 match a model id across backends rather than a route, so no
+            // `[retry]` block applies and the shipped default governs.
+            retry: RetryPolicy::default(),
         })
     }
 
@@ -355,6 +372,10 @@ fn plan_from_route(
         reason,
         alias: Some(route.alias.clone()),
         rewrite_model_to,
+        // **This is what makes `routes.toml`'s `[retry]` block do something.** It is copied
+        // rather than referenced so the plan outlives the `ArcSwap` guard the table was read
+        // through; `RetryPolicy` is three bytes and `Copy`.
+        retry: route.retry,
     })
 }
 
@@ -545,6 +566,14 @@ mod tests {
     }
 
     fn route(a: &str, targets: Vec<(Arc<LiveBackend>, Option<&str>)>) -> CompiledRoute {
+        route_with_retry(a, targets, RetryPolicy::default())
+    }
+
+    fn route_with_retry(
+        a: &str,
+        targets: Vec<(Arc<LiveBackend>, Option<&str>)>,
+        retry: RetryPolicy,
+    ) -> CompiledRoute {
         CompiledRoute {
             alias: alias(a),
             targets: targets
@@ -557,7 +586,7 @@ mod tests {
                 .collect(),
             strategy: Strategy::FirstHealthy,
             filter: RouteFilter::default(),
-            retry: RetryPolicy::default(),
+            retry,
             is_default: a == "auto",
         }
     }
@@ -1023,6 +1052,91 @@ mod tests {
         assert_send_sync::<RoutingTable>();
         assert_send_sync::<LiveBackend>();
         assert_send_sync::<Plan>();
+    }
+
+    #[test]
+    fn a_routes_own_retry_block_reaches_the_plan() {
+        // Before `Plan::retry` existed, `routes.toml`'s `[routes.retry]` parsed, compiled
+        // into `CompiledRoute::retry` and then stopped — the handler used
+        // `RetryPolicy::default()` unconditionally and the config key did nothing.
+        let mut f = fixture();
+        let local = f.get("local-carnice");
+        let pinned = RetryPolicy {
+            attempts: 5,
+            failover: false,
+            honor_retry_after: false,
+        };
+        f.put(route_with_retry("coder", vec![(local, None)], pinned));
+
+        let p = f.resolve(Some("coder"), UnknownModelPolicy::Reject);
+        assert_eq!(p.reason, RouteReason::Alias);
+        assert_eq!(p.retry, pinned, "the route's own policy, not the default");
+    }
+
+    #[test]
+    fn a_route_without_its_own_retry_block_carries_the_default() {
+        let f = fixture();
+        // Rule 1, on a route compiled with the shipped default.
+        assert_eq!(
+            f.resolve(Some("auto"), UnknownModelPolicy::Reject).retry,
+            RetryPolicy::default()
+        );
+        // Rule 5 — the legacy names land on the default route, so they inherit its policy.
+        assert_eq!(
+            f.resolve(Some("x"), UnknownModelPolicy::Reject).retry,
+            RetryPolicy::default()
+        );
+        // Rules 2 and 3 name a backend rather than a route, so there is no `[retry]` block
+        // in play at all and the shipped default governs.
+        assert_eq!(
+            f.resolve(Some("vast-h100/big-model"), UnknownModelPolicy::Reject)
+                .retry,
+            RetryPolicy::default()
+        );
+        assert_eq!(
+            f.resolve(Some("Carnice-9b-Q6_K"), UnknownModelPolicy::Reject)
+                .retry,
+            RetryPolicy::default()
+        );
+    }
+
+    #[test]
+    fn a_per_route_retry_block_survives_a_non_default_route_being_the_one_that_matched() {
+        // The failure mode this guards: reading the policy off the *default* route instead
+        // of the route that actually matched.
+        let mut f = fixture();
+        let local = f.get("local-carnice");
+        let rented = f.get("vast-h100");
+        f.put(route_with_retry(
+            "auto",
+            vec![(local, None)],
+            RetryPolicy {
+                attempts: 1,
+                failover: false,
+                honor_retry_after: true,
+            },
+        ));
+        f.put(route_with_retry(
+            "big",
+            vec![(rented, Some("big-model"))],
+            RetryPolicy {
+                attempts: 4,
+                failover: true,
+                honor_retry_after: false,
+            },
+        ));
+        assert_eq!(
+            f.resolve(Some("big"), UnknownModelPolicy::Reject)
+                .retry
+                .attempts,
+            4
+        );
+        assert_eq!(
+            f.resolve(Some("auto"), UnknownModelPolicy::Reject)
+                .retry
+                .attempts,
+            1
+        );
     }
 
     #[test]

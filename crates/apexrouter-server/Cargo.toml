@@ -35,3 +35,6 @@ sha2         = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# S-02 asserts the TraceLayer span records method+path and never the `?token=` query, which
+# takes a real subscriber to capture the recorded fields.
+tracing-subscriber = { workspace = true }

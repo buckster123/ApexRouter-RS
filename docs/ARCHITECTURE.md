@@ -927,9 +927,18 @@ directory containing endpoint logs, which children write to continuously.
 ```rust
 pub fn resolve(&self, model: Option<&str>, class: RequestClass) -> Result<Plan, RouteError>;
 pub struct Plan { pub candidates: SmallVec<[Candidate; 4]>, pub reason: RouteReason,
-                  pub alias: Option<Alias>, pub rewrite_model_to: Option<String> }
+                  pub alias: Option<Alias>, pub rewrite_model_to: Option<String>,
+                  pub retry: RetryPolicy }
 pub struct Candidate { pub backend: Arc<LiveBackend>, pub upstream_model: String }
 ```
+
+`Plan::retry` is **the route's own `[retry]` block**, and it is on the `Plan` because that is the
+only path from `routes.toml` to the attempt loop: rules 1, 5 and 6 copy it off the matched
+`CompiledRoute`; rules 2, 3 and 4 name a backend rather than a route, so they carry
+`RetryPolicy::default()` — which is also what a route declaring no `[retry]` block compiles to.
+`attempts` and `failover` bound the loop in §4.3, and `honor_retry_after` is consumed inside
+`attempt()`, where an upstream `Retry-After` is read. A `Plan` without this field is how a config key
+gets parsed, validated and then silently ignored.
 
 Order, and what each rule buys:
 
@@ -1017,7 +1026,11 @@ impl Drop for InFlightGuard { /* … */ }
   asserting `/slots` frees within 1 s.
 - **Mid-stream upstream death** has a defined client-visible behaviour: emit one synthetic
   `data: {"error":{"message":"upstream ended mid-stream","type":"upstream_unavailable"}}` frame
-  followed by `data: [DONE]`, then close. Never a silent truncation.
+  followed by `data: [DONE]`, then close. Never a silent truncation. A **clean EOF with no
+  `data: [DONE]` terminator is death too** — a socket closing politely mid-generation looks
+  identical to a finished stream to every SDK, so it gets the same pair. The idle timeout gets its
+  own, `"type":"upstream_timeout"`. There is exactly one implementation of these rules
+  (`router::relay::stream`); the proxy handler calls it and holds no framing code of its own.
 - A **tee** watches the tail for `usage` / `timings`. It is best-effort and never gates the relay;
   when the provider emits nothing the record degrades to `TokenCount::Estimated` /
   `CostEstimate::Approximate`.

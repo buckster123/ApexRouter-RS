@@ -115,6 +115,17 @@ pub struct ServerCfg {
     pub drain_timeout_secs: u64,
     /// May a `Mutate` CLI verb start the daemon?
     pub autostart: bool,
+    /// Origins that may read a **proxy-listener** response cross-origin.
+    ///
+    /// Empty (the default) emits no CORS header at all, which is ApexRouter's behaviour and
+    /// is a deliberate difference from LocalRouter — `endpoint_proxy.py` set
+    /// `Access-Control-Allow-Origin: *` on every proxied response. A non-empty list emits
+    /// the header for a matching `Origin`; the single entry `"*"` is an explicit opt-in to
+    /// the old blanket behaviour.
+    ///
+    /// The **control** listener and every mutating route are never covered by this — the
+    /// mutation gate of ARCHITECTURE §9.3 governs there regardless of what is listed here.
+    pub proxy_cors_origins: Vec<String>,
 }
 
 impl Default for ServerCfg {
@@ -127,6 +138,7 @@ impl Default for ServerCfg {
             ui_dir: String::new(),
             drain_timeout_secs: 30,
             autostart: true,
+            proxy_cors_origins: Vec::new(),
         }
     }
 }

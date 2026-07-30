@@ -14,23 +14,24 @@
 //!
 //! # Shape of the implementation
 //!
-//! [`sse_response`] is a thin adapter. Everything interesting lives in two pieces that are
-//! independent of `Committed` and of `InFlightGuard`, and are unit-tested directly:
+//! This is **the** streaming relay: `handler::relay` hands a `Committed` straight to
+//! [`sse_response`] and there is no second copy of these rules anywhere in the crate.
+//! [`sse_response`] is a thin adapter over two pieces that are independent of `Committed`
+//! and of `InFlightGuard`, and are unit-tested directly:
 //!
 //! * `relay_stream` — the byte pump: idle timeout, synthetic frames and tee bookkeeping,
-//!   with one exit point (`Drop`) that reports a `StreamOutcome` to a callback. Whether the
+//!   with one exit point (`Drop`) that reports a [`StreamOutcome`] to a callback. Whether the
 //!   client vanished or the upstream finished is decided by whether the upstream stream was
 //!   still open at drop time, so a disconnect cannot be mistaken for a clean end.
 //! * [`UsageTee`] — a bounded rolling tail, fed a `&[u8]` per chunk. It never copies the
 //!   whole stream, never allocates proportionally to it, and never delays a byte.
 
 use crate::attempt::Committed;
-use crate::errors::openai_error;
 use crate::limits::InFlightGuard;
 use crate::relay::headers::response_headers;
 use apexrouter_core::config::RouterCfg;
 use apexrouter_core::upstream::{parse_timings, parse_usage, Timings, UsageFields};
-use apexrouter_protocol::{Event, TokenCount};
+use apexrouter_protocol::TokenCount;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use bytes::Bytes;
@@ -38,7 +39,6 @@ use futures_util::{Stream, StreamExt};
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
-use tokio::sync::broadcast;
 
 /// The synthetic frame emitted when an upstream dies in the middle of an SSE stream.
 const MID_STREAM_FRAME: &[u8] = b"data: {\"error\":{\"message\":\"upstream ended mid-stream\",\"type\":\"upstream_unavailable\"}}\n\n";
@@ -55,62 +55,56 @@ const DEFAULT_TAIL_CAP: usize = 64 * 1024;
 /// machine free of type parameters, which is what lets it carry a `Drop` impl.
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
 
-/// The three things the relay needs out of a committed upstream response.
+/// The four things the relay needs out of a committed upstream response.
 struct Upstream {
     status: StatusCode,
     headers: HeaderMap,
     body: ByteStream,
+    guard: Option<InFlightGuard>,
 }
+
+/// How the relay hands everything back when the response ends: the [`InFlightGuard`] it was
+/// lent, and everything it learned.
+///
+/// Invoked from the relay's `Drop`, so it runs **exactly once** whether the stream ended
+/// cleanly, the upstream died mid-stream, the idle timeout fired, or the client vanished —
+/// and `StreamOutcome::aborted` says which. The caller (R-08) is what knows how to turn that
+/// into a `RequestRecord`, so sealing the record, the ring buffer and the usage row all stay
+/// on its side of the seam and this file stays free of `Router`.
+pub type FinishFn = Box<dyn FnOnce(Option<InFlightGuard>, StreamOutcome) + Send>;
 
 /// Turn a committed upstream response into a streaming axum response.
 ///
-/// Takes ownership of the `InFlightGuard`, so a client disconnect drops it, cancels the
-/// reqwest future, aborts the upstream (freeing llama.cpp's slot) and emits exactly one
-/// `RequestFinished { aborted: true }`.
+/// **This is the one SSE relay.** `handler::relay` calls it for every streamed response;
+/// there is no second implementation of the frame rules, the idle timeout or the tee.
 ///
-/// # NOT WIRED UP — do not call this from a new call site
+/// The returned body owns the `InFlightGuard`, so a client disconnect drops it, cancels the
+/// reqwest future and aborts the upstream — freeing llama.cpp's slot — and `on_end` still
+/// runs, with `StreamOutcome::aborted` set. The caller never has to remember to release
+/// anything.
 ///
-/// [`upstream_parts`] still returns `None` and [`settle`] still drops the guard instead of
-/// finishing it, so **every call returns `502 upstream_unavailable`** and would report a
-/// completed stream as aborted. The shipping SSE relay is `crate::handler::relay`, which is
-/// a byte-for-byte duplicate of the rules below and is what the end-to-end tests exercise.
-///
-/// Closing the two seams (destructure `Committed`, and give the guard a
-/// `finish_with`-shaped accessor) and then deleting `handler::relay` in favour of this one
-/// is a Stage 4 clean-up, tracked in the Stage 3 gate report. Everything else in this file —
-/// the frame rules, the bounded tee, the idle timeout, the `Drop`-decides-aborted logic — is
-/// implemented and unit-tested.
-pub fn sse_response(
-    c: Committed,
-    cfg: &RouterCfg,
-    tx: broadcast::Sender<Event>,
-    guard: InFlightGuard,
-) -> axum::response::Response {
-    let Some(up) = upstream_parts(c) else {
-        // Nothing was relayed, so dropping the guard is the honest outcome.
-        drop(guard);
-        return openai_error(
-            StatusCode::BAD_GATEWAY,
-            "upstream_unavailable",
-            "the committed upstream response was not available to the relay",
-        );
-    };
+/// Response headers are built here: [`response_headers`] drops the hop-by-hop set, and
+/// [`decorate_stream_headers`] adds the streaming-only ones — but **only** when the upstream
+/// is 2xx and already said `text/event-stream`, so a `400 {"error":…}` on a `stream:true`
+/// request reaches the client as the JSON it is. The observability stamp
+/// (`X-ApexRouter-Route` and friends) is the caller's, applied to the returned response.
+pub fn sse_response(c: Committed, cfg: &RouterCfg, on_end: FinishFn) -> axum::response::Response {
     let Upstream {
         status,
         headers,
         body,
-    } = up;
+        guard,
+    } = upstream_parts(c);
 
     let sse = is_event_stream(status, &headers);
     let mut out_headers = response_headers(&headers);
     decorate_stream_headers(&mut out_headers, sse);
 
     let idle = Duration::from_millis(cfg.idle_timeout_ms);
-    let on_end: Box<dyn FnOnce(StreamOutcome) + Send> =
-        Box::new(move |out| settle(guard, &tx, out));
+    let settle: Box<dyn FnOnce(StreamOutcome) + Send> = Box::new(move |out| on_end(guard, out));
 
     let mut resp =
-        axum::response::Response::new(Body::from_stream(relay_stream(body, idle, sse, on_end)));
+        axum::response::Response::new(Body::from_stream(relay_stream(body, idle, sse, settle)));
     *resp.status_mut() = status;
     *resp.headers_mut() = out_headers;
     resp
@@ -118,39 +112,26 @@ pub fn sse_response(
 
 /// Take the committed upstream response apart.
 ///
-/// **This is the one R-04 seam in this file.** `Committed` (R-04, `router/src/attempt.rs`)
-/// owns the `reqwest::Response`, and Stage 0 published it with no accessor — Rust privacy is
-/// per-module, not per-crate, so a sibling module cannot reach its fields. The moment R-04
-/// exposes the response (an `into_parts`-style method, or `pub(crate)` fields) this function
-/// becomes two lines and every other line in this file is already correct. Reported in
-/// `signature_problems`; deliberately **not** worked around by editing R-04's file.
-fn upstream_parts(c: Committed) -> Option<Upstream> {
-    let _not_reachable_yet = c;
-    None
-}
-
-/// Hand the guard back with everything the relay learned.
-///
-/// **The second R-04 seam.** `InFlightGuard::finish` takes a whole `RequestRecord`, but the
-/// partially built record lives inside the guard and Stage 0 published no accessor for it,
-/// so R-05 cannot fill in `prompt_tokens` / `completion_tokens` / `tok_per_s` / `error` and
-/// hand it back. Until R-04 exposes one, the guard is dropped here: its `Drop` still
-/// releases the permit, decrements the gauge and emits `RequestFinished`, which is the
-/// load-bearing behaviour — but a completed stream is currently reported as aborted.
-fn settle(guard: InFlightGuard, tx: &broadcast::Sender<Event>, out: StreamOutcome) {
-    tracing::debug!(
-        bytes = out.bytes,
-        total_ms = out.total_ms,
-        aborted = out.aborted,
-        streamed = out.streamed,
-        prompt_tokens = ?out.prompt_tokens(),
-        completion_tokens = ?out.completion_tokens(),
-        tok_per_s = ?out.tok_per_s(),
-        error = ?out.error(),
-        subscribers = tx.receiver_count(),
-        "relay finished"
+/// The error type is erased to `String` here and nowhere else, which is what lets the relay
+/// state machine below stay free of type parameters and therefore carry a `Drop` impl.
+fn upstream_parts(mut c: Committed) -> Upstream {
+    // The guard comes out first: `Committed::guard` is an `Option` precisely so the relay
+    // can take ownership without the response having to be rebuilt around it.
+    let guard = c.guard.take();
+    let response = c.response;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body: ByteStream = Box::pin(
+        response
+            .bytes_stream()
+            .map(|r| r.map_err(|e: reqwest::Error| e.to_string())),
     );
-    drop(guard);
+    Upstream {
+        status,
+        headers,
+        body,
+        guard,
+    }
 }
 
 /// Is this response an SSE stream we may decorate?
@@ -158,7 +139,11 @@ fn settle(guard: InFlightGuard, tx: &broadcast::Sender<Event>, out: StreamOutcom
 /// `Content-Type: text/event-stream` is forced **only** when the upstream is 2xx *and*
 /// already says so, so a `400 {"error":…}` on a `stream:true` request reaches the client as
 /// the JSON it is.
-fn is_event_stream(status: StatusCode, upstream: &HeaderMap) -> bool {
+///
+/// `pub(crate)` because R-08 asks the same question one step earlier — it has to decide
+/// between this relay and the buffered one — and two spellings of one rule is how a
+/// `TEXT/EVENT-STREAM` from some proxy ends up taking different branches in two files.
+pub(crate) fn is_event_stream(status: StatusCode, upstream: &HeaderMap) -> bool {
     if !status.is_success() {
         return false;
     }
@@ -195,38 +180,40 @@ fn decorate_stream_headers(h: &mut HeaderMap, sse: bool) {
 }
 
 /// Everything the relay learned about one response.
+///
+/// Handed to a [`FinishFn`] exactly once, from the relay's `Drop`.
 #[derive(Debug, Default)]
-struct StreamOutcome {
+pub struct StreamOutcome {
     /// Bytes relayed from the upstream. Synthetic frames are not counted.
-    bytes: u64,
+    pub bytes: u64,
     /// Newlines seen — only ever used to estimate tokens nobody reported.
-    newlines: u64,
+    pub newlines: u64,
     /// Reported usage, when the tail carried any.
-    usage: Option<UsageFields>,
+    pub usage: Option<UsageFields>,
     /// llama.cpp `timings`, when the tail carried any.
-    timings: Option<Timings>,
+    pub timings: Option<Timings>,
     /// The client vanished before the upstream finished.
-    aborted: bool,
+    pub aborted: bool,
     /// The upstream ended or failed mid-stream.
-    ended_mid_stream: bool,
+    pub ended_mid_stream: bool,
     /// The inter-chunk idle timeout expired.
-    idle_timeout: bool,
+    pub idle_timeout: bool,
     /// Wall clock across the relay.
-    total_ms: u32,
+    pub total_ms: u32,
     /// Whether this was relayed as SSE.
-    streamed: bool,
+    pub streamed: bool,
 }
 
 impl StreamOutcome {
     /// Reported prompt tokens, or `None` — a prompt cannot be estimated from the response.
-    fn prompt_tokens(&self) -> Option<TokenCount> {
+    pub fn prompt_tokens(&self) -> Option<TokenCount> {
         self.usage.map(|u| TokenCount::Reported(u.prompt_tokens))
     }
 
     /// Reported completion tokens, degrading to `TokenCount::Estimated` on an absent or
     /// malformed tail. An SSE stream is estimated from its frame count (llama.cpp emits one
     /// frame per token), a buffered body from ~4 bytes per token. Never a silent zero.
-    fn completion_tokens(&self) -> TokenCount {
+    pub fn completion_tokens(&self) -> TokenCount {
         match self.usage {
             Some(u) => TokenCount::Reported(u.completion_tokens),
             None if self.streamed => TokenCount::Estimated(clamp_u32(self.newlines / 2)),
@@ -234,13 +221,21 @@ impl StreamOutcome {
         }
     }
 
+    /// Cached prompt tokens, from `usage.prompt_tokens_details` or llama.cpp's
+    /// `timings.cache_n`, whichever the tail carried.
+    pub fn cached_tokens(&self) -> Option<u32> {
+        self.usage
+            .and_then(|u| u.cached_tokens)
+            .or_else(|| self.timings.map(|t| t.cache_n))
+    }
+
     /// Throughput, **read** from the upstream's `timings`, never stopwatched.
-    fn tok_per_s(&self) -> Option<f32> {
+    pub fn tok_per_s(&self) -> Option<f32> {
         self.timings.map(|t| t.predicted_per_second)
     }
 
     /// The error to record, when the stream did not end cleanly.
-    fn error(&self) -> Option<&'static str> {
+    pub fn error(&self) -> Option<&'static str> {
         if self.idle_timeout {
             Some("upstream idle timeout")
         } else if self.ended_mid_stream {
@@ -505,6 +500,10 @@ impl UsageTee {
     }
 
     /// Bytes currently retained. Bounded for any stream length.
+    ///
+    /// The bound is the whole point of the two-buffer rotation, so this exists to let the
+    /// tests assert it. Nothing on the request path needs to ask.
+    #[cfg(test)]
     fn buffered(&self) -> usize {
         self.prev.len() + self.cur.len()
     }
