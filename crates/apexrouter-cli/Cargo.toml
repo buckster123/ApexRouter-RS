@@ -1,0 +1,37 @@
+[package]
+name = "apexrouter-cli"
+description = "apexrouter — the CLI, the daemon entrypoint and the MCP stdio server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+default-run = "apexrouter"
+
+[[bin]]
+name = "apexrouter"
+path = "src/main.rs"
+
+[dependencies]
+apexrouter-protocol  = { workspace = true }
+apexrouter-core      = { workspace = true }
+apexrouter-router    = { workspace = true }
+apexrouter-providers = { workspace = true }
+apexrouter-server    = { workspace = true }
+apexrouter-client    = { workspace = true }
+clap               = { workspace = true }
+clap_complete      = { workspace = true }
+tokio              = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow             = { workspace = true }
+chrono             = { workspace = true }
+async-trait        = { workspace = true }
+futures-util       = { workspace = true }
+rustix             = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

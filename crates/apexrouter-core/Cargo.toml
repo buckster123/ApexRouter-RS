@@ -1,0 +1,36 @@
+[package]
+name = "apexrouter-core"
+description = "ApexRouter-RS core — config, state, discovery, fit solver, argv builder, usage, ledger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+apexrouter-protocol = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+toml         = { workspace = true }
+toml_edit    = { workspace = true }
+tokio        = { workspace = true }
+reqwest      = { workspace = true }
+tracing      = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+chrono       = { workspace = true }
+dirs         = { workspace = true }
+notify       = { workspace = true }
+sysinfo      = { workspace = true }
+glob         = { workspace = true }
+sha2         = { workspace = true }
+rustix       = { workspace = true }
+async-trait  = { workspace = true }
+futures-util = { workspace = true }
+ulid         = { workspace = true }
+
+[dev-dependencies]
+tempfile  = { workspace = true }
+wiremock  = { workspace = true }
+tokio     = { workspace = true, features = ["test-util"] }

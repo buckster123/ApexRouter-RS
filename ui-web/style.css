@@ -1,0 +1,43 @@
+/*
+  OWNER: unit U-01 (ui-web/{index.html,app.js,style.css}). Do not edit outside that unit.
+
+  Stage 0 placeholder, so rust-embed's #[folder = "../../ui-web"] compiles.
+
+  U-01 builds the :root token block below out properly. House rules:
+  status colours are reserved for HEALTH, never identity; badges pair icon + label, never
+  colour alone; system sans for body text with monospace strictly for code and logs; and
+  every element that toggles `hidden` and declares its own `display` gets the
+  `[hidden]{display:none}` guard.
+*/
+
+:root {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --hairline: #2c2c2a;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --muted: #898781;
+  --accent: #3987e5;
+  --good: #0ca30c;
+  --warn: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+  }
+}
+
+[hidden] {
+  display: none;
+}
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--ink);
+  font-family: system-ui, sans-serif;
+}

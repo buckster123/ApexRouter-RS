@@ -1,0 +1,23 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - name: no shell-outs
+        run: |
+          ! grep -rn --include=*.rs -e '"sh", *"-c"' -e '\.arg("-c")' crates/ \
+            || (echo "shell invocation found — use core::exec with an argv vector" && exit 1)
+      - name: clippy (seven headless crates; apexrouter-slint is never linked in CI)
+        run: >
+          cargo clippy
+          -p apexrouter-protocol -p apexrouter-core -p apexrouter-router
+          -p apexrouter-providers -p apexrouter-client -p apexrouter-server
+          -p apexrouter-cli -- -D warnings
+      - run: cargo test --workspace --exclude apexrouter-slint
+      - run: cargo build --release

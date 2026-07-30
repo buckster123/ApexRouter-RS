@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.log
+.env*
+.idea/
+.vscode/
+
+# Cargo.lock is DELIBERATELY NOT ignored: this is a binary workspace.
+# Nothing else belongs here. Runtime state lives under Paths::state()
+# ($XDG_STATE_HOME/apexrouter), never inside the checkout — invariant 5.

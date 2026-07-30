@@ -201,7 +201,7 @@ Acyclic, resolver 2, edition 2021, MSRV `1.75`, version `0.1.0`.
 |---|---|---|---|
 | `apexrouter-protocol` | Every wire and domain type. The single vocabulary every surface deserializes. `#[serde(rename_all="snake_case")]`, `#[serde(tag="type")]` on `Event`, `PartialEq` everywhere so the daemon suppresses no-op broadcasts, `#[serde(default)]` on additive `Vec` fields. | — | serde, serde_json, ulid |
 | `apexrouter-core` | Paths, config, secrets, atomic store + locks, process identity, argv builder, discovery (builds/devices/models/GGUF), the fit solver, upstream probing, pricing, usage, ledger, catalog, migration, the `Check` registry. No axum, no provisioning. | protocol | tokio, reqwest, toml, toml_edit, dirs, notify, chrono, thiserror, anyhow, tracing, sysinfo, glob, sha2 |
-| `apexrouter-router` | **The request path.** Routing table, `resolve()`, relay, SSE, retry/failover, breaker, limits, aggregated `/v1/models`, telemetry, legacy compat handlers. Knows nothing about Vast, HF or process spawning. | protocol, core | axum, tower, reqwest, arc-swap, bytes, futures-util |
+| `apexrouter-router` | **The request path.** Routing table, `resolve()`, relay, SSE, retry/failover, breaker, limits, aggregated `/v1/models`, telemetry, legacy compat handlers, and the one Anthropic ingress translator (`anthropic/`). Knows nothing about Vast, HF or process spawning. | protocol, core | axum, tower, reqwest, arc-swap, bytes, futures-util |
 | `apexrouter-providers` | How backends come to exist. Local `llama-server` supervisor, vast.ai REST + boot + tunnel, together.ai, HuggingFace, plain OpenAI-compatible node. Provider-specific `Check`s. | protocol, core | reqwest, async-trait, serde_json, tokio |
 | `apexrouter-client` | `NodeClient` — the thin HTTP+WS client every non-server surface uses. ~300 lines. No business logic. | protocol | reqwest, tokio-tungstenite, futures-util |
 | `apexrouter-server` | The axum application: proxy listener, control listener, `/ws`, auth, embedded assets, job runner. `pub use api_router()` so ApexOS-RS can mount the control plane. | protocol, core, router, providers | axum `["ws"]`, tower-http, rust-embed |
@@ -410,17 +410,24 @@ Launch drawer's live headroom bar in both GUIs, and the Vast rent panel ("what f
 
 ### 3.4 Endpoint, Backend, Provider
 
-An **Endpoint** is a thing ApexRouter knows how to start and stop. A **Backend** is a live
-OpenAI-compatible upstream in the routing table. Every endpoint produces a backend; not every
-backend has an endpoint (a LAN node or a managed provider has no lifecycle).
+An **Endpoint** is a thing ApexRouter knows how to start and stop. A **Backend** is a live upstream
+in the routing table — OpenAI-compatible unless it declares otherwise. Every endpoint produces a
+backend; not every backend has an endpoint (a LAN node or a managed provider has no lifecycle).
 
 ```rust
+/// The wire dialect a listener accepts or an upstream speaks.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol { OpenAi, Anthropic }
+impl Default for Protocol { fn default() -> Self { Protocol::OpenAi } }
+
 #[serde(rename_all = "snake_case")]
 pub enum BackendKind { LocalLlama, LocalVllm, VastLlama, VastVllm, Managed, Node }
 
 pub struct Backend {
     pub id: BackendId,
     pub kind: BackendKind,
+    pub protocol: Protocol,          // #[serde(default)] — OpenAi unless the record says otherwise
     pub label: String,
     pub base_url: String,            // ALWAYS stored WITHOUT a trailing /v1  (§6.1)
     pub credential: CredentialSource,// a DESCRIPTION, never key material
@@ -465,6 +472,27 @@ pub enum Provenance { Discovered, Spawned, Rented, Manual, Adopted, Imported }
 pub enum CredentialSource { None, Env { var: String }, File { path: String },
                             Managed { store: String }, Instance }
 ```
+
+**Protocol is a matrix cell, not a branch bolted onto a handler.** `Protocol` appears in exactly two
+places on the request path: the ingress records which dialect the *client* spoke (§4.3), and the
+resolved `Backend` declares which dialect the *upstream* speaks. What happens to the body is then
+selected by the pair `(ingress, upstream)`. mk1 implements three of the four cells:
+
+| ingress → upstream | mk1 behaviour |
+|---|---|
+| `OpenAi` → `OpenAi` | relay, byte-for-byte. Today's path, unchanged |
+| `Anthropic` → `Anthropic` | **passthrough relay** — bytes verbatim, only the credential is swapped. No translation code runs |
+| `Anthropic` → `OpenAi` | **translate** (§6.1; work unit R-10). This is the point of the surface: `ANTHROPIC_BASE_URL=http://127.0.0.1:8888` lets the Claude Code harness drive a local or rented model |
+| `OpenAi` → `Anthropic` | **501** with an **OpenAI-shaped** error body (`{"error":{"type":"protocol_not_supported",…}}`). Permanently out of scope (§12) |
+
+**OpenAI-compatible remains the canonical surface**, and the Anthropic side is a *translating ingress
+only*, one direction. Two facts from the surrounding ecosystem fix that:
+`ApexOS-RS/agentd/crates/gateway/src/compute.rs` sweeps the LAN probing `GET /v1/models` for the
+OpenAI list shape, so being byte-exact there is what makes ApexRouter auto-discoverable as an ApexOS
+compute node; and `ApexOS-RS/agentd/crates/agent/src/provider.rs` is already a provider trait over
+"Anthropic native, OpenAI-compat, OpenRouter" with `anthropic.rs` and `oai.rs` side by side, whose
+Anthropic calls go straight to `api.anthropic.com` with a real key. ApexOS does not want a
+translating proxy. Nothing in the ecosystem ever needs OpenAI → Anthropic.
 
 **Endpoint lifecycle types** (facts only; see invariant 3):
 
@@ -526,9 +554,11 @@ pub struct LocalVllmSpec { pub bin: String, pub model_id: String, pub tp: Option
                            pub reasoning_parser: Option<String>, pub gpu_util: Option<f32>,
                            pub host: String, pub port: Option<u16>, pub extra_args: Vec<String> }
 pub struct NodeSpec    { pub base_url: String, pub credential: CredentialSource,
-                         pub label: String, pub declared_models: Vec<String> }
+                         pub label: String, pub declared_models: Vec<String>,
+                         pub protocol: Protocol }          // default OpenAi
 pub struct ManagedSpec { pub provider: String, pub base_url: String,
-                         pub credential: CredentialSource, pub model_id: Option<String> }
+                         pub credential: CredentialSource, pub model_id: Option<String>,
+                         pub protocol: Protocol }          // default OpenAi
 pub struct VastSpec    { pub instance_id: InstanceId, pub runtime: ContainerRuntime,
                          pub launch: ContainerLaunch, pub tunnel: Option<TunnelSpec> }
 ```
@@ -592,6 +622,8 @@ pub struct RequestRecord {
     pub id: RequestId, pub started_unix: i64,
     pub alias: Option<Alias>, pub backend: Option<BackendId>,
     pub upstream_model: Option<String>, pub route_reason: RouteReason,
+    pub ingress: Protocol,               // which dialect the CLIENT spoke; the upstream's is on
+                                         // the Backend, so (ingress, upstream) names the cell
     pub method: String, pub path: String,
     pub status: u16, pub attempts: u8, pub streamed: bool, pub aborted: bool,
     pub ttft_ms: Option<u32>, pub total_ms: u32,
@@ -933,11 +965,14 @@ inbound
  ├─ normalise path: collapse a repeated leading /v1 to one; log once per (UA, path) at debug
  ├─ loop guard: `Via` already contains "apexrouter" → 508 loop_detected
  ├─ classify: Models | Chat | Completion | Embedding | Rerank | Opaque
+ ├─ record ingress: Protocol — Anthropic for /v1/messages, or when `anthropic-version` is
+ │    present on /v1/models; OpenAi otherwise. Stored on the RequestRecord (§3.6)
  ├─ acquire global byte budget (max_inflight_bytes), then read body (max_body_bytes → 413)
  ├─ RequestPeek: a top-level-key scanner (NOT a full serde_json::Value parse) for
  │    {model, stream (strict bool), stream_options.include_usage}
  ├─ resolve(model, class) -> Plan
  └─ for candidate in plan, bounded by RetryPolicy.attempts AND a wall-clock deadline:
+      ├─ (ingress, candidate.protocol) selects the matrix cell (§3.4): relay | translate | 501
       ├─ breaker.check()            → skip if Open (min_volume 5 before it can trip)
       ├─ InFlightGuard::acquire(backend).timeout(queue_timeout) → 503 + Retry-After if saturated
       ├─ outbound_headers(inbound, cred)  → CONSTRUCTED from an allowlist; inbound map never cloned
@@ -1004,7 +1039,11 @@ backend's own credential. The inbound `HeaderMap` is never cloned, so a client's
 cannot reach a third party — and a local `llama-server --api-key` becomes reachable through the
 proxy for the first time. Added: `X-Request-Id`, `Via: 1.1 apexrouter`. Preserved for compat:
 `X-Provider`, `X-Usage`. Added: `X-ApexRouter-Backend`, `X-ApexRouter-Route`,
-`X-ApexRouter-Attempts`, `X-ApexRouter-Fallback`.
+`X-ApexRouter-Attempts`, `X-ApexRouter-Fallback`, and — whenever the ingress is not `open_ai` —
+`X-ApexRouter-Protocol: <ingress>-><upstream>` (e.g. `anthropic->open_ai`), so which matrix cell ran
+is observable exactly like `X-ApexRouter-Route`. The Anthropic ingress adds two inbound headers to
+the never-forwarded set: `x-api-key` and `anthropic-version` are consumed by the proxy and never
+reach an upstream.
 
 Errors are OpenAI-shaped everywhere:
 `{"error":{"message":…,"type":…,"code":…,"param":null}}`, with
@@ -1215,6 +1254,10 @@ breaker_min_volume   = 5
 request_usage        = "off"             # off | passthrough (injects stream_options.include_usage)
 capture_bodies       = false             # prompts are NEVER stored unless this is on
 log_usage            = true
+anthropic_ingress    = true              # serve POST /v1/messages on the proxy listener (§6.1)
+anthropic_tools      = false             # translate tool_use/tool_result <-> tool_calls. OFF by
+                                         # default: it is the imperfect part (§12). With it off, a
+                                         # /v1/messages body carrying `tools` is REFUSED, loudly.
 
 [supervisor]
 health_deadline_ms   = 600000            # REAL deadline, reset on observed progress
@@ -1358,8 +1401,10 @@ against; `openapi/apexrouter-v1.yaml` is generated from these tables and checked
 | `POST` | `/v1/completions` | routed |
 | `POST` | `/v1/embeddings` | routed (class `Embedding`; only embedding-capable backends) |
 | `POST` | `/v1/rerank` | routed if the target supports it |
-| `GET` | `/v1/models` | **aggregated** across aliases + every enabled backend, served from the table |
-| `GET` | `/v1/models/{id}` | one entry; alias or `backend/model` |
+| `POST` | `/v1/messages` | **Anthropic ingress** (class `Chat`, `ingress = Anthropic`). Routed by the same `resolve()`. Upstream `Protocol::Anthropic` → relayed verbatim; `Protocol::OpenAi` → **translated** both ways, request and response, streaming and buffered. Requires `anthropic-version: 2023-06-01`; `x-api-key` is accepted for auth and never forwarded. `501` when `[router] anthropic_ingress = false` |
+| `POST` | `/v1/messages/count_tokens` | `501` with an **Anthropic-shaped** error body. Not in mk1 (§12) |
+| `GET` | `/v1/models` | **aggregated** across aliases + every enabled backend, served from the table. **The OpenAI list shape is the default and stays byte-exact** — ApexOS's LAN sweep depends on it. The Anthropic list shape is emitted **only** when the request carries an `anthropic-version` header; same rows, re-rendered — see "Anthropic ingress" below |
+| `GET` | `/v1/models/{id}` | one entry; alias or `backend/model`. Same header rule |
 | `GET`/`HEAD` | `/health` | `{"ok":true,"product":"apexrouter","version":"0.1.0","provider":"<active>","uptime":<f64>}` — a superset of the LocalRouter shape and the house shape. Always 200; never probes a backend |
 | `GET`/`HEAD` | `/providers` | the **exact** LocalRouter JSON shape, plus additive `endpoints[]` and `routes[]`. Probes run **concurrently** with a 3 s cap (was ~8 s serial) and Together is detected from the **full credential chain**, not just `$TOGETHER_API_KEY` — the documented inconsistency, fixed |
 | `POST` | `/switch` | the same request/response shapes, retargeting `default_alias`. Extended with `{"provider":"endpoint","id":…}` and `{"alias":…}`. **Three silent no-ops fixed**: `api_key` in a `together` body is now persisted as a `CredentialRef`; `local` now copies the instance's key; a malformed instance JSON returns a JSON 400, not an HTML 500. Gated by §9.3 |
@@ -1390,6 +1435,28 @@ them:
                  "vision":false,"price":null,"tok_per_s_p50":4.1}}
 ]}
 ```
+
+**Anthropic ingress — what is translated and what is relayed.** Only three things on this listener
+are protocol-aware, and each is stated so nobody has to guess:
+
+- **`POST /v1/messages` against an `OpenAi` backend is fully translated** — request body, response
+  body, and the SSE event stream in both directions. This is real work with real edge cases and it
+  is the whole of work unit **R-10**; the contract it must satisfy (system hoisting, required
+  `max_tokens`, block arrays, tool shapes, `stop_reason`, usage field names, and the named-SSE-event
+  state machine) is specified in `BUILD-PLAN.md` §4, Stage 5.
+- **`POST /v1/messages` against an `Anthropic` backend is relayed, not translated** — same
+  byte-for-byte relay as the OpenAI path, same never-re-framed SSE rule (§4.4). The only change is
+  the credential: the client's `x-api-key` is dropped and the backend's own is constructed onto the
+  outbound request (§4.5). No translation code is on this path at all.
+- **`GET /v1/models` is re-rendered, never translated.** The rows come from the same routing table
+  and the same aggregation function. Without an `anthropic-version` header the OpenAI list shape is
+  returned unchanged — that default is load-bearing, because ApexOS's compute sweep identifies a node
+  by exactly that shape. With the header, the same rows are emitted as
+  `{"data":[{"type":"model","id":…,"display_name":…,"created_at":…}],"has_more":false,
+  "first_id":…,"last_id":…}`; the `apexrouter` extras key is carried through untouched.
+
+Everything else on the proxy listener is protocol-agnostic: `resolve()`, the breaker, the limits,
+the retry rules and the telemetry do not know which dialect came in beyond recording it.
 
 ### 6.2 Control listener (`127.0.0.1:2739`)
 
@@ -1802,10 +1869,33 @@ routes or authors is missing.
 
 Each with the reason, so a future reader knows it was a decision and not an oversight.
 
-- **Anthropic `/v1/messages` translation.** `/v1/messages` is passed through to a backend that
-  speaks it, but there is no OpenAI↔Anthropic body translation. It is a large surface (tool blocks,
-  system prompts, content parts) and Claude Code reaches ApexRouter through MCP for control, not for
-  inference.
+> **Amended.** Anthropic `/v1/messages` translation *was* on this list, on the reasoning that
+> "Claude Code reaches ApexRouter through MCP for control, not for inference". That reasoning was
+> wrong: inference is exactly the point — pointing `ANTHROPIC_BASE_URL` at ApexRouter is what lets
+> the Claude Code harness drive a local or rented model. Anthropic ingress is **in** mk1 as a bonus
+> last feature (§3.4, §6.1, work unit R-10). What genuinely stays out is narrower, and is the first
+> three bullets below.
+
+- **OpenAI → Anthropic translation. Permanently out, not deferred.** The matrix cell returns `501`
+  with an OpenAI-shaped body. ApexOS-RS already speaks Anthropic natively
+  (`agentd/crates/agent/src/anthropic.rs`) and calls `api.anthropic.com` directly with a real key;
+  nothing in the ecosystem wants a proxy that fakes an Anthropic upstream out of an OpenAI one.
+  Building it would mean maintaining a second, unexercised translator.
+- **Perfect Anthropic tool-use translation.** `[router] anthropic_tools` is **off by default** and
+  when on it is *allowed to be imperfect*, which is the honest statement rather than a promise we
+  would quietly break. `input_schema`/`parameters` and `tool_use`/`tool_calls` map cleanly; parallel
+  tool calls, `tool_choice` variants, and a `tool_result` whose content is a block array rather than
+  a string do not map cleanly in every case. With the flag **off**, a `/v1/messages` body carrying
+  `tools` is **refused with a clear error** — never silently stripped and answered wrongly, which is
+  the failure mode that actually costs an agent an hour.
+- **`thinking` blocks, and `/v1/messages/count_tokens`.** There is no OpenAI-side equivalent of an
+  Anthropic `thinking` content block, so mk1 neither synthesises one on the way out nor accepts one
+  on the way in. The closest thing that exists is llama.cpp b9199's `--reasoning-format`, which can
+  emit `reasoning_content` on a chat completion; mk1 records that it exists and does **not** map it
+  onto `thinking` — inventing a signature or a token count for a block the upstream never produced
+  would violate the honesty rule that `CostEstimate` and `TokenCount` exist to enforce.
+  `count_tokens` is `501` for the same reason: the only honest answer needs a tokenizer we do not
+  have, and a fabricated count is worse than an error the client can fall back from.
 - **`Strategy::Mirror`, `Fastest` and sticky sessions.** They are not in the mk1 enum at all, so no
   config value can reach an unimplemented arm. Batch comparison ships instead as
   `POST /v1/compare` / `apexrouter compare`, which is what the feature was actually for.

@@ -1,0 +1,218 @@
+# ApexRouter-RS — config.example.toml
+#
+# OWNER: work unit C-02. Mirrors `docs/ARCHITECTURE.md` §5.2.
+#
+# Copy this to your config path and edit, or run `apexrouter config init`, which writes
+# this exact file for you:
+#
+#     $APEXROUTER_CONFIG                          (an explicit file path)
+#     $APEXROUTER_HOME/config.toml                (an explicit home)
+#     $XDG_CONFIG_HOME/apexrouter/config.toml     (the default: ~/.config/apexrouter/config.toml)
+#
+# EVERY field below is defaulted in code, and every value written here IS that default.
+# A missing config file is therefore a fully working zero-config install, and deleting any
+# line from this file changes nothing. Nothing here is required.
+#
+# Credentials are NOT configured here. A key you merely *borrow* from an env var or from a
+# third-party file is never copied into this file — the sections below name *where* a key
+# lives (`api_key_env`, `api_key_file`), never the key itself. A key you type into a GUI or
+# pipe to `--key-stdin` goes to `$STATE/credentials.toml` at mode 0600. See §9.2.
+
+[server]
+# Data plane: the one base URL every agent, SDK and script on this machine points at.
+# The `$PROXY_PORT` environment variable overrides the port here and IS honoured, because
+# LocalRouter honoured it and shell aliases depend on it.
+proxy_bind = "127.0.0.1:8888"
+# Control plane: REST + WebSocket + /metrics + the embedded web UI. 2739 is APEX on a
+# phone keypad. Clients discover this URL from the lock file or $APEXROUTER_URL — you
+# should never have to type it.
+control_bind = "127.0.0.1:2739"
+# Name of the environment variable holding the bearer token. Required for ANY non-loopback
+# bind: a listener on 0.0.0.0 with no token configured refuses to start.
+token_env = "APEXROUTER_TOKEN"
+# Allow an unauthenticated request from a genuinely loopback peer IP. The peer IP is read
+# from the connection, not from a header, and an absent peer IP fails CLOSED.
+loopback_bypass = true
+# "" serves the web UI embedded in the binary. A path serves that directory instead, which
+# is the live-reload dev loop for `ui-web/`.
+ui_dir = ""
+# How long in-flight requests get to finish after a shutdown signal.
+drain_timeout_secs = 30
+# May a mutating CLI verb start the daemon if it is not running?
+autostart = true
+
+[router]
+# The alias a request lands on when it names no model, names a legacy placeholder
+# ("x", "auto", "default", ""), or — if `unknown_model = "fallback"` — names nothing we know.
+default_alias = "auto"
+# Strategy used when one upstream model id is served by several backends and no route
+# names it explicitly. One of: first_healthy | round_robin | least_busy | cheapest.
+implicit_strategy = "first_healthy"
+# reject | fallback. `reject` by default and deliberately: a fat-fingered "gpt-4o-mimi"
+# must 404 loudly, not silently bill a rented H100.
+unknown_model = "reject"
+# Global in-flight request cap.
+max_inflight = 64
+# GLOBAL resident-body budget, in bytes (512 MiB). A count cap alone is not a memory cap:
+# 64 concurrent requests x 32 MiB each is 2 GiB.
+max_inflight_bytes = 536870912
+# Per-request body cap, in bytes (32 MiB). aiohttp's silent 1 MiB default was a bug that
+# truncated long-context requests.
+max_body_bytes = 33554432
+# TCP connect timeout, milliseconds.
+connect_timeout_ms = 5000
+# Time allowed to the response HEADERS, milliseconds. Long on purpose: a non-streaming
+# completion sends no headers until generation has finished.
+headers_timeout_ms = 600000
+# Idle timeout BETWEEN stream chunks, milliseconds. This is never a total timeout on a
+# stream — a long generation that keeps producing tokens is never cut off.
+idle_timeout_ms = 300000
+# How long to wait for a backend concurrency permit before answering 503 + Retry-After.
+queue_timeout_ms = 30000
+# Per-backend retry token bucket, so a struggling backend is not amplified into a storm.
+retry_budget_per_min = 30
+# How many observations a breaker needs before it is allowed to open.
+breaker_min_volume = 5
+# off | passthrough. `passthrough` injects `stream_options.include_usage` so streaming
+# requests report token counts. It changes what every streaming client receives, so it is
+# opt-in rather than default.
+request_usage = "off"
+# Prompts and completions are NEVER stored unless this is on.
+capture_bodies = false
+# Append one row per request to $STATE/usage.jsonl.
+log_usage = true
+# Serve POST /v1/messages (the Anthropic dialect) on the proxy listener, so
+# ANTHROPIC_BASE_URL=http://127.0.0.1:8888 drives a local or rented model.
+anthropic_ingress = true
+# Translate tool_use/tool_result <-> tool_calls. OFF by default: it is the imperfect part.
+# With it off, a /v1/messages body carrying `tools` is REFUSED loudly rather than silently
+# stripped and answered wrongly.
+anthropic_tools = false
+
+[supervisor]
+# A REAL wall-clock deadline for the health gate, reset whenever observable progress is
+# made (a download percentage moves, a load percentage moves). Milliseconds.
+health_deadline_ms = 600000
+# How often to probe a starting endpoint, milliseconds.
+health_interval_ms = 3000
+# Re-adopt identity-verified children (pid AND start time AND boot id AND exe) at startup.
+adopt_on_start = true
+# FALSE by default, and honest about what it means: a model that took 90 seconds and 6 GB
+# to load survives `systemctl --user restart apexrouterd`, a crash, and `cargo install`.
+# Vast instances are never auto-destroyed on shutdown at ANY setting.
+kill_children_on_exit = false
+# never | on-failure.
+restart = "never"
+# Restart budget, so a crash-looping endpoint cannot spin forever.
+max_restarts_per_hour = 5
+# Rotate a child's log at this size, in MiB, with copytruncate semantics — an adopted
+# child holds an fd to that inode, so renaming would send its output into a deleted file.
+log_rotate_mb = 32
+
+[endpoints]
+# Where to look for GGUF weights. Searched recursively; per-model subdirectories and
+# multi-shard models (-00001-of-000NN) are grouped into one logical model.
+model_roots = ["~/models", "~/.cache/huggingface/hub"]
+# Where to look for llama.cpp builds (`build*/bin/llama-server`, or a bare llama-server).
+build_roots = ["~/llama.cpp", "~/Projects/llama.cpp", "/usr/local/bin"]
+# Globs skipped while walking the roots above.
+ignore_globs = ["**/.cache/**"]
+# Port pool for locally spawned servers. 8100+ is baked into existing agent configs.
+port_range = [8100, 8199]
+# Sampling preset for `apexrouter up`: thinking | coding | nonthinking | raw.
+default_mode = "thinking"
+# Safety margin held back from every VRAM budget, in MiB.
+vram_margin_mb = 1024
+# Background rescan interval, seconds. Plan-time queries are ALWAYS live regardless of
+# this — the fit solver never reads a 300-second-old free-VRAM number.
+scan_interval_secs = 300
+
+# Managed OpenAI-compatible providers, keyed by provider id.
+#
+# `api_key_env` / `api_key_file` say WHERE the key is. Neither this file nor any file
+# ApexRouter writes ever holds the key itself.
+[providers.together]
+base_url = "https://api.together.ai/v1"
+api_key_env = "TOGETHER_API_KEY"
+
+# Add as many as you like:
+#
+# [providers.openrouter]
+# base_url = "https://openrouter.ai/api/v1"
+# api_key_env = "OPENROUTER_API_KEY"
+#
+# [providers.somebody]
+# base_url = "https://api.example.com/v1"
+# api_key_file = "~/.config/somebody/key"
+
+# vast.ai. Its own section because money lives here.
+#
+# `[providers.vast]` is also accepted and merged into this section, because that is the
+# spelling ARCHITECTURE §5.2 prints; `[vast]` is the canonical one and is what `save()`
+# writes into a document that does not already use the other.
+[vast]
+base_url = "https://console.vast.ai/api/v0"
+# The `vastai` CLI's own convention. Read, never written.
+api_key_file = "~/.config/vastai/vast_api_key"
+# vast.ai publishes no rate limits, so we set our own floor. Never poll faster than this.
+poll_min_ms = 5000
+# Give up on an instance that has not become healthy within this many seconds.
+max_boot_secs = 1800
+# Local port pool for `ssh -L` tunnels. 8800+ is baked into existing agent configs.
+tunnel_port_range = [8800, 8899]
+# adopt | down. What happens to live tunnels when the daemon exits. Instances themselves
+# are NEVER destroyed on shutdown — a crash must not delete a paid box.
+tunnels_on_shutdown = "adopt"
+# HARD daemon-side spend cap, USD per hour. A SpendApproval cannot exceed it, so an agent
+# that fills in a big number still cannot spend more than you configured here.
+max_usd_per_hour_ceiling = 4.0
+# true => an approval that came from MCP (i.e. from an agent) is refused until a human
+# clears it out of band.
+require_human_confirm = false
+
+[hf]
+# Conventional HuggingFace token path. Read, never written.
+token_file = "~/.cache/huggingface/token"
+# Where `apexrouter hf pull` puts weights.
+download_dir = "~/models"
+
+# The published container images. Genuine configuration: these are artifacts you can
+# republish under your own account.
+[docker]
+prebuilt = "ghcr.io/buckster123/vastai-gguf:prebuilt"
+builder = "ghcr.io/buckster123/vastai-gguf:builder"
+vllm = "ghcr.io/buckster123/vastai-gguf:vllm"
+
+# Genuinely undiscoverable knowledge: which model needs which llama.cpp fork. A match here
+# FORCES the builder image, sets LLAMA_CPP_REPO/LLAMA_CPP_REF, and pushes a
+# "custom fork -> builder image -> +12-18 min cold start" warning that every surface
+# renders before the confirm. `match_repo` is a glob over the HuggingFace repo id.
+[known_forks."deepseek-v4"]
+match_repo = "deepseek-ai/DeepSeek-V4*"
+llama_cpp_repo = "fairydreaming/llama.cpp"
+llama_cpp_ref = "deepseek-dsa"
+
+# [known_forks."my-fork"]
+# match_repo = "someone/SomeModel*"
+# llama_cpp_repo = "someone/llama.cpp"
+# llama_cpp_ref  = "some-branch"
+
+[compat]
+# Read ~/.vastai-gguf for usage rows, provider base URLs and saved local instances.
+# Read-only: that directory is never rewritten.
+read_legacy_state = true
+# Also append every usage row to ~/.vastai-gguf/usage.log in the exact legacy field set,
+# so the old cost.py keeps working.
+mirror_usage_log = true
+# "" = off. A path mirrors the default alias into a legacy `.active_endpoint` file on every
+# change, atomically, for the old TUI.
+active_endpoint_path = ""
+# DEFAULT OFF, and here is the reason: LocalRouter's `_proxy_down()` reads
+# /tmp/vastai-gguf-proxy.pid and SIGTERMs whatever pid it names. Turning this on hands the
+# old TUI's "Proxy -> stop" menu item a kill switch for this entire daemon. Local children
+# survive via setsid, but the routing table, the tunnels and the watchdogs go with it.
+legacy_proxy_pidfile = false
+# POST /switch validates any supplied base_url against this list. Unauthenticated /switch
+# with an arbitrary URL plus an injected provider key is a credential-exfiltration
+# primitive, not merely SSRF.
+allow_switch_hosts = ["api.together.ai", "127.0.0.1", "localhost"]

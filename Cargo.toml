@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/apexrouter-protocol",
+    "crates/apexrouter-core",
+    "crates/apexrouter-router",
+    "crates/apexrouter-providers",
+    "crates/apexrouter-client",
+    "crates/apexrouter-server",
+    "crates/apexrouter-cli",
+    "crates/apexrouter-slint",   # GPL app — deliberately NOT in default-members
+]
+default-members = [
+    "crates/apexrouter-protocol",
+    "crates/apexrouter-core",
+    "crates/apexrouter-router",
+    "crates/apexrouter-providers",
+    "crates/apexrouter-client",
+    "crates/apexrouter-server",
+    "crates/apexrouter-cli",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.75"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/buckster123/ApexRouter-RS"
+authors      = ["Andre <buckster123>"]
+
+[workspace.dependencies]
+apexrouter-protocol  = { path = "crates/apexrouter-protocol",  version = "0.1.0" }
+apexrouter-core      = { path = "crates/apexrouter-core",      version = "0.1.0" }
+apexrouter-router    = { path = "crates/apexrouter-router",    version = "0.1.0" }
+apexrouter-providers = { path = "crates/apexrouter-providers", version = "0.1.0" }
+apexrouter-client    = { path = "crates/apexrouter-client",    version = "0.1.0" }
+apexrouter-server    = { path = "crates/apexrouter-server",    version = "0.1.0" }
+
+anyhow             = "1"
+thiserror          = "2"
+serde              = { version = "1", features = ["derive"] }
+serde_json         = { version = "1", features = ["preserve_order"] }
+toml               = "0.8"
+toml_edit          = "0.22"
+clap               = { version = "4", features = ["derive", "env"] }
+clap_complete      = "4"
+tokio              = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "io-util", "io-std", "sync", "process", "signal", "net"] }
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+axum               = { version = "0.8", features = ["ws"] }
+tower              = "0.5"
+tower-http         = { version = "0.7.0", features = ["trace", "fs"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arc-swap           = "1"
+bytes              = "1"
+futures-util       = "0.3"
+async-trait        = "0.1"
+chrono             = { version = "0.4", features = ["serde"] }
+ulid               = { version = "1", features = ["serde"] }
+dirs               = "6"
+notify             = "6"
+rust-embed         = "8"
+sysinfo            = "0.32"
+glob               = "0.3"
+sha2               = "0.10"
+rustix             = { version = "0.38", features = ["fs", "process", "thread"] }
+tokio-tungstenite  = "0.24"
+slint              = "1"
+slint-build        = "1"
+tempfile           = "3"
+wiremock           = "0.6"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = true
+
+[profile.dev]
+debug = "line-tables-only"     # the dev box is at 92% disk

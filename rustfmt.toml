@@ -1,0 +1,2 @@
+# House default. Intentionally empty — we use rustfmt's defaults, and this file
+# exists so `cargo fmt --all -- --check` is unambiguous in CI.

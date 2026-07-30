@@ -1,0 +1,15 @@
+// OWNER: unit U-02 (crates/apexrouter-slint/src/**, except build.rs).
+//
+// Stage 0 placeholder: an empty AppWindow so `slint_build::compile` and
+// `slint::include_modules!()` have something to chew on.
+//
+// U-02 builds the real tree: this root plus palette.slint, types.slint and
+// components/{card,badge,meter,table,logview,drawer}.slint. `export global Palette` matches
+// the web tokens exactly, and EVERY component reads from it — a grep asserts no colour
+// literal exists outside palette.slint.
+
+export component AppWindow inherits Window {
+    title: "ApexRouter";
+    preferred-width: 1100px;
+    preferred-height: 720px;
+}

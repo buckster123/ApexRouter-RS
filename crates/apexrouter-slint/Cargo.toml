@@ -1,0 +1,31 @@
+[package]
+name = "apexrouter-slint"
+description = "ApexRouter-RS native UI — Slint edge client of the same HTTP API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+license = "GPL-3.0-only"     # deliberate: Slint's GPL option. NOT the workspace license.
+publish = false
+
+[[bin]]
+name = "apexrouter-ui"
+path = "src/main.rs"
+
+[features]
+default = ["winit"]
+winit = ["slint/backend-winit"]
+# linuxkms = ["slint/backend-linuxkms-noseat"]   # for pure-ApexOS KMS/DRM setups
+
+[dependencies]
+apexrouter-protocol = { workspace = true }
+apexrouter-client   = { workspace = true }
+slint        = { workspace = true }
+tokio        = { workspace = true }
+anyhow       = { workspace = true }
+serde_json   = { workspace = true }
+futures-util = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

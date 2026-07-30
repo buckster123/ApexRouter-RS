@@ -32,8 +32,8 @@ Stage 3  ── 10 agents, parallel ── router crate (the request path) + the
 Stage 4  ── 6 agents, parallel ──  server (both listeners, ws, auth, assets) + CLI core verbs
             GATE: ***MK1-CORE ACCEPTANCE*** — §7.1 end-to-end on this laptop
 
-Stage 5  ── 13 agents, parallel ── vast, hf, together, ssh, web UI, Slint, MCP, CLI remainder,
-                                   compare/smoke/diagnose, jobs, docs
+Stage 5  ── 14 agents, parallel ── vast, hf, together, ssh, web UI, Slint, MCP, CLI remainder,
+                                   compare/smoke/diagnose, jobs, Anthropic ingress, docs
             GATE: per-unit acceptance + `cargo clippy -D warnings` on every headless crate
 
 Stage 6  ── 5 agents, parallel ──  migration, README/banner, CHARTER/API/SLINT/AGENTS, SKILL.md,
@@ -680,9 +680,18 @@ impl Default for SplitPlan { /* devices: [], mode: Layer, main_gpu: None, tensor
 ### 3.6 `src/backend.rs`
 
 ```rust
+/// The wire dialect a listener accepts or an upstream speaks. ARCHITECTURE §3.4 is the matrix.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Protocol { OpenAi, Anthropic }
+impl Default for Protocol { fn default() -> Self { Protocol::OpenAi } }
+impl Protocol { pub fn as_str(&self) -> &'static str; }   // "open_ai" | "anthropic"
+
 pub enum BackendKind { LocalLlama, LocalVllm, VastLlama, VastVllm, Managed, Node }
 
-pub struct Backend { pub id: BackendId, pub kind: BackendKind, pub label: String,
+pub struct Backend { pub id: BackendId, pub kind: BackendKind,
+    #[serde(default)] pub protocol: Protocol,             // OpenAi unless the record says otherwise
+    pub label: String,
     pub base_url: String,                 // INVARIANT: never ends in /v1
     pub credential: CredentialSource, pub tags: Vec<String>, pub models: Vec<UpstreamModel>,
     pub limits: BackendLimits, pub price: Option<PriceModel>, pub health: Health,
@@ -758,9 +767,11 @@ pub struct LocalVllmSpec { pub bin: String, pub model_id: String, pub tp: Option
     pub extra_args: Vec<String> }
 
 pub struct NodeSpec { pub base_url: String, pub credential: CredentialSource,
-                      pub label: String, pub declared_models: Vec<String> }
+                      pub label: String, pub declared_models: Vec<String>,
+                      #[serde(default)] pub protocol: Protocol }
 pub struct ManagedSpec { pub provider: ProviderId, pub base_url: String,
-                         pub credential: CredentialSource, pub model_id: Option<String> }
+                         pub credential: CredentialSource, pub model_id: Option<String>,
+                         #[serde(default)] pub protocol: Protocol }
 pub struct VastSpec { pub instance_id: InstanceId, pub runtime: ContainerRuntime,
                       pub launch: ContainerLaunch, pub tunnel: Option<TunnelSpec> }
 
@@ -810,7 +821,10 @@ pub enum Severity { Info, Warning, Error }
 ```rust
 pub struct RequestRecord { pub id: RequestId, pub started_unix: i64, pub alias: Option<Alias>,
     pub backend: Option<BackendId>, pub upstream_model: Option<String>,
-    pub route_reason: RouteReason, pub method: String, pub path: String, pub status: u16,
+    pub route_reason: RouteReason,
+    #[serde(default)] pub ingress: Protocol,   // the dialect the CLIENT spoke; the upstream's lives
+                                               // on the Backend, so the pair names the matrix cell
+    pub method: String, pub path: String, pub status: u16,
     pub attempts: u8, pub streamed: bool, pub aborted: bool, pub ttft_ms: Option<u32>,
     pub total_ms: u32, pub prompt_tokens: Option<TokenCount>,
     pub completion_tokens: Option<TokenCount>, pub cached_tokens: Option<u32>,
@@ -1575,7 +1589,12 @@ pub async fn proxy_handler(State(r): State<Router>, req: Request) -> Response;
 *Acceptance*: `proxy_router()` merged with any other router does **not** panic (explicit test).
 The full pipeline of §4.3 is exercised against a `wiremock` upstream: routing, retry on 502,
 no-retry-after-first-byte, 413 on an oversized body, 508 on a `Via` loop, `X-ApexRouter-Route` on
-every response.
+every response. The handler also **owns the `(ingress, upstream)` matrix dispatch** of
+`ARCHITECTURE.md` §3.4: it records `RequestRecord.ingress`, relays for `OpenAi→OpenAi` and
+`Anthropic→Anthropic`, returns `501` with an **OpenAI-shaped** body for `OpenAi→Anthropic`, and for
+`Anthropic→OpenAi` calls into `router/src/anthropic/` — stubbed by Stage 0, filled in by **R-10**
+(Stage 5) against the signatures published there. In Stage 3 the stub returns `501`; the dispatch,
+the `X-ApexRouter-Protocol` header and the `ingress` field are R-08's and are tested here.
 
 **R-09 · legacy compat handlers** — owns `router/src/compat.rs`
 ```rust
@@ -1767,7 +1786,7 @@ credentials and no money.
 
 ---
 
-### Stage 5 — providers, GUIs, MCP, remaining CLI (13 agents, parallel)
+### Stage 5 — providers, GUIs, MCP, remaining CLI (14 agents, parallel)
 
 **P-02 · vast REST client** — owns `providers/src/vast/api.rs`, `providers/src/vast/query.rs`
 ```rust
@@ -1930,6 +1949,121 @@ doctor,compare,backend,swap,up,approvals,token,open,env,migrate}.rs`
 ambiguous prefix. Money verbs require `--yes` and print `$/hr`, estimated total and **current
 credit** before acting. `apexrouter completions bash|zsh|fish` emits working completions.
 
+**R-10 · Anthropic ingress translation** — owns `router/src/anthropic/mod.rs`,
+`router/src/anthropic/translate.rs`, `router/src/anthropic/sse.rs`
+
+The bonus last mk1 feature: `ANTHROPIC_BASE_URL=http://127.0.0.1:8888` makes the Claude Code harness
+drive a local or rented model. Read `ARCHITECTURE.md` §3.4 (the `(ingress, upstream)` matrix) and
+§6.1 (the routes) first — **this unit implements exactly one matrix cell, `Anthropic → OpenAi`.**
+The `Anthropic → Anthropic` cell is the existing byte relay and needs no code here; `OpenAi →
+Anthropic` is a `501` and stays one.
+
+**You do not own `router/src/handler.rs`.** R-08 wired the matrix dispatch in Stage 3 against the
+signatures below and Stage 0 stubbed `router/src/anthropic/`. If a signature here is genuinely
+wrong, stop and report it — do not edit R-08's file.
+
+```rust
+// mod.rs — the surface R-08's handler calls. Nothing else in the crate knows this module exists.
+pub fn is_anthropic_ingress(path: &str, headers: &HeaderMap) -> bool;
+/// `/v1/messages` -> `/v1/chat/completions`. The ONLY path rewrite this unit performs.
+pub fn upstream_path(ingress_path: &str) -> &'static str;
+/// Anthropic-shaped error body, for failures that occur before/instead of an upstream hop.
+/// Shape: {"type":"error","error":{"type":…,"message":…}}  — NOT the OpenAI shape.
+pub fn anthropic_error(status: StatusCode, kind: &str, msg: &str) -> axum::response::Response;
+
+// translate.rs — pure, synchronous, no I/O, unit-tested against fixtures.
+pub struct AnthropicCfg { pub tools: bool }          // from [router] anthropic_tools
+pub enum TranslateError {
+    MissingMaxTokens,                                 // required on the Anthropic side
+    ToolsDisabled,                                    // `tools` present while cfg.tools == false
+    UnsupportedBlock { kind: String },                // e.g. "thinking"
+    Malformed { at: String, why: String },
+}
+/// Anthropic MessagesRequest -> OpenAI ChatCompletionRequest. `model` is left EXACTLY as the
+/// client sent it: resolve() owns model naming, this unit never invents an alias.
+pub fn request_to_openai(body: &[u8], cfg: &AnthropicCfg) -> Result<Vec<u8>, TranslateError>;
+/// Buffered OpenAI ChatCompletion -> Anthropic Message. `id` is passed through prefixed `msg_`.
+pub fn response_to_anthropic(body: &[u8]) -> Result<Vec<u8>, TranslateError>;
+pub fn map_stop_reason_to_anthropic(finish_reason: &str) -> &'static str;
+pub fn map_stop_reason_to_openai(stop_reason: &str) -> &'static str;
+
+// sse.rs — the state machine. This is the unit's main risk.
+pub struct SseTranslator { /* block index, open/close state, accumulated usage, message id */ }
+impl SseTranslator {
+    pub fn new(model: String) -> Self;
+    /// Feed one OpenAI SSE frame; get back zero or more Anthropic frames, already framed
+    /// `event: <name>\ndata: <json>\n\n`. `data: [DONE]` yields the closing frames.
+    pub fn feed(&mut self, frame: &[u8]) -> Vec<Bytes>;
+    /// Upstream ended without [DONE]: close every open block honestly, then message_stop.
+    pub fn finish(self) -> Vec<Bytes>;
+}
+```
+
+**The translation contract, precisely** (each line is a fixture test):
+
+| Anthropic | OpenAI | Rule |
+|---|---|---|
+| top-level `system` (string or block array) | a `{"role":"system"}` message | **hoist/lower.** Prepended as the first message; a block array is joined on `\n\n`. Absent ⇒ no system message is invented |
+| `max_tokens` — **REQUIRED** | `max_tokens` — optional | Missing ⇒ `TranslateError::MissingMaxTokens` ⇒ `400` Anthropic-shaped `invalid_request_error`. Never defaulted silently |
+| `content`: typed block array (`text`, `image`, `tool_use`, `tool_result`) | `content`: a plain string, or the OpenAI parts array | A single `text` block lowers to a plain string (the common case, and what keeps llama.cpp happy); multiple blocks lower to the parts array |
+| `tools[].input_schema` | `tools[].function.parameters` | Rename only; the JSON Schema itself is copied byte-identically |
+| `tool_use` block | an assistant message's `tool_calls[]` | `id`→`id`, `name`→`function.name`, `input` (object) → `function.arguments` (**a JSON string**) |
+| `tool_result` block in a `user` message | a `{"role":"tool","tool_call_id":…}` message | One `tool_result` becomes one `tool` message; they are hoisted out of the user turn in order |
+| `stop_reason: end_turn` | `finish_reason: stop` | both directions |
+| `stop_reason: max_tokens` | `finish_reason: length` | both directions |
+| `stop_reason: tool_use` | `finish_reason: tool_calls` | both directions |
+| `usage.input_tokens` / `output_tokens` | `usage.prompt_tokens` / `completion_tokens` | rename only; never recomputed, never estimated |
+| `thinking` block | — | no equivalent. Rejected as `UnsupportedBlock` (§12). llama.cpp b9199 has `--reasoning-format` and can emit `reasoning_content`, which is the closest thing that exists — mk1 records that and does **not** map it |
+
+**Required inbound headers.** `anthropic-version: 2023-06-01` must be present (a missing or
+unrecognised value is a `400` Anthropic-shaped error naming the header). `x-api-key` is the
+Anthropic-side auth header and is accepted wherever a bearer would be; both it and
+`anthropic-version` are consumed here and **never** appear on the outbound request — R-03's
+constructed-allowlist rule already guarantees that, and a test asserts it.
+
+**Streaming is the hard part.** Anthropic emits *named* SSE events —
+`message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`,
+`message_stop` — carrying explicit content-block **indices** and a final `usage` on `message_delta`.
+OpenAI emits one delta shape repeatedly and terminates with `data: [DONE]`. Rebuilding that state
+machine correctly — opening a block on the first delta of a kind, keeping the index monotonic,
+closing every opened block exactly once, emitting `message_delta` with `stop_reason` **and** the
+final usage before `message_stop` — is where this unit will break if it breaks.
+
+**Stage the work inside the unit, in this order:**
+1. **Non-streaming text.** `request_to_openai` + `response_to_anthropic` round-trip.
+2. **Streaming text.** `SseTranslator` for `text` blocks only.
+3. **Tool use, behind `[router] anthropic_tools`.** With the flag **off**, a body carrying `tools`
+   returns `TranslateError::ToolsDisabled` as a `400` Anthropic-shaped error naming the config key —
+   **a clear error, never a silent wrong answer with the tools quietly dropped.**
+
+*Acceptance*:
+- A `wiremock` OpenAI upstream + a real `/v1/messages` request body captured from Claude Code:
+  buffered round-trip produces a valid Anthropic `Message` with `role:"assistant"`,
+  `content:[{"type":"text",…}]`, a mapped `stop_reason`, and `usage` in Anthropic field names.
+- **The SSE state-machine test is the gate.** Replaying a recorded llama.cpp OpenAI SSE capture
+  through `SseTranslator` produces a frame sequence that: starts with exactly one `message_start`;
+  opens and closes each content block exactly once with indices `0..n` and no gaps; never emits a
+  `content_block_delta` for a closed or unopened index; ends with `message_delta` carrying both
+  `stop_reason` and the final `usage`, then exactly one `message_stop`. A property test feeding
+  arbitrary chunk splits of the same capture (including splits **inside** a `data:` line) yields an
+  identical frame sequence — chunk boundaries must not be observable.
+- Upstream dies mid-stream ⇒ every open block is closed, then `message_stop`. Never a truncated
+  block, never a dangling index.
+- `max_tokens` absent ⇒ `400`, and the body is **Anthropic-shaped**
+  (`{"type":"error","error":{"type":"invalid_request_error",…}}`), because the client is an
+  Anthropic SDK and will parse it as one. Symmetrically, the `OpenAi → Anthropic` `501` carries an
+  **OpenAI-shaped** body.
+- `tools` present with `anthropic_tools = false` ⇒ `400` naming the config key. Zero upstream hops.
+- With `anthropic_tools = true`, a `get_weather` fixture survives the full loop:
+  `tool_use` → `tool_calls` → upstream → `tool_result` → `role:"tool"` → final answer.
+- A `thinking` block in a request ⇒ `UnsupportedBlock`, not a panic and not a silent drop.
+- Ingress detection never fires on an OpenAI request: `is_anthropic_ingress` is false for every path
+  and header combination in the existing R-08 test suite, and
+  **`GET /v1/models` without an `anthropic-version` header returns the byte-identical OpenAI list
+  shape it returns today** — a regression test asserts this, because ApexOS's LAN compute sweep
+  identifies a node by that shape.
+- Clippy clean; `translate.rs` does no I/O and is not `async`.
+
 **D-01 · docs (part A)** — owns `docs/API.md`, `docs/ROUTING.md`, `openapi/apexrouter-v1.yaml`
 *Acceptance*: every route in §6 documented with a jsonc example carrying inline enum comments. The
 OpenAPI file validates and is checked in CI against the route table (a test enumerates axum's routes
@@ -2018,6 +2152,7 @@ Quick check that no file is owned twice. If you are about to write a file not on
 | R-07 | `router/src/telemetry.rs` |
 | R-08 | `router/src/lib.rs`, `router/src/handler.rs` |
 | R-09 | `router/src/compat.rs` |
+| R-10 (Stage 5) | `router/src/anthropic/{mod,translate,sse}.rs` |
 | P-01 | `providers/src/local/**` |
 | P-02 | `providers/src/vast/api.rs`, `providers/src/vast/query.rs`, `providers/src/vast/mod.rs` |
 | P-03 | `providers/src/vast/offers.rs` |
@@ -2229,4 +2364,24 @@ git status --porcelain                     # clean: no state file was written in
 grep -rn 'unwrap()' crates/*/src | grep -v tests | wc -l    # 0 outside tests and main()
 ```
 
-When A–G pass, mk1 is done.
+**H. Anthropic ingress (the bonus surface, R-10).**
+```bash
+curl -s localhost:8888/v1/messages -H 'anthropic-version: 2023-06-01' \
+  -H 'x-api-key: not-needed' -H 'content-type: application/json' \
+  -d '{"model":"auto","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}' | jq
+# -> {"type":"message","role":"assistant","content":[{"type":"text",...}],
+#     "stop_reason":"end_turn","usage":{"input_tokens":N,"output_tokens":M}}
+
+curl -s localhost:8888/v1/models | jq '.data[0]'          # OpenAI shape, unchanged (ApexOS sweep)
+curl -s localhost:8888/v1/models -H 'anthropic-version: 2023-06-01' | jq '.data[0].type'  # "model"
+```
+- The same request with `"stream":true` yields the named-event sequence: `message_start`,
+  `content_block_start`, N × `content_block_delta`, `content_block_stop`, `message_delta` (with
+  `stop_reason` **and** final `usage`), `message_stop`.
+- The same request **without** `max_tokens` returns `400` with an **Anthropic-shaped** error body.
+- With `[router] anthropic_tools = false` (the default), a body carrying `tools` returns `400`
+  naming the config key — and the upstream is never contacted.
+- **The real test:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8888 ANTHROPIC_API_KEY=not-needed claude`
+  starts a Claude Code session that completes a turn against the local model.
+
+When A–H pass, mk1 is done.

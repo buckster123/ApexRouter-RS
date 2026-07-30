@@ -1,0 +1,37 @@
+[package]
+name = "apexrouter-server"
+description = "ApexRouter-RS axum application — proxy listener, control plane, WebSocket, embedded web UI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+apexrouter-protocol  = { workspace = true }
+apexrouter-core      = { workspace = true }
+apexrouter-router    = { workspace = true }
+apexrouter-providers = { workspace = true }
+axum         = { workspace = true }
+tower        = { workspace = true }
+tower-http   = { workspace = true }
+tokio        = { workspace = true }
+reqwest      = { workspace = true }
+arc-swap     = { workspace = true }
+bytes        = { workspace = true }
+futures-util = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tracing      = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+chrono       = { workspace = true }
+ulid         = { workspace = true }
+notify       = { workspace = true }
+rust-embed   = { workspace = true }
+sha2         = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }

@@ -1,0 +1,117 @@
+# ApexRouter-RS — example routing table.
+#
+# THE ROUTING TABLE IS THE PRODUCT. An alias is a stable string a client puts in
+# "model"; it points at an ordered chain of live backends. Point every agent at
+# http://127.0.0.1:8888/v1 with model "auto" once and never touch either again.
+#
+# The daemon PERSISTS this table as JSON at $STATE/routes.json (a `RouteFile`:
+# `{ "schema_version": 1, "default_alias": "auto", "routes": [ModelRoute] }`).
+# This TOML file is documentation and a hand-editable starting point — copy the
+# shapes, not the file. Edit the live table with `apexrouter route set`, the web
+# UI, the Slint app or `PUT /v1/routes`; all four go through the same validator.
+#
+# Every field below maps 1:1 onto `apexrouter_protocol::route::*`.
+
+schema_version = 1
+
+# Resolution rule 5: an absent model, "", "x", "auto" or "default" lands here.
+# This is why smoke.sh's hardcoded {"model":"x"} keeps working.
+default_alias = "auto"
+
+
+# ---------------------------------------------------------------------------
+# `auto` — the one alias every agent should use.
+# ---------------------------------------------------------------------------
+[[routes]]
+alias       = "auto"
+is_default  = true
+description = "Whatever is healthy and local first, then whatever is rented."
+
+# first_healthy | round_robin | least_busy | cheapest
+# mk1 ships EXACTLY the strategies it implements: no config value can reach a
+# `todo!()`. `cheapest` is REJECTED at compile time on a route where no target
+# has a price model — it would be an invented number.
+strategy = "first_healthy"
+
+  # Targets are ORDERED. `backend.sel` is one of:
+  #   id   — an exact BackendId          { sel = "id",   value = "local-carnice" }
+  #   tag  — every backend carrying tag  { sel = "tag",  value = "local" }
+  #   glob — a BackendId glob            { sel = "glob", value = "vast-*" }
+  # `model` overrides the upstream model id sent on; omit it to send the
+  # backend's own advertised id. `weight` is used by round_robin only.
+  [[routes.targets]]
+  backend = { sel = "id", value = "local-carnice" }
+  model   = "Carnice-9b-Q6_K"
+  weight  = 1
+
+  [[routes.targets]]
+  backend = { sel = "glob", value = "vast-*" }
+  weight  = 1
+
+  # A candidate that fails any filter is never dispatched to.
+  [routes.filter]
+  require_tags       = []
+  exclude_tags       = ["experimental"]
+  max_cost_per_mtok  = 0        # micro-USD; 0 here means "unset" only because
+                                # the field is Option<Money> — omit it instead.
+  min_ctx            = 8192
+  require_vision     = false
+  require_tools      = false
+
+  # attempts counts TOTAL tries, including the first. There is never a retry
+  # after the first upstream byte — that invariant is a type, not a comment.
+  [routes.retry]
+  attempts           = 2
+  failover           = true
+  honor_retry_after  = true
+
+
+# ---------------------------------------------------------------------------
+# `coder` — pin one backend, no failover. Handy while benchmarking.
+# ---------------------------------------------------------------------------
+[[routes]]
+alias       = "coder"
+is_default  = false
+strategy    = "first_healthy"
+description = "Deterministic: exactly one target, never fails over."
+
+  [[routes.targets]]
+  backend = { sel = "id", value = "local-carnice" }
+  weight  = 1
+
+  [routes.filter]
+  require_tags   = ["tools"]
+  exclude_tags   = []
+  require_vision = false
+  require_tools  = true
+
+  [routes.retry]
+  attempts          = 1
+  failover          = false
+  honor_retry_after = true
+
+
+# ---------------------------------------------------------------------------
+# `big` — spread across every rented box, cheapest first.
+# ---------------------------------------------------------------------------
+[[routes]]
+alias       = "big"
+is_default  = false
+strategy    = "cheapest"
+description = "Rented capacity. `cheapest` needs a price on every target."
+
+  [[routes.targets]]
+  backend = { sel = "tag", value = "rented" }
+  weight  = 1
+
+  [routes.filter]
+  require_tags   = []
+  exclude_tags   = []
+  min_ctx        = 32768
+  require_vision = false
+  require_tools  = false
+
+  [routes.retry]
+  attempts          = 3
+  failover          = true
+  honor_retry_after = true

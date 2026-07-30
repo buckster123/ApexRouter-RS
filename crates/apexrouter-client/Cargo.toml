@@ -1,0 +1,19 @@
+[package]
+name = "apexrouter-client"
+description = "ApexRouter-RS thin HTTP+WS client — used by the CLI, the MCP server and the Slint app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+apexrouter-protocol = { workspace = true }
+reqwest           = { workspace = true }
+tokio             = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util      = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+thiserror         = { workspace = true }
