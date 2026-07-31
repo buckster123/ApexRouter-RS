@@ -15,10 +15,12 @@
 //! serialises `RequestFinished` while `tx.receiver_count() > 0` — the rule that stops a
 //! router at 50 rps from drowning its own dashboard. So a [`RequestLog`] must be **attached**
 //! before it can see anything, and everything before the attach is invisible to it.
-//! [`attach`] is idempotent and per-channel; a daemon should call it once at startup
-//! (`crate::api::requests::attach(&state.tx)`), and the handlers call it lazily so a
-//! control plane that never wires it up still answers with everything since the first query
-//! instead of an empty list forever.
+//! [`attach`] is idempotent and per-channel. **`crate::build_state` calls it once, before
+//! either listener binds** — for a while nothing did, and the visible symptom was both GUIs
+//! showing an empty live-request panel on first load however much traffic had preceded them,
+//! then self-healing from the next poll. The handlers still call it lazily as well, so an
+//! embedder that assembles its own `AppState` gets everything since its first query rather
+//! than an empty list forever.
 //!
 //! `usage.jsonl` remains the durable record. This ring is a display buffer: bounded, in
 //! memory, and gone on restart, exactly like the one it mirrors.

@@ -139,6 +139,41 @@ impl RouterInner {
         self.table.load()
     }
 
+    /// Swap in a freshly parsed configuration. **The counterpart of [`store_table`].**
+    ///
+    /// [`store_table`]: RouterInner::store_table
+    ///
+    /// The request path re-reads this `ArcSwap` on every request, so every `[router]` key it
+    /// consults takes effect on the **next** request with no restart: `anthropic_tools`,
+    /// `unknown_model`, `max_body_bytes`, `log_usage`, `implicit_strategy`, and the
+    /// `headers_timeout_ms` / `idle_timeout_ms` / `queue_timeout_ms` family. An in-flight
+    /// stream keeps the configuration it started with, because the handler took a
+    /// `load_full()` at its first line.
+    ///
+    /// Until this existed there was no way to reach the field: `AppState.cfg` and
+    /// `RouterInner.cfg` are two `ArcSwap<Config>`s and only the first had a setter, so
+    /// `POST /v1/reload` answered `{"ok":true,"issues":[]}` while the proxy went on serving
+    /// the configuration the daemon booted with. A reload that reports success and changes
+    /// nothing is worse than one that fails.
+    ///
+    /// **Three things are still not hot** and it is a deliberate limit, not an oversight:
+    /// `connect_timeout_ms` and the pool shape are baked into the one pooled
+    /// `reqwest::Client` ([`build_http_client`]), and `max_inflight_bytes` sized the global
+    /// `Semaphore`, both at construction. Rebuilding either would drop live connections and
+    /// in-flight permits mid-request. Changing those three keys still needs a restart.
+    pub fn store_cfg(&self, cfg: Arc<Config>) {
+        self.cfg.store(cfg);
+    }
+
+    /// The configuration the request path is using right now.
+    ///
+    /// A full `Arc` clone rather than a `Guard`, for the same reason `AppState::cfg` is: a
+    /// caller that holds a `Guard` across an `.await` pins the old configuration for the
+    /// life of a streaming response.
+    pub fn cfg(&self) -> Arc<Config> {
+        self.cfg.load_full()
+    }
+
     /// The live backend registry.
     pub fn registry(&self) -> &BackendRegistry {
         &self.registry

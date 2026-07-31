@@ -255,7 +255,7 @@ pub async fn build_state(
     assets::set_ui_dir(ui_dir_of(&cfg));
 
     let store = Store::new(paths.clone());
-    Ok(Arc::new(AppState::new(
+    let state = Arc::new(AppState::new(
         paths,
         cfg,
         store,
@@ -264,7 +264,19 @@ pub async fn build_state(
         supervisor,
         Arc::new(checks),
         lock,
-    )))
+    ));
+
+    // The live-request ring has to be listening BEFORE anything can be served. R-08 only
+    // serialises `RequestFinished` while the broadcast has a receiver — the rule that keeps a
+    // router at 50 rps from drowning its own dashboard — so a log that attaches lazily on
+    // first query is *structurally* blind to everything before that query. Both GUIs showed
+    // an empty live-request panel on first load for exactly this reason, and it self-healed
+    // from the first poll, which is the signature of a missing startup attach rather than a
+    // broken ring. `api::requests::attach` is idempotent per channel, so the handlers' own
+    // lazy call becomes a no-op that returns this same log.
+    api::requests::attach(&state.tx);
+
+    Ok(state)
 }
 
 /// Steps 6–9: reconcile, arm, bind, poll, serve, drain.
@@ -478,14 +490,40 @@ pub async fn reload_config(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
     };
 
-    state.cfg.store(Arc::new(cfg.clone()));
-    // A reload changes what the *next* launch does. It never evicts a model that took 90
-    // seconds and 6 GB to load.
-    state.supervisor.set_config(cfg.clone());
-    assets::set_ui_dir(ui_dir_of(&cfg));
+    let cfg = apply_config(state, cfg);
     arm_table(state, &cfg);
     tracing::info!("config reloaded");
     Ok(())
+}
+
+/// Publish a freshly parsed configuration to **every** place the daemon keeps one, and
+/// return it shared.
+///
+/// There are four copies and none of them is optional:
+///
+/// * `AppState.cfg` — what the control plane renders and what `recompile` compiles against;
+/// * `RouterInner.cfg` — what the **request path** reads on every request, which is where
+///   `[router] anthropic_tools`, `unknown_model`, `max_body_bytes` and the timeouts live;
+/// * the supervisor's copy — what the *next* endpoint launch uses (a reload never evicts a
+///   model that took 90 seconds and 6 GB to load);
+/// * `assets`' `[server] ui_dir` — the live-reload hatch for `ui-web/`.
+///
+/// This function exists because forgetting one of them is not a partial reload, it is a
+/// reload that answers `{"ok":true,"issues":[]}` and changes nothing. `POST /v1/reload`
+/// updated the first and third and left the request path frozen at daemon start; `SIGHUP`
+/// updated the first, third and fourth. Both now land here, so the set can only be got
+/// wrong in one place.
+///
+/// What a reload still cannot change is listed on [`apexrouter_router::RouterInner::store_cfg`]
+/// (`connect_timeout_ms`, `max_inflight_bytes`) and, one level up, the two bind addresses:
+/// a listener is bound once. Those need a restart.
+pub fn apply_config(state: &Arc<AppState>, cfg: Config) -> Arc<Config> {
+    let shared = Arc::new(cfg);
+    state.cfg.store(Arc::clone(&shared));
+    state.router.store_cfg(Arc::clone(&shared));
+    state.supervisor.set_config((*shared).clone());
+    assets::set_ui_dir(ui_dir_of(&shared));
+    shared
 }
 
 /// Feed one shutdown flag from every source that can ask for one.
@@ -1406,6 +1444,240 @@ mod tests {
         reload_config(&state).await.expect_err("must report");
 
         assert_eq!(state.cfg().router.max_inflight, before);
+    }
+
+    // ---- POST /v1/reload reaches the REQUEST PATH, not only the control plane -------------
+
+    /// Serve one composed app on the address it is configured for, and hand back the
+    /// authority a client should use.
+    ///
+    /// `run` is deliberately not used by the reload test below: it also starts the config
+    /// watcher, which reloads `config.toml` on its own 250 ms debounce, and a test that
+    /// cannot tell `POST /v1/reload` apart from the watcher proves nothing about either.
+    /// The apps themselves are the real composed ones — mutation gate included, which is why
+    /// the listener must be on the **configured** port: `auth::allowed_ports` derives the
+    /// `Host` allowlist from `[server] proxy_bind`/`control_bind`.
+    async fn spawn_on(addr: SocketAddr, which: &str, app: axum::Router) -> String {
+        let listener = bind_listener(addr, which).await.expect("bind");
+        let local = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        local.to_string()
+    }
+
+    /// The acceptance for FIX-3 defect A.
+    ///
+    /// `[router] max_body_bytes` is the cheapest `[router]` key to *observe*: the handler
+    /// enforces it before it resolves anything, so a 413 proves the request path re-read the
+    /// configuration without a single upstream existing. Before `apply_config`, this test
+    /// failed on the last assertion — `POST /v1/reload` answered `{"ok":true,"issues":[]}`
+    /// and the proxy went on using the daemon's boot-time cap.
+    #[tokio::test]
+    async fn a_router_key_changes_behaviour_after_post_v1_reload_with_no_restart() {
+        let fx = fixture();
+        let cfg = fx.config();
+        fx.write_config(&cfg);
+
+        let state = build_state(fx.paths.clone(), cfg.clone(), fx.lock())
+            .await
+            .expect("state");
+        let proxy = spawn_on(cfg.proxy_bind(), "proxy", proxy_app(&state)).await;
+        let control = spawn_on(
+            cfg.control_bind(),
+            "control",
+            api_router(Arc::clone(&state)),
+        )
+        .await;
+
+        let http = client();
+        let big = format!("{{\"model\":\"auto\",\"pad\":\"{}\"}}", "x".repeat(8192));
+        let post_big = |authority: String, body: String| {
+            let http = http.clone();
+            async move {
+                http.post(format!("http://{authority}/v1/chat/completions"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("proxy answered")
+                    .status()
+            }
+        };
+
+        let before = post_big(proxy.clone(), big.clone()).await;
+        assert_ne!(
+            before,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the shipped cap accepts an 8 KiB body; the test needs a change to observe"
+        );
+
+        // The edit an operator makes, and the reload they then ask for.
+        let mut edited = cfg.clone();
+        edited.router.max_body_bytes = 64;
+        fx.write_config(&edited);
+
+        let res = http
+            .post(format!("http://{control}/v1/reload"))
+            .send()
+            .await
+            .expect("reload answered");
+        assert_eq!(res.status(), StatusCode::OK);
+        let report: serde_json::Value = res.json().await.expect("ValidationReport json");
+        assert_eq!(report["ok"], serde_json::json!(true), "{report}");
+
+        assert_eq!(
+            post_big(proxy, big).await,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "POST /v1/reload must reach the request path's own config, not only AppState.cfg"
+        );
+        assert_eq!(state.router.cfg().router.max_body_bytes, 64);
+        assert_eq!(state.cfg().router.max_body_bytes, 64);
+    }
+
+    // ---- the live-request log is attached before the first query --------------------------
+
+    /// The acceptance for FIX-3 defect B: a **cold** daemon, real traffic, and the very first
+    /// `GET /v1/requests` this process ever makes already has the row.
+    ///
+    /// The order is the whole point. Nothing queries `/v1/requests` before the traffic, so a
+    /// lazily-attached log would still be unsubscribed while the request finished, R-08 would
+    /// skip the `RequestFinished` broadcast for want of a receiver, and the answer would be
+    /// `[]` — which is what both GUIs showed on first load.
+    #[tokio::test]
+    async fn the_live_request_log_is_populated_on_a_cold_daemon_after_traffic() {
+        use apexrouter_protocol::{
+            Alias, BackendSelector, ModelRoute, RouteFile, RouteTarget, Strategy, UpstreamModel,
+        };
+        use wiremock::matchers::{method as m_method, path as m_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A loopback upstream. `/v1/models` is mounted too, so the health prober confirms the
+        // backend instead of tripping it to Down mid-test.
+        let up = MockServer::start().await;
+        Mock::given(m_method("GET"))
+            .and(m_path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                br#"{"object":"list","data":[{"id":"carnice","object":"model"}]}"#.to_vec(),
+                "application/json",
+            ))
+            .mount(&up)
+            .await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                br#"{"id":"a","object":"chat.completion","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#.to_vec(),
+                "application/json",
+            ))
+            .mount(&up)
+            .await;
+
+        let fx = fixture();
+        let cfg = fx.config();
+        let proxy = cfg.proxy_bind();
+        let control = cfg.control_bind();
+        fx.write_config(&cfg);
+
+        // State on disk *before* the daemon boots: this is a cold start, not a live edit.
+        let store = Store::new(fx.paths.clone());
+        let mut backend = a_backend("up-a", 0);
+        backend.kind = BackendKind::Node;
+        backend.base_url = up.uri();
+        backend.models = vec![UpstreamModel {
+            id: "carnice".to_owned(),
+            ctx: Some(4096),
+            vision: false,
+            tools: true,
+        }];
+        backend.health = Health::Ready {
+            since_unix: 0,
+            slots_busy: 0,
+            slots_total: 4,
+            tps_p50: None,
+        };
+        store.save_backends(&[backend]).expect("save backends");
+
+        let alias = Alias::parse("auto").expect("alias");
+        store
+            .save_routes(&RouteFile {
+                schema_version: 1,
+                default_alias: alias.clone(),
+                routes: vec![ModelRoute {
+                    alias: alias.clone(),
+                    targets: vec![RouteTarget {
+                        backend: BackendSelector::Id(BackendId::parse("up-a").expect("backend id")),
+                        model: None,
+                        weight: 1,
+                    }],
+                    strategy: Strategy::FirstHealthy,
+                    filter: Default::default(),
+                    retry: Default::default(),
+                    is_default: true,
+                    description: None,
+                }],
+            })
+            .expect("save routes");
+
+        let state = build_state(fx.paths.clone(), cfg, fx.lock())
+            .await
+            .expect("state");
+        let (trigger, handle) = shutdown::channel();
+        let mut task = tokio::spawn(run(Arc::clone(&state), handle));
+        wait_for_up(&format!("http://{control}/health"), &mut task).await;
+
+        // ---- traffic, and NOTHING has ever asked for /v1/requests ------------------------
+        let http = client();
+        let mut relayed = false;
+        for _ in 0..80 {
+            let res = http
+                .post(format!("http://{proxy}/v1/chat/completions"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(r#"{"model":"auto","messages":[]}"#)
+                .send()
+                .await
+                .expect("proxy answered");
+            if res.status() == StatusCode::OK {
+                relayed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(relayed, "the proxy never relayed to the loopback upstream");
+
+        // ---- the FIRST /v1/requests query of this daemon's life --------------------------
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..200 {
+            rows = http
+                .get(format!("http://{control}/v1/requests"))
+                .send()
+                .await
+                .expect("requests answered")
+                .json()
+                .await
+                .expect("a JSON array of RequestRecord");
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            !rows.is_empty(),
+            "GET /v1/requests must be populated on a cold daemon after traffic; \
+             an empty answer means nothing attached the log at startup"
+        );
+        assert_eq!(rows[0]["backend"], serde_json::json!("up-a"));
+        assert_eq!(rows[0]["status"], serde_json::json!(200));
+
+        trigger.trigger();
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("shutdown")
+            .expect("join")
+            .expect("serve");
     }
 
     // ---- shutdown never signals a child --------------------------------------------------

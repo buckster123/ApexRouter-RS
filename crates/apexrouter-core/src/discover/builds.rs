@@ -12,6 +12,12 @@
 //!   [`choose_build`] returns a `BinaryChoiceInfo` whose `exact: false` is a **visible**
 //!   value the UI renders as a warning.
 //!
+//! …and the fourth, found by the MK1 acceptance gate: a backend may report **more free VRAM
+//! than the card has**. `--list-devices` is the single point at which a device's memory
+//! enters this program, so it is the single point at which that is made impossible —
+//! [`VramReading`] is the only way this module builds a [`Gpu`]'s memory pair, and its one
+//! constructor enforces `free <= total`. See its docs for the measured numbers.
+//!
 //! Two conventions the rest of the crate depends on:
 //!
 //! * Every probe runs the binary with `LD_LIBRARY_PATH = dirname(binary)`, because
@@ -54,6 +60,72 @@ const SOFTWARE_MARKERS: &[&str] = &[
 
 /// The line that introduces the `--list-devices` table, lowercased.
 const DEVICE_HEADER: &str = "available devices";
+
+/// One device's memory reading, with the impossible pair removed **at construction**.
+///
+/// `--list-devices` prints `(<total> MiB, <free> MiB free)` verbatim from the backend, and a
+/// backend may report a `free` larger than the `total` it printed on the same line. Measured
+/// on this box, same silicon, same minute:
+///
+/// ```text
+///   ROCm0:   AMD Radeon 840M Graphics                    (11397 MiB, 18482 MiB free)
+///   Vulkan0: AMD Radeon 840M Graphics (RADV KRACKAN1)    (20992 MiB, 20363 MiB free)
+/// ```
+///
+/// HIP counts **GTT** — system memory the card may borrow — as free VRAM, against a `total`
+/// that is only the carve-out. The excess is not usable VRAM, it is an accounting artefact,
+/// and everything downstream of it is wrong: `total - free` underflows a `u64` to 17 EiB, and
+/// a budget built from `free` promised 16115 MiB on a device that then failed a 7312 MiB
+/// `cudaMalloc` for the KV cache — the MK1 acceptance gate's first launch line.
+///
+/// Clamping the *subtraction* only fixes the callers you remember. So the pair is not carried
+/// as two `u64`s a caller must remember to compare: [`VramReading::observed`] is the only
+/// constructor, it enforces `free <= total`, and it is the only way this module fills
+/// [`Gpu::vram_total_mb`] and [`Gpu::vram_free_mb`]. The impossible reading is therefore not
+/// guarded, it is unrepresentable — while [`VramReading::reported_free_mb`] keeps what the
+/// driver actually said, so the correction can be logged rather than hidden.
+///
+/// `total_mb == 0` means the line carried no memory group at all (`WebGPU0: Something New`);
+/// `--list-devices` prints both numbers or neither, so `free` is then 0 too and the clamp is
+/// a no-op on every input this parser can produce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VramReading {
+    total_mb: u64,
+    free_mb: u64,
+    reported_free_mb: u64,
+}
+
+impl VramReading {
+    /// The only constructor: `free` above `total` is clamped to `total`, always.
+    pub fn observed(total_mb: u64, reported_free_mb: u64) -> Self {
+        Self {
+            total_mb,
+            free_mb: reported_free_mb.min(total_mb),
+            reported_free_mb,
+        }
+    }
+
+    /// Total memory the backend claims for this device, MiB.
+    pub fn total_mb(&self) -> u64 {
+        self.total_mb
+    }
+
+    /// Free memory, MiB. **Never** greater than [`VramReading::total_mb`].
+    pub fn free_mb(&self) -> u64 {
+        self.free_mb
+    }
+
+    /// What the backend actually printed, before the clamp — the evidence, kept.
+    pub fn reported_free_mb(&self) -> u64 {
+        self.reported_free_mb
+    }
+
+    /// True when the reading had to be corrected: the backend reported more free memory than
+    /// the device has. AMD's GTT accounting is the live example.
+    pub fn was_clamped(&self) -> bool {
+        self.reported_free_mb > self.total_mb
+    }
+}
 
 /// One cached `--help` probe. The key is `(path, mtime, size)`, so a rebuilt binary at the
 /// same path invalidates itself and nobody has to remember to clear a cache.
@@ -226,6 +298,11 @@ pub async fn probe_flags(server: &Path, cache: &Path) -> Result<FlagSupport> {
 /// enumerated. With `want: Some(b)` and no build that enumerated `b`, the result is
 /// `exact: false` with both `wanted` and `got` populated: the caller still gets a usable
 /// build, and the UI has what it needs to say "you asked for Vulkan, this is HIP".
+///
+/// **`want: None` is the default launch** (`apexrouter up` with no `--devices`), so what it
+/// prefers matters more than anything else in this module: see [`rank`] and
+/// [`backend_confidence`] for the order and the reasoning. An explicit `want` is never
+/// overruled by it — a named backend that exists is always an exact match.
 ///
 /// `None` only when there are no builds at all.
 pub fn choose_build(builds: &[LlamaBuild], want: Option<GpuBackend>) -> Option<BinaryChoiceInfo> {
@@ -467,6 +544,10 @@ fn parse_build_info(text: &str) -> Option<String> {
 ///
 /// The trailing parenthesised group carries the memory numbers; a device name may itself
 /// contain parentheses, so the group is taken from the end of the line, not the first `(`.
+///
+/// This is the **one** place a device's memory enters ApexRouter, so it is the one place the
+/// `free > total` artefact is corrected: the numbers become a [`VramReading`] before they
+/// become a [`Gpu`], and the correction is logged with both figures.
 fn parse_devices(stdout: &str, seen_by: &BuildId) -> Vec<Gpu> {
     let mut out = Vec::new();
     let mut in_table = false;
@@ -491,16 +572,26 @@ fn parse_devices(stdout: &str, seen_by: &BuildId) -> Vec<Gpu> {
         if token.is_empty() || token.contains(char::is_whitespace) {
             continue;
         }
-        let (name, total_mb, free_mb) = split_device_memory(rest.trim());
+        let (name, vram) = split_device_memory(rest.trim());
         let (backend, index) = parse_device_token(token);
+        if vram.was_clamped() {
+            tracing::warn!(
+                device = token,
+                build = seen_by.as_str(),
+                reported_free_mb = vram.reported_free_mb(),
+                total_mb = vram.total_mb(),
+                "device reports more free memory than it has (GTT/shared-memory accounting); \
+                 clamped to total"
+            );
+        }
         let lower = name.to_ascii_lowercase();
         out.push(Gpu {
             device: token.to_owned(),
             index,
             name,
             backend,
-            vram_total_mb: total_mb,
-            vram_free_mb: free_mb,
+            vram_total_mb: vram.total_mb(),
+            vram_free_mb: vram.free_mb(),
             // Filled by `physical::attach_pci_ids`: `--list-devices` prints no bus id.
             pci_bus_id: None,
             driver: None,
@@ -513,23 +604,30 @@ fn parse_devices(stdout: &str, seen_by: &BuildId) -> Vec<Gpu> {
     out
 }
 
-/// `NAME (20992 MiB, 19066 MiB free)` -> `("NAME", 20992, 19066)`.
-fn split_device_memory(rest: &str) -> (String, u64, u64) {
+/// `NAME (20992 MiB, 19066 MiB free)` -> `("NAME", VramReading { 20992, 19066 })`.
+///
+/// The two numbers leave this function as a [`VramReading`] and never as a bare pair, so
+/// there is no point between the parser and the [`Gpu`] at which `free > total` exists.
+fn split_device_memory(rest: &str) -> (String, VramReading) {
+    let unknown = |name: &str| (name.to_owned(), VramReading::observed(0, 0));
     let trimmed = rest.trim_end();
     let Some(open) = trimmed.rfind('(') else {
-        return (rest.to_owned(), 0, 0);
+        return unknown(rest);
     };
     if !trimmed.ends_with(')') {
-        return (rest.to_owned(), 0, 0);
+        return unknown(rest);
     }
     let inner = trimmed[open + 1..trimmed.len() - 1].trim();
     let mut parts = inner.split(',');
     let total = parts.next().and_then(parse_mib);
     let free = parts.next().and_then(parse_mib);
     match (total, free) {
-        (Some(t), Some(f)) => (trimmed[..open].trim().to_owned(), t, f),
+        (Some(t), Some(f)) => (
+            trimmed[..open].trim().to_owned(),
+            VramReading::observed(t, f),
+        ),
         // Not a memory group after all — some other parenthesised suffix. Keep the name.
-        _ => (rest.to_owned(), 0, 0),
+        _ => unknown(rest),
     }
 }
 
@@ -743,8 +841,9 @@ fn write_flag_cache(path: &Path, entry: &FlagCache) {
 // build ranking
 // ---------------------------------------------------------------------------
 
-/// Prefer a build that enumerated an accelerator, then one that enumerated more devices,
-/// then the lexicographically first id — so the answer never depends on directory order.
+/// Prefer a build that enumerated an accelerator, then the backend whose enumeration
+/// promises most about a launch, then the build that enumerated more devices, then the
+/// lexicographically first id — so the answer never depends on directory order.
 fn best<'a>(builds: impl Iterator<Item = &'a LlamaBuild>) -> Option<&'a LlamaBuild> {
     builds.max_by(|a, b| {
         rank(a)
@@ -753,10 +852,57 @@ fn best<'a>(builds: impl Iterator<Item = &'a LlamaBuild>) -> Option<&'a LlamaBui
     })
 }
 
-/// `(has an accelerator, device count)`.
-fn rank(b: &LlamaBuild) -> (u8, usize) {
+/// `(has an accelerator, backend confidence, device count)`.
+///
+/// Confidence outranks the device count deliberately: `LlamaBuild::devices` counts every
+/// token the build printed, software rasterisers included (they are *marked* on the `Gpu`,
+/// not dropped, and a token list carries no such mark), so it is a noisy measure of "how much
+/// of this machine can this build use" — while the backend decides whether the launch runs at
+/// all.
+fn rank(b: &LlamaBuild) -> (u8, u8, usize) {
     let accel = u8::from(b.backends.iter().any(|x| !matches!(x, GpuBackend::Cpu)));
-    (accel, b.devices.len())
+    let confidence = b.backends.iter().map(backend_confidence).max().unwrap_or(0);
+    (accel, confidence, b.devices.len())
+}
+
+/// How much a backend's **enumeration** promises about the launch that follows.
+///
+/// This is a tiebreak for a *default* — what to run when the operator named neither a build
+/// nor a device. Before this existed the tiebreak between two builds that each saw one
+/// accelerator was the **directory name**, which is a coin flip: on the development box
+/// `~/llama.cpp/build` (ROCm) beat `~/llama.cpp/build-vulkan` because `"build"` sorts first,
+/// and the ROCm launch died in `cudaMalloc` where the Vulkan build of the same model runs.
+///
+/// The ranking is not about speed, and it is not about a vendor. It is about how much
+/// enumerating a device implies about being able to *use* it:
+///
+/// * **The vendor's own runtime for hardware the vendor ships it for** (CUDA, Metal). If it
+///   enumerates, it is the first-class path and the fast one. Highest.
+/// * **A portable, conformance-gated API** (Vulkan). A device appears only through an ICD
+///   that implements the compute pipeline the runtime asked for, on any vendor's silicon.
+///   Broad, and rarely a lie.
+/// * **A vendor runtime whose support matrix is narrower than the hardware it binds**
+///   (ROCm/HIP, SYCL). These enumerate whatever the runtime loads — supported or not — and
+///   when the device is outside the matrix they fail *late*: at allocation, at dispatch, or
+///   by reporting memory figures that are not memory (this box's ROCm view of the 840M claims
+///   more free VRAM than the card has; see [`VramReading`]). A late failure is the worst
+///   thing a default can do, because the manager has already promised a fit.
+///
+/// Nothing here is specific to one machine, and nothing here removes a choice: `--build`,
+/// `--devices ROCm0` and `choose_build(builds, Some(Rocm))` all still select that build
+/// exactly, and [`choose_build`] reports what it settled for either way. A faster specialist
+/// is one flag away; a default that OOMs is a bug report.
+fn backend_confidence(b: &GpuBackend) -> u8 {
+    match b {
+        GpuBackend::Cuda | GpuBackend::Metal => 3,
+        GpuBackend::Vulkan => 2,
+        // An accelerator we know can enumerate more than it can run…
+        GpuBackend::Rocm | GpuBackend::Hip | GpuBackend::Sycl => 1,
+        // …and one llama.cpp grew that this build has never heard of: still an accelerator,
+        // but nothing is known about it, so it ranks with the ones that can disappoint.
+        GpuBackend::Other(_) => 1,
+        GpuBackend::Cpu => 0,
+    }
 }
 
 /// The backend a build is "for": its first accelerator, else whatever it did enumerate.
@@ -992,6 +1138,71 @@ Available devices:
         assert!(parse_devices("", &id).is_empty());
     }
 
+    // -- the GTT trap ------------------------------------------------------
+    //
+    // MK1 acceptance, `apexrouter up Carnice-9b-Q6_K --alias auto`: the ROCm view of this
+    // laptop's single 840M reported 17139 MiB free against an 11397 MiB total, the budget
+    // came out at 16115 MiB, `fit` said "fits, 3.8 GiB spare", and llama-server then died
+    // with `cudaMalloc failed: out of memory` allocating 7312 MiB of KV.
+
+    #[test]
+    fn a_reading_can_never_say_more_is_free_than_the_device_has() {
+        // The gate's numbers, exactly.
+        let rocm = VramReading::observed(11_397, 17_139);
+        assert_eq!(rocm.free_mb(), 11_397, "free is clamped to total");
+        assert_eq!(rocm.total_mb(), 11_397);
+        assert!(rocm.was_clamped());
+        assert_eq!(
+            rocm.reported_free_mb(),
+            17_139,
+            "the driver's own figure is kept, so the correction can be reported"
+        );
+
+        // A coherent reading is left completely alone.
+        let vulkan = VramReading::observed(20_992, 20_363);
+        assert_eq!((vulkan.total_mb(), vulkan.free_mb()), (20_992, 20_363));
+        assert!(!vulkan.was_clamped());
+        assert_eq!(vulkan.reported_free_mb(), 20_363);
+
+        // And the invariant holds for every pair a driver could print, which is the point of
+        // there being exactly one constructor.
+        for (total, free) in [
+            (0u64, 0u64),
+            (0, u64::MAX),
+            (11_397, 12_821),
+            (11_397, 17_139),
+            (u64::MAX, 0),
+            (7, 7),
+            (81_559, 80_000),
+        ] {
+            let r = VramReading::observed(total, free);
+            assert!(r.free_mb() <= r.total_mb(), "{total} / {free}");
+            assert_eq!(r.total_mb(), total, "a total is never invented");
+            assert_eq!(r.free_mb(), free.min(total));
+        }
+    }
+
+    #[test]
+    fn a_device_that_reports_more_free_than_total_is_clamped_at_ingest() {
+        let id = BuildId::parse("build").unwrap();
+        // The live line from `~/llama.cpp/build/bin/llama-server --list-devices`.
+        let gpus = parse_devices(
+            "Available devices:\n  ROCm0: AMD Radeon 840M Graphics (11397 MiB, 17139 MiB free)\n",
+            &id,
+        );
+        assert_eq!(gpus.len(), 1, "{gpus:?}");
+        assert_eq!(gpus[0].backend, GpuBackend::Rocm);
+        assert_eq!(gpus[0].vram_total_mb, 11_397);
+        assert_eq!(
+            gpus[0].vram_free_mb, 11_397,
+            "no consumer may ever see the 17139 MiB"
+        );
+        // The honesty types downstream can now answer at all, and answer sanely.
+        assert!(!gpus[0].reports_gtt_overcommit());
+        assert_eq!(gpus[0].vram_used_mb(), Some(0));
+        assert!(gpus[0].vram_free_mb <= gpus[0].vram_total_mb);
+    }
+
     // -- flags ------------------------------------------------------------
 
     #[test]
@@ -1161,6 +1372,94 @@ Available devices:
         assert_eq!(choose_build(&reversed, None), Some(c));
     }
 
+    /// The rig this laptop really is, and the launch the plan opens with:
+    /// `apexrouter up <model> --alias auto`, no `--devices`, so `want` is `None`.
+    ///
+    /// Five builds, two of which see the same single card through ROCm and two through
+    /// Vulkan. The old tiebreak was the directory name, so `build` — ROCm, and the one that
+    /// OOMs — won because `"build"` sorts before `"build-vulkan"`.
+    #[test]
+    fn the_default_choice_is_not_decided_by_the_directory_name() {
+        let builds = vec![
+            a_build("build", vec![GpuBackend::Rocm], vec!["ROCm0"]),
+            a_build("build-mtp", vec![GpuBackend::Rocm], vec!["ROCm0"]),
+            // Installed and broken: enumerates nothing, so it is never a default.
+            a_build("build-rocm", vec![], vec![]),
+            a_build("build-vulkan", vec![GpuBackend::Vulkan], vec!["Vulkan0"]),
+            a_build("build-zaya1", vec![GpuBackend::Vulkan], vec!["Vulkan0"]),
+        ];
+        let c = choose_build(&builds, None).expect("a choice");
+        assert_eq!(c.chosen.as_str(), "build-vulkan", "{c:?}");
+        assert_eq!(c.got, Some(GpuBackend::Vulkan));
+        assert!(c.exact, "nothing was asked for, so nothing was substituted");
+
+        // Still order-independent: the answer is a ranking, not an accident of the glob.
+        let mut reversed = builds.clone();
+        reversed.reverse();
+        assert_eq!(choose_build(&reversed, None), Some(c));
+
+        // And asking for the specialist still gets exactly the specialist.
+        let rocm = choose_build(&builds, Some(GpuBackend::Rocm)).expect("a choice");
+        assert!(rocm.exact);
+        assert_eq!(rocm.chosen.as_str(), "build", "{rocm:?}");
+        assert_eq!(rocm.got, Some(GpuBackend::Rocm));
+    }
+
+    #[test]
+    fn the_default_prefers_the_vendor_path_where_the_vendor_ships_one() {
+        // An NVIDIA box: CUDA is both the fast path and the safe one.
+        let nvidia = vec![
+            a_build("build-vulkan", vec![GpuBackend::Vulkan], vec!["Vulkan0"]),
+            a_build("build-cuda", vec![GpuBackend::Cuda], vec!["CUDA0"]),
+        ];
+        assert_eq!(
+            choose_build(&nvidia, None)
+                .expect("a choice")
+                .chosen
+                .as_str(),
+            "build-cuda"
+        );
+
+        // A box where the only accelerator is the narrow one: it is still chosen, because a
+        // default that refuses to run is not a default.
+        let rocm_only = vec![
+            a_build("build-cpu", vec![GpuBackend::Cpu], vec!["CPU0"]),
+            a_build("build-hip", vec![GpuBackend::Hip], vec!["ROCm0"]),
+        ];
+        let c = choose_build(&rocm_only, None).expect("a choice");
+        assert_eq!(c.chosen.as_str(), "build-hip");
+        assert_eq!(c.got, Some(GpuBackend::Hip));
+
+        // Within one backend the richer build still wins, and a software rasteriser in the
+        // token list cannot buy a weaker backend the default.
+        let same_backend = vec![
+            a_build("build-a", vec![GpuBackend::Cuda], vec!["CUDA0"]),
+            a_build("build-b", vec![GpuBackend::Cuda], vec!["CUDA0", "CUDA1"]),
+        ];
+        assert_eq!(
+            choose_build(&same_backend, None)
+                .expect("a choice")
+                .chosen
+                .as_str(),
+            "build-b"
+        );
+        let padded = vec![
+            a_build("build-cuda", vec![GpuBackend::Cuda], vec!["CUDA0"]),
+            a_build(
+                "build-vulkan",
+                vec![GpuBackend::Vulkan],
+                vec!["Vulkan0", "Vulkan1"],
+            ),
+        ];
+        assert_eq!(
+            choose_build(&padded, None)
+                .expect("a choice")
+                .chosen
+                .as_str(),
+            "build-cuda"
+        );
+    }
+
     #[test]
     fn choose_build_on_an_empty_machine_is_none() {
         assert_eq!(choose_build(&[], None), None);
@@ -1284,6 +1583,50 @@ Available devices:
             .unwrap();
         assert!(flags.has("--model") && flags.has("--port") && flags.has("-fa"));
         assert!(flags.help_lines > 100);
+    }
+
+    /// The default launch, on whatever machine this is: when the box offers a build on a
+    /// backend whose enumeration promises more, the default must not be one that promises
+    /// less. Phrased over [`backend_confidence`] rather than over a backend name, so it says
+    /// the same thing on a CUDA box, an Apple box, and this laptop — where it fails on the
+    /// pre-fix ranking, which picked `~/llama.cpp/build` (ROCm) over `build-vulkan`.
+    #[tokio::test]
+    async fn real_machine_default_build_is_not_the_late_failing_backend() {
+        let Some(root) = llama_cpp_root() else {
+            eprintln!("SKIP: no ~/llama.cpp on this box");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let builds = discover_builds(&cfg_with_root(&root), &dir.path().join("cache"))
+            .await
+            .unwrap();
+        let Some(choice) = choose_build(&builds, None) else {
+            eprintln!("SKIP: no builds on this box");
+            return;
+        };
+        let best_available = builds
+            .iter()
+            .flat_map(|b| b.backends.iter())
+            .map(backend_confidence)
+            .max()
+            .unwrap_or(0);
+        let chosen = builds.iter().find(|b| b.id == choice.chosen).unwrap();
+        let got = chosen
+            .backends
+            .iter()
+            .map(backend_confidence)
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "\n=== default build on this machine ===\n  chosen={} backends={:?} confidence={got} (best available {best_available})",
+            choice.chosen, chosen.backends
+        );
+        assert_eq!(
+            got, best_available,
+            "the default launch must use the backend whose enumeration promises most; \
+             chose {} ({:?})",
+            choice.chosen, chosen.backends
+        );
     }
 
     #[tokio::test]

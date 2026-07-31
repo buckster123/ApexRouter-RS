@@ -8,6 +8,7 @@
 //! | Anthropic | OpenAI | Rule |
 //! |---|---|---|
 //! | top-level `system` | a `{"role":"system"}` message | hoist/lower; a block array joins on `\n\n`; absent ⇒ no system message is invented |
+//! | `{"role":"system"}` inside `messages[]` | a `{"role":"system"}` message **in position** | passed through where it stands; never hoisted, never merged into the top-level one |
 //! | `max_tokens` — **REQUIRED** | `max_tokens` — optional | missing ⇒ [`TranslateError::MissingMaxTokens`] ⇒ `400`. **Never defaulted silently** |
 //! | typed block array | a plain string, or the parts array | one `text` block lowers to a plain string, which is what keeps llama.cpp happy |
 //! | `tools[].input_schema` | `tools[].function.parameters` | rename only; the JSON Schema is copied byte-identically |
@@ -17,7 +18,25 @@
 //! | `usage.input_tokens`/`output_tokens` | `usage.prompt_tokens`/`completion_tokens` | rename only; **never recomputed, never estimated** |
 //! | `thinking` block | — | no equivalent. [`TranslateError::UnsupportedBlock`] |
 //!
-//! # Two decisions this file records rather than guesses
+//! # Three decisions this file records rather than guesses
+//!
+//! **A `{"role":"system"}` message inside `messages[]` is accepted and lowered in place.** This
+//! is not a client bug: a mid-conversation system message is a current Messages API feature —
+//! an operator instruction is appended as `{"role":"system", "content": …}` in `messages[]`
+//! *instead of* editing the top-level `system` field, specifically so it does not invalidate
+//! the cached prefix. Claude Code 2.1.220 uses it on its **first** request (its Agent-tool
+//! catalogue, observed on the wire as `messages = ['user', 'system']`, alongside
+//! `anthropic-beta: …,mid-conversation-system-2026-04-07,…`), so an ingress that answers
+//! `400 role "system" is not a Messages role` kills the harness before it has said anything.
+//! OpenAI natively accepts a system message anywhere in `messages[]`, so this lowers 1:1 and
+//! the fix is to pass it through in position.
+//!
+//! The Messages API also states *where* such a message may appear — it must follow a user turn
+//! (or an assistant turn ending in server-tool use), must be last or followed by an assistant
+//! turn, and can never be `messages[0]`. **This unit does not re-validate any of that.** Every
+//! arrangement it forbids is still legal OpenAI, so enforcing it here could only ever turn a
+//! request the upstream would have answered into a `400` — which is the exact failure this
+//! decision exists to remove. Placement is Anthropic's to police, upstream of us.
 //!
 //! **`reasoning_content` is not mapped.** llama.cpp b9199 splits a reasoning model's chain of
 //! thought into `choices[].message.reasoning_content` (buffered) and
@@ -163,10 +182,14 @@ pub fn request_to_openai(body: &[u8], cfg: &AnthropicCfg) -> Result<Vec<u8>, Tra
         }
     }
 
-    // ---- messages, with `system` hoisted in front --------------------------------------------
+    // ---- messages, with the top-level `system` hoisted in front -------------------------------
+    //
+    // A body may legitimately carry BOTH a top-level `system` and a `{"role":"system"}` message
+    // inside `messages[]` — Claude Code sends exactly that — and their order has to survive:
+    // the top-level one first, then the messages in the order the client wrote them.
     let mut msgs: Vec<Value> = Vec::new();
     if let Some(system) = obj.get("system").filter(|v| !v.is_null()) {
-        let text = system_text(system)?;
+        let text = system_text(system, "$.system")?;
         msgs.push(json!({ "role": "system", "content": text }));
     }
 
@@ -185,10 +208,16 @@ pub fn request_to_openai(body: &[u8], cfg: &AnthropicCfg) -> Result<Vec<u8>, Tra
         match m.get("role").and_then(Value::as_str) {
             Some("user") => lower_user(content, &at, cfg, &mut msgs)?,
             Some("assistant") => lower_assistant(content, &at, cfg, &mut msgs)?,
+            // A mid-conversation operator instruction. It lowers 1:1 and stays exactly where
+            // the client put it — see the module doc.
+            Some("system") => {
+                let text = system_text(content, &format!("{at}.content"))?;
+                msgs.push(json!({ "role": "system", "content": text }));
+            }
             Some(other) => {
                 return Err(malformed(
                     &at,
-                    &format!("role {other:?} is not a Messages role (user | assistant)"),
+                    &format!("role {other:?} is not a Messages role (user | assistant | system)"),
                 ))
             }
             None => return Err(malformed(&at, "a message must carry a role")),
@@ -245,20 +274,24 @@ pub fn request_to_openai(body: &[u8], cfg: &AnthropicCfg) -> Result<Vec<u8>, Tra
     })
 }
 
-/// `system` as one string: a bare string verbatim, a block array joined on `\n\n`.
-fn system_text(system: &Value) -> Result<String, TranslateError> {
+/// System content as one string: a bare string verbatim, a block array joined on `\n\n`.
+///
+/// `at` is where the array lives, so the same routine reports `$.system[1]` for the top-level
+/// field and `$.messages[2].content[1]` for a mid-conversation system message. Both spellings
+/// carry text and nothing else — there is no image or tool block in a system turn.
+fn system_text(system: &Value, at: &str) -> Result<String, TranslateError> {
     if let Some(s) = system.as_str() {
         return Ok(s.to_owned());
     }
     let blocks = system
         .as_array()
-        .ok_or_else(|| malformed("$.system", "system must be a string or a block array"))?;
+        .ok_or_else(|| malformed(at, "system content must be a string or a text block array"))?;
     let mut parts: Vec<&str> = Vec::with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
         let kind = b.get("type").and_then(Value::as_str).unwrap_or("");
         if kind != "text" {
             return Err(TranslateError::UnsupportedBlock {
-                kind: format!("{kind} (in $.system[{i}])"),
+                kind: format!("{kind} (in {at}[{i}])"),
             });
         }
         parts.push(b.get("text").and_then(Value::as_str).unwrap_or(""));
@@ -734,6 +767,35 @@ mod tests {
     /// truncated. Note the `reasoning_content` sibling — this is the real shape, not a guess.
     const LLAMACPP_BUFFERED: &str = r#"{"choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":"OK","reasoning_content":"The user is repeatedly asking me to respond with 'OK'"}}],"created":1785448506,"model":"carnice","system_fingerprint":"b9199-39cf5d619","object":"chat.completion","usage":{"completion_tokens":85,"prompt_tokens":15,"total_tokens":100,"prompt_tokens_details":{"cached_tokens":0}},"id":"chatcmpl-VXbkIMz3XZNTaE35HqRcSRGQ9QdEG0pq","timings":{"predicted_per_second":9.37296930484877}}"#;
 
+    /// The shape real Claude Code 2.1.220 puts on the wire on its **first** request, captured
+    /// by the acceptance gate and abridged: a top-level `system` block array **and** a
+    /// `{"role":"system"}` message inside `messages[]` — observed as `messages = ['user',
+    /// 'system']` — sent alongside
+    /// `anthropic-beta: …,mid-conversation-system-2026-04-07,…`.
+    ///
+    /// Before FIX-2 this body was answered
+    /// `400 malformed request at $.messages[1]: role "system" is not a Messages role`, and the
+    /// harness died with `API Error: 400` before printing a token.
+    // `r##"…"##`: the fixture's own text contains `"#`, which would close an `r#"…"#`.
+    const CLAUDE_CODE_MID_CONVERSATION_SYSTEM: &str = r##"{
+      "model": "carnice",
+      "max_tokens": 512,
+      "temperature": 1,
+      "system": [
+        {"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},
+        {"type":"text","text":"You are an interactive CLI tool that helps users with software engineering tasks."}
+      ],
+      "messages": [
+        {"role":"user","content":[
+          {"type":"text","text":"Reply with exactly the word PONG and nothing else."}]},
+        {"role":"system","content":[
+          {"type":"text","text":"# Agent tools"},
+          {"type":"text","text":"The following tools are available to the Agent tool."}]}
+      ],
+      "metadata": {"user_id": "andre"},
+      "stream": false
+    }"##;
+
     const WEATHER_TOOLS: &str = r#"[{"name":"get_weather","description":"Get the weather",
         "input_schema":{"type":"object","properties":{"location":{"type":"string",
         "description":"City"}},"required":["location"]}}]"#;
@@ -782,6 +844,100 @@ mod tests {
         let msgs = v["messages"].as_array().expect("messages");
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
+    }
+
+    // ---- mid-conversation system messages (the FIX-2 regression) ---------------------------------
+
+    #[test]
+    fn a_mid_conversation_system_message_lowers_in_position() {
+        // THE regression. Claude Code's own first request: a top-level `system` AND a
+        // `{"role":"system"}` message in `messages[]`. Both must survive, in that order.
+        let v = tr(CLAUDE_CODE_MID_CONVERSATION_SYSTEM, &tools_off());
+        let msgs = v["messages"].as_array().expect("messages");
+        assert_eq!(
+            msgs.len(),
+            3,
+            "top-level system, the user turn, then the mid-conversation system: {v}"
+        );
+
+        // 1. the top-level `system`, hoisted in front exactly as before.
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(
+            msgs[0]["content"],
+            "You are Claude Code, Anthropic's official CLI for Claude.\n\n\
+             You are an interactive CLI tool that helps users with software engineering tasks."
+        );
+
+        // 2. the user turn, untouched.
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(
+            msgs[1]["content"],
+            "Reply with exactly the word PONG and nothing else."
+        );
+
+        // 3. the operator instruction, IN POSITION — after the user turn, not merged into
+        //    msgs[0] and not hoisted to the front.
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(
+            msgs[2]["content"],
+            "# Agent tools\n\nThe following tools are available to the Agent tool.",
+            "a system message's block array joins on \\n\\n like the top-level field"
+        );
+
+        // …and nothing about it leaks into the top level of the outbound body.
+        assert!(
+            v.get("system").is_none(),
+            "system is a message on the OpenAI side, never a top-level field: {v}"
+        );
+    }
+
+    #[test]
+    fn a_system_message_takes_a_plain_string_too() {
+        let v = tr(
+            r#"{"model":"auto","max_tokens":8,"messages":[
+                 {"role":"user","content":"hi"},
+                 {"role":"system","content":"Terse mode enabled."},
+                 {"role":"assistant","content":"ok"}]}"#,
+            &tools_off(),
+        );
+        let msgs = v["messages"].as_array().expect("messages");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1]["role"], "system");
+        assert_eq!(msgs[1]["content"], "Terse mode enabled.");
+        assert_eq!(msgs[2]["role"], "assistant");
+    }
+
+    #[test]
+    fn placement_rules_are_anthropics_to_police_not_ours() {
+        // The Messages API says a system message cannot be `messages[0]`. Every arrangement it
+        // forbids is still legal OpenAI, so refusing one here could only ever turn a request
+        // the upstream would have answered into a 400 — the exact failure FIX-2 removed.
+        let v = tr(
+            r#"{"model":"auto","max_tokens":8,"messages":[
+                 {"role":"system","content":"Operator note."},
+                 {"role":"user","content":"hi"}]}"#,
+            &tools_off(),
+        );
+        let msgs = v["messages"].as_array().expect("messages");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "Operator note.");
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn a_non_text_block_in_a_system_message_is_refused_and_names_where() {
+        // A system turn carries text and nothing else — an image there has nowhere to go, and
+        // the error has to say which message and which block.
+        let body = r#"{"model":"auto","max_tokens":8,"messages":[
+            {"role":"user","content":"hi"},
+            {"role":"system","content":[{"type":"text","text":"note"},
+              {"type":"image","source":{"type":"base64","media_type":"image/png","data":"QQ=="}}]}]}"#;
+        match request_to_openai(body.as_bytes(), &tools_off()) {
+            Err(TranslateError::UnsupportedBlock { kind }) => {
+                assert_eq!(kind, "image (in $.messages[1].content[1])")
+            }
+            other => panic!("expected UnsupportedBlock, got {other:?}"),
+        }
     }
 
     #[test]
@@ -864,12 +1020,16 @@ mod tests {
             Err(TranslateError::Malformed { at, .. }) => assert_eq!(at, "$"),
             other => panic!("expected Malformed, got {other:?}"),
         }
-        let body =
-            r#"{"model":"auto","max_tokens":8,"messages":[{"role":"system","content":"x"}]}"#;
+        // `tool` is an OpenAI role, not a Messages one: a tool result travels as a block
+        // inside a `user` turn. Unknown roles are still refused, and the message names the
+        // three that are not — including `system`, now that it is one of them.
+        let body = r#"{"model":"auto","max_tokens":8,
+            "messages":[{"role":"tool","tool_call_id":"t1","content":"x"}]}"#;
         match request_to_openai(body.as_bytes(), &tools_off()) {
             Err(TranslateError::Malformed { at, why }) => {
                 assert_eq!(at, "$.messages[0]");
-                assert!(why.contains("system"), "{why}");
+                assert!(why.contains("tool"), "{why}");
+                assert!(why.contains("user | assistant | system"), "{why}");
             }
             other => panic!("expected Malformed, got {other:?}"),
         }
@@ -1165,6 +1325,56 @@ mod tests {
         assert_eq!(v["stop_reason"], "end_turn");
         assert_eq!(v["usage"]["input_tokens"], 15);
         assert_eq!(v["usage"]["output_tokens"], 85);
+    }
+
+    /// The FIX-2 regression at the wire, not at the function: the captured Claude Code body
+    /// reaches an OpenAI upstream as a `ChatCompletion` whose `messages` are
+    /// `system, user, system` **in that order**, and the answer comes back as an Anthropic
+    /// `Message`. This is the exchange that used to end at `400` before the first token.
+    #[tokio::test]
+    async fn the_captured_claude_code_body_reaches_the_upstream_in_order() {
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(LLAMACPP_BUFFERED.as_bytes().to_vec(), "application/json"),
+            )
+            .mount(&up)
+            .await;
+
+        let outbound =
+            request_to_openai(CLAUDE_CODE_MID_CONVERSATION_SYSTEM.as_bytes(), &tools_off())
+                .expect("the mid-conversation system message must not be a 400");
+
+        let res = reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", up.uri()))
+            .header("content-type", "application/json")
+            .body(outbound)
+            .send()
+            .await
+            .expect("upstream reachable");
+        assert_eq!(res.status(), 200);
+        let raw = res.bytes().await.expect("body");
+
+        let seen = up.received_requests().await.expect("recording");
+        assert_eq!(seen.len(), 1);
+        let sent: Value = serde_json::from_slice(&seen[0].body).expect("json");
+        let roles: Vec<&str> = sent["messages"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|m| m["role"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            roles,
+            ["system", "user", "system"],
+            "the top-level system leads and the mid-conversation one keeps its place: {sent}"
+        );
+        assert!(sent.get("system").is_none());
+
+        let out = response_to_anthropic(&raw).expect("response translated");
+        let v: Value = serde_json::from_slice(&out).expect("json");
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["content"][0]["text"], "OK");
     }
 
     /// The `get_weather` fixture surviving the whole loop with `anthropic_tools = true`:

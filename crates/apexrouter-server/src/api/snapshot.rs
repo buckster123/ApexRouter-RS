@@ -47,6 +47,10 @@ pub async fn get_snapshot(State(s): State<Arc<AppState>>) -> ApiResult<Snapshot>
 
 /// `POST /v1/reload` — reparse `config.toml` and `routes.json`.
 ///
+/// Every `[router]` key takes effect on the next request, with no restart: the parsed
+/// configuration is published through [`crate::apply_config`], which is the only thing that
+/// reaches the request path's own `ArcSwap<Config>`.
+///
 /// **A failed compile keeps the running table.** The report comes back with `ok: false` and
 /// the issues; the daemon is still serving whatever it was serving, which is exactly what
 /// `ARCHITECTURE.md` §4.1 asks for. A config file that does not *parse* is a `400`, because
@@ -106,8 +110,11 @@ pub fn reload(state: &Arc<AppState>) -> Result<ValidationReport, ApiError> {
             format!("{} did not parse: {e}", path.display()),
         )
     })?;
-    state.cfg.store(Arc::new(cfg.clone()));
-    state.supervisor.set_config(cfg);
+    // ONE publisher for all four copies — `AppState.cfg`, the request path's own
+    // `ArcSwap<Config>`, the supervisor and `ui_dir`. Storing only into `state.cfg` here is
+    // what made this endpoint answer `{"ok":true,"issues":[]}` while every `[router]` key
+    // stayed frozen at daemon start.
+    crate::apply_config(state, cfg);
 
     match super::recompile(state) {
         Ok(()) => Ok(ValidationReport {
@@ -188,6 +195,26 @@ fn inflight(state: &Arc<AppState>) -> u32 {
 /// Derived from the usage log rather than from a counter, so the number survives a daemon
 /// restart and agrees with `apexrouter usage`. With `[router] log_usage = false` both are
 /// zero, which is honest: nothing is being recorded.
+///
+/// # This is where both dashboards' `tok/s` tile comes from, and what it is not
+///
+/// The tile is **server-side**: `apexrouter-slint`'s `set_tok_per_s` and `ui-web`'s stat tile
+/// both render `Snapshot.proxy.tok_per_s` verbatim, so a `0.0` there is this function's
+/// answer, not a client bug. It is a different quantity from the per-request `tok_per_s` the
+/// live-request rows show, and the two are expected to disagree:
+///
+/// * this is **completion tokens ÷ 60 s of wall clock**, a load average — not generation
+///   throughput. A backend generating at 9.7 tok/s for six seconds a minute reports `0.97`
+///   here while every row honestly reads `9.7`;
+/// * the window **ends now**, so it decays to `0.0` a minute after the last request, while
+///   the live-request ring keeps 1 000 records with no time bound. "Rows populated, tile
+///   zero" is the normal reading of an idle router;
+/// * with `[router] log_usage = false` it is permanently `0.0`, because the ring is fed by
+///   the event broadcast and this is fed by `usage.jsonl`.
+///
+/// None of that is wrong, but the tile is labelled as if it were throughput. Changing it is
+/// a `ProxyStatus` semantics change (protocol-visible, five surfaces) and belongs in a
+/// charter entry, not in a bug fix; see FIX-3's report.
 fn rate(rows: &[UsageRecord], now: i64) -> (f32, f32) {
     let window = usage::aggregate(rows, Some(now - RATE_WINDOW), GroupBy::Provider);
     let per_min = window.rows as f32 * (60.0 / RATE_WINDOW as f32);

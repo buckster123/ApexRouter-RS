@@ -353,6 +353,13 @@ pub enum BackendScope<'a> {
 /// `ROCm0` is holding the *silicon*, so it is subtracted from `Vulkan0`'s budget too when
 /// they are the same card. `Gpu::reserved_mb` from the snapshot is respected as a floor, so a
 /// holder the caller did not pass in `running` still cannot be double-spent.
+///
+/// # A reading that cannot be true is never spent
+///
+/// A backend may report more free VRAM than the device has — AMD's HIP counts borrowable
+/// system memory (GTT) as free against a `total` that is only the carve-out. Discovery clamps
+/// that at ingest ([`crate::discover::VramReading`]); [`spendable_free_mb`] re-asserts it here
+/// for snapshots this process did not scan, and says so in [`VramBudget::notes`].
 pub fn budget_from_rig(
     rig: &RigSnapshot,
     scope: BackendScope<'_>,
@@ -414,7 +421,7 @@ pub fn budget_from_rig(
             .iter()
             .map(|g| DeviceBudget {
                 device: g.device.clone(),
-                free_mb: g.vram_free_mb,
+                free_mb: spendable_free_mb(g, &mut notes),
                 reserved_mb: g
                     .reserved_mb
                     .max(reserved.get(&key_of(&g.device)).copied().unwrap_or(0)),
@@ -425,6 +432,32 @@ pub fn budget_from_rig(
         backend: if selected.is_empty() { None } else { backend },
         notes,
     }
+}
+
+/// The free VRAM of one device that a budget is allowed to spend — never more than the
+/// device has.
+///
+/// `core::discover` clamps this at ingest, where the `Gpu` is constructed, so on a rig this
+/// process scanned the invariant already holds and this is a no-op. It is re-asserted here
+/// because a [`RigSnapshot`] is a **wire type**: it also arrives deserialized from a daemon,
+/// from a state file written by an older build, or (the direction this is heading) from
+/// another node, and `Gpu` is a plain struct with public fields that anyone may fill in.
+///
+/// A device that reports no total at all reports "unknown", not "zero" — `--list-devices`
+/// prints both numbers or neither — so a zero total leaves `free` alone rather than zeroing a
+/// budget on the strength of a missing field.
+///
+/// The correction is never silent: it lands in [`VramBudget::notes`], which `fit` copies into
+/// [`FitPlan::why`] and the local provisioner copies into its launch warnings.
+fn spendable_free_mb(g: &Gpu, notes: &mut Vec<String>) -> u64 {
+    if g.vram_total_mb == 0 || g.vram_free_mb <= g.vram_total_mb {
+        return g.vram_free_mb;
+    }
+    notes.push(format!(
+        "{} reported {} MiB free against a {} MiB total — shared-memory (GTT) accounting, not usable VRAM; clamped to {} MiB",
+        g.device, g.vram_free_mb, g.vram_total_mb, g.vram_total_mb
+    ));
+    g.vram_total_mb
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1399,7 +1432,9 @@ mod tests {
         // The presentation layer agrees it is one card.
         assert_eq!(r.physical_devices().len(), 1);
 
-        for (scope, want_device, want_free, want_backend) in [
+        // `want_spendable` is not always the reported free: the ROCm view reports 12821 MiB
+        // free against an 11397 MiB total, and a budget may not exceed the device.
+        for (scope, want_device, want_spendable, want_backend) in [
             (
                 BackendScope::Build(&BuildId::parse("build-vulkan").expect("id")),
                 "Vulkan0",
@@ -1409,7 +1444,7 @@ mod tests {
             (
                 BackendScope::Build(&BuildId::parse("build").expect("id")),
                 "ROCm0",
-                12_821,
+                11_397,
                 GpuBackend::Rocm,
             ),
         ] {
@@ -1420,7 +1455,7 @@ mod tests {
                 "a budget must be over ONE backend's devices"
             );
             assert_eq!(b.backend, Some(want_backend));
-            assert_eq!(b.total_usable_mb(), want_free - 1_024);
+            assert_eq!(b.total_usable_mb(), want_spendable - 1_024);
             // The sum that used to happen. 19626 + 12821 - 1024 = 31423.
             assert_ne!(b.total_usable_mb(), 19_626 + 12_821 - 1_024);
             assert!(
@@ -1536,7 +1571,8 @@ mod tests {
             rocm.devices[0].reserved_mb, 5_956,
             "the silicon is held, whichever backend is holding it"
         );
-        assert_eq!(rocm.total_usable_mb(), 12_821 - 5_956);
+        // 11397, not the 12821 the driver claims is free: a budget is bounded by the device.
+        assert_eq!(rocm.total_usable_mb(), 11_397 - 5_956);
     }
 
     #[test]
@@ -1620,6 +1656,69 @@ mod tests {
         let b = budget(&[("Vulkan0", 100, 9_999)], 4_096, 0);
         assert_eq!(b.total_usable_mb(), 0);
         assert_eq!(b.largest_usable_mb(), 0);
+    }
+
+    /// The defect the MK1 gate reproduced three ways (`up`, `swap --to`, MCP `apexrouter_up`):
+    /// `free` itself was never clamped, only the subtraction that consumes it, so a device
+    /// reporting 17139 MiB free against an 11397 MiB total produced a 16115 MiB budget, a
+    /// "fits, 3.8 GiB spare" verdict, and a `cudaMalloc failed: out of memory` for 7312 MiB of
+    /// KV. A budget may never exceed the device it is drawn on.
+    #[test]
+    fn a_budget_can_never_exceed_the_memory_the_device_reports_having() {
+        let mut rocm = gpu("ROCm0", 0, 17_139, 0);
+        rocm.name = "AMD Radeon 840M Graphics".into();
+        rocm.vram_total_mb = 11_397;
+        let r = rig(vec![rocm]);
+
+        let b = budget_from_rig(
+            &r,
+            BackendScope::Backend(&GpuBackend::Rocm),
+            &[],
+            1_024,
+            &[],
+        );
+        assert_eq!(b.devices.len(), 1);
+        assert_eq!(
+            b.devices[0].free_mb, 11_397,
+            "the reported 17139 MiB is GTT, not VRAM"
+        );
+        assert_eq!(b.total_usable_mb(), 11_397 - 1_024);
+        assert_ne!(b.total_usable_mb(), 17_139 - 1_024, "the pre-fix budget");
+        assert!(
+            b.notes.iter().any(|n| n.contains("GTT")),
+            "a corrected reading is stated, not swallowed: {:?}",
+            b.notes
+        );
+
+        // …and the correction reaches the operator through the plan's own explanation.
+        let plan = fit(&FitInput {
+            budget: b,
+            ..log_input()
+        });
+        assert!(
+            plan.why.iter().any(|w| w.contains("clamped")),
+            "{:?}",
+            plan.why
+        );
+
+        // The invariant, over every reading a driver could print: usable is bounded by total
+        // for every device, whatever it claims is free.
+        for (total, free) in [
+            (11_397u64, 17_139u64),
+            (11_397, 12_821),
+            (0, u64::MAX),
+            (20_992, 20_363),
+            (81_559, 81_559),
+        ] {
+            let mut g = gpu("CUDA0", 0, free, 0);
+            g.vram_total_mb = total;
+            let b = budget_from_rig(&rig(vec![g]), BackendScope::Auto, &[], 0, &[]);
+            let usable = b.total_usable_mb();
+            assert!(
+                total == 0 || usable <= total,
+                "usable {usable} > total {total} (reported free {free})"
+            );
+        }
     }
 
     #[test]

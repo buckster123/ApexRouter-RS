@@ -381,9 +381,20 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
         // `/v1/chat/completions`; every other cell sends the client's own bytes to the path it
         // asked for. `resolve()`'s model rewrite is applied to whichever body that is, so an
         // alias still becomes the upstream's own model id on the Anthropic path too.
-        let (out_bytes, out_path) = match &cell {
-            Cell::Translate(_) => (translated.as_ref().unwrap_or(&bytes), upstream_path(&path)),
-            Cell::Relay => (&bytes, path.as_str()),
+        //
+        // The translating cell also sends **no query string**. Claude Code asks for
+        // `POST /v1/messages?beta=true`; relaying that verbatim would hand a strict OpenAI
+        // upstream `/v1/chat/completions?beta=true`, a parameter that means nothing on the
+        // endpoint it is now attached to. llama.cpp ignores it, but it is an Anthropic-side
+        // concern and does not survive the rewrite. Every other cell is a byte relay and keeps
+        // the client's query untouched.
+        let (out_bytes, out_path, out_query) = match &cell {
+            Cell::Translate(_) => (
+                translated.as_ref().unwrap_or(&bytes),
+                upstream_path(&path),
+                None,
+            ),
+            Cell::Relay => (&bytes, path.as_str(), query.as_deref()),
         };
 
         // A body that is not a JSON object has no `model` to rewrite — a multipart
@@ -417,7 +428,7 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
             candidate: cand,
             http: &r.http,
             method: method.clone(),
-            url: upstream_url(&meta.base_url, out_path, query.as_deref()),
+            url: upstream_url(&meta.base_url, out_path, out_query),
             headers: out_headers,
             body: body_plan,
             deadline,
@@ -2107,6 +2118,48 @@ mod tests {
         assert_eq!(sent["messages"][0]["content"], "Be terse.");
         assert_eq!(sent["messages"][1]["role"], "user");
         assert_eq!(sent["messages"][1]["content"], "Hello");
+    }
+
+    /// Claude Code sends `POST /v1/messages?beta=true`. The path is rewritten, so the query
+    /// has to go with it: `/v1/chat/completions?beta=true` is a parameter attached to an
+    /// endpoint that never defined it. llama.cpp ignores it; a strict OpenAI upstream need
+    /// not. The byte-relay cells keep the client's query — `upstream_url` still carries one
+    /// when it is given one, which its own test asserts.
+    #[tokio::test]
+    async fn the_translating_cell_drops_the_query_string() {
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(OPENAI_REPLY.to_vec(), "application/json"),
+            )
+            .expect(1)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages?beta=true")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(
+                r#"{"model":"auto","max_tokens":64,
+                    "messages":[{"role":"user","content":"Hello"}]}"#
+                    .to_owned(),
+            ))
+            .expect("request");
+        let resp = call(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let seen = up.received_requests().await.expect("recording");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].url.path(), "/v1/chat/completions");
+        assert_eq!(
+            seen[0].url.query(),
+            None,
+            "?beta=true is an Anthropic-side concern and means nothing on chat/completions"
+        );
     }
 
     #[tokio::test]

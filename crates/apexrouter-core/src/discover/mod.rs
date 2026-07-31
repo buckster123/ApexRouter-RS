@@ -13,7 +13,7 @@ pub mod gguf;
 pub mod models;
 pub mod physical;
 
-pub use builds::{choose_build, discover_builds, probe_devices, probe_flags};
+pub use builds::{choose_build, discover_builds, probe_devices, probe_flags, VramReading};
 pub use gguf::read_gguf_meta;
 pub use models::discover_models;
 pub use physical::{attach_pci_ids, scan_pci_gpus, GpuVendor, PciGpu};
