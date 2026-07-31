@@ -269,3 +269,14 @@ one for reasoning.
   materialise it as a key — and never deletes the operator's mistyped key either.
   Changed: `core/src/config.rs`, `config.example.toml`. `Config::validate`/`validate_file` are
   built and unrendered; `apexrouter config validate` is still owed (`docs/MIGRATION.md` §10.3).
+- **2026-08-01** — **The tag-time leftovers closed** (commit `a00b7dd`): `apexrouter config
+  validate` rendered (the debt in the entry above), migration rows strikeable through both
+  surfaces (`--skip` / `skip[]`, one `core::migrate::strike`), `POST /v1/migrate` mounted
+  (`openapi_routes.rs` `PENDING` now holds `/metrics` alone), and `apexrouter update` added —
+  pull the recorded checkout, hand over to its installer. No D-decision changed.
+- **2026-08-01** — **mk2 exploration charter adopted: `docs/GARDEN.md`.** The model garden —
+  thinker, embedder, dreamer-as-thinker-alias, image and video co-residents under one VRAM
+  ledger, Tier B (48 GB) as design centre — with seeded decisions G1–G6 and a measured
+  campaign protocol before any design lock. It binds direction, not implementation; where it
+  disagrees with D1–D18, D1–D18 win. The roadmap seeds in "Deliberately out of mk1" (llama.cpp
+  router mode / idle-unload, capacity-aware placement) are the mechanisms arc G-A picks up.
