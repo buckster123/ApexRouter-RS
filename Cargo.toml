@@ -9,6 +9,7 @@ members = [
     "crates/apexrouter-server",
     "crates/apexrouter-cli",
     "crates/apexrouter-slint",   # GPL app — deliberately NOT in default-members
+    "tests-support",             # test doubles — deliberately NOT in default-members
 ]
 default-members = [
     "crates/apexrouter-protocol",
@@ -35,6 +36,8 @@ apexrouter-router    = { path = "crates/apexrouter-router",    version = "0.1.0"
 apexrouter-providers = { path = "crates/apexrouter-providers", version = "0.1.0" }
 apexrouter-client    = { path = "crates/apexrouter-client",    version = "0.1.0" }
 apexrouter-server    = { path = "crates/apexrouter-server",    version = "0.1.0" }
+
+apexrouter-tests-support = { path = "tests-support", version = "0.1.0" }
 
 anyhow             = "1"
 thiserror          = "2"

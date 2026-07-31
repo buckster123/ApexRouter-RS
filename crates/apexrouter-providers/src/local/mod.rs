@@ -31,8 +31,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
 pub mod adopt;
+pub mod resolve;
 pub mod supervisor;
 
+pub use resolve::{ResolvedSpec, SpecOverride};
 use supervisor::{GateInput, GateOutcome, PortDenied, PortLease};
 
 /// How long a `SIGTERM` gets before the `SIGKILL`.
@@ -463,7 +465,13 @@ impl LocalProvisioner {
         spawned_flag: &mut bool,
     ) -> Result<Backend> {
         let port = lease.port();
-        let spec = with_port(&plan.spec, port);
+        // The SAME resolution `plan()` did, from the same draft and the same `FitPlan`, with
+        // only the port free to differ: the planned port can be taken between plan and up.
+        // `ResolvedSpec::resolve` is pure, so the argv the operator was shown and the argv
+        // the child gets cannot say different things about `-c`, `-np`, `-ngl`, `-dev` or
+        // the KV type.
+        let resolved = ResolvedSpec::resolve(&plan.spec, port, plan.fit.clone());
+        let spec = resolved.spec().clone();
 
         // ---- everything that must be true before we exec --------------------------------
         let rig = self.rig().await?;
@@ -496,7 +504,7 @@ impl LocalProvisioner {
         )?;
 
         // ---- argv -------------------------------------------------------------------------
-        let preview = self.argv_for(&spec, build.as_ref(), key_file.as_deref())?;
+        let preview = self.argv_for(&resolved, build.as_ref(), key_file.as_deref())?;
         let program = PathBuf::from(&preview.program);
         let cwd = PathBuf::from(&preview.cwd);
         std::fs::create_dir_all(&cwd).map_err(|source| Error::Io {
@@ -518,15 +526,21 @@ impl LocalProvisioner {
         // ---- facts on disk BEFORE we wait for anything ------------------------------------
         // A crash, a `systemctl --user restart` or a panic between here and the health gate
         // must leave a record we can adopt, not an orphan holding 6 GB of VRAM.
+        // `spec` is the operator's DRAFT plus the port, not the resolved spec: `same_endpoint`
+        // compares a record against the next draft, and a record holding solver-filled
+        // numbers would stop matching the moment free VRAM moved — leaving a second record,
+        // and a second log file, behind every restart. The numbers that were executed live
+        // in `fit`, which `ResolvedSpec` has annotated with the argv they became; put them
+        // back together with `ResolvedSpec::from_record`.
         let mut record = EndpointRecord {
             id: id.clone(),
-            spec: spec.clone(),
+            spec: with_port(&plan.spec, port),
             desired: DesiredState::Running,
             proc: Some(facts.clone()),
             port: Some(port),
             log_path: Some(log.display().to_string()),
             started_at_unix: chrono::Utc::now().timestamp(),
-            fit: plan.fit.clone(),
+            fit: resolved.fit().cloned(),
             adopted: false,
             alias_bindings: Vec::new(),
         };
@@ -657,12 +671,19 @@ impl LocalProvisioner {
     /// `core::argv` resolves the cwd from the process environment; the supervisor's own
     /// `Paths` is authoritative, so the preview and the exec cannot disagree. The cwd is
     /// never load-bearing anyway — that is what the always-present `LD_LIBRARY_PATH` is for.
+    ///
+    /// **Takes a [`ResolvedSpec`], never a draft.** That is the whole of the fix for the
+    /// MK1 ACCEPTANCE defect: the solver used to compute a plan that argv never read, and
+    /// the type now makes "render argv from the operator's draft" fail to compile. Any
+    /// residual disagreement between the rendered argv and the plan it claims to execute is
+    /// logged rather than left for a log tail to imply.
     fn argv_for(
         &self,
-        spec: &EndpointSpec,
+        resolved: &ResolvedSpec,
         build: Option<&LlamaBuild>,
         key_file: Option<&Path>,
     ) -> Result<ArgvPreview> {
+        let spec = resolved.spec();
         let mut preview = match (spec, build) {
             (EndpointSpec::LocalLlama(s), Some(b)) => argv::plan_local(s, b, key_file)?,
             (EndpointSpec::LocalLlama(s), None) => {
@@ -684,6 +705,12 @@ impl LocalProvisioner {
             }
         };
         preview.cwd = self.paths.state().display().to_string();
+        // Impossible by construction — `preview` was rendered from `resolved` — but the
+        // defect this type closed was exactly "the plan and the process disagreed and
+        // nothing said so", so the check is cheap insurance rather than decoration.
+        for line in resolved.disagreements(&preview) {
+            tracing::error!(%line, "the rendered argv does not execute the plan it reports");
+        }
         Ok(preview)
     }
 
@@ -954,13 +981,21 @@ impl Provisioner for LocalProvisioner {
             }
             _ => None,
         };
-        let preview = self.argv_for(&previewed, build.as_ref(), key_file.as_deref())?;
+
+        // THE fix for "the centrepiece is decorative": argv is rendered from the solver's
+        // plan, not from the draft. `-c`, `-np`, `-ngl`, `-dev` and the KV cache type are
+        // emitted explicitly instead of being left to llama.cpp's own auto-sizing, and an
+        // operator value that overrules the solver is carried into the plan as an override
+        // rather than quietly replacing it.
+        let resolved = ResolvedSpec::resolve(draft, port, fit);
+        warnings.extend(resolved.notes());
+        let preview = self.argv_for(&resolved, build.as_ref(), key_file.as_deref())?;
         warnings.extend(preview.warnings.iter().cloned());
 
         Ok(LaunchPlan {
             spec: draft.clone(),
             argv: preview,
-            fit,
+            fit: resolved.into_fit(),
             cost: CostEstimate::Metered {
                 usd: Money(0),
                 source: PriceSource::Derived,

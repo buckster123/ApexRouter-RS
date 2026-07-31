@@ -143,16 +143,27 @@ pub async fn smoke(
 /// The rig is taken from S-04's cache rather than rescanned: a diagnose that spent four
 /// seconds enumerating Vulkan devices before running `creds.vast` would be a diagnose
 /// nobody runs.
+///
+/// The **vast client is injected here** and nowhere else. `install_provider_clients` builds
+/// one at startup and parks it where `/v1/vast/*` can find it; until this line existed the
+/// check registry could not, so `vast.credit` and `vast.orphans` skipped with "no vast.ai
+/// client" in a daemon that was holding one. Injecting the installed client rather than
+/// building a second one also means the two surfaces cannot disagree about which key is in
+/// play. Nothing a caller already put under that key is replaced — that is how the smoke
+/// probes and the tests pass their own doubles in.
 pub async fn check_ctx(
     s: &Arc<AppState>,
     instance: Option<InstanceId>,
-    ext: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
+    mut ext: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
 ) -> CheckCtx {
     let cfg = s.cfg();
     let rig = crate::api::rig::rig_snapshot(s, false)
         .await
         .ok()
         .map(Arc::new);
+    if let Some(api) = super::vast::vast_api() {
+        apexrouter_providers::checks::insert_vast(&mut ext, api);
+    }
     CheckCtx {
         paths: s.paths.clone(),
         cfg: Arc::clone(&cfg),

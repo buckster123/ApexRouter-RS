@@ -13,6 +13,12 @@
 //! clients; `apexrouter-server` registers them at startup, and `CheckCtx::ext` is how they
 //! get their clients without `core` ever depending on this crate.
 //!
+//! [`provider_ext`] is the other half of that sentence, and it was missing: registering a
+//! check that reads `ext` is worthless unless something *writes* `ext`. Nothing did, so
+//! `vast.credit` and `vast.orphans` skipped on every machine — including one whose
+//! `creds.vast` row passed on the line above. Both `apexrouter doctor` (no daemon) and
+//! `GET /v1/diagnose` (daemon) now fill the map before they run the registry.
+//!
 //! Nothing in this file can spend money. The vast calls are `GET /users/current/` and
 //! `GET /instances/`, both read-only, and a check that finds an orphan **reports** it — the
 //! Destroy action belongs to a surface that can ask for confirmation first.
@@ -21,9 +27,11 @@ use crate::local::adopt;
 use crate::smoke::{first_chars, redact};
 use crate::vast::api::VastApi;
 use apexrouter_core::checks::{Check, CheckCtx, CheckNeeds};
+use apexrouter_core::config::Config;
 use apexrouter_core::error::Result;
 use apexrouter_core::exec::{self, Output, SshOpts};
 use apexrouter_core::ledger::Ledger;
+use apexrouter_core::paths::Paths;
 use apexrouter_core::proc::Adoption;
 use apexrouter_core::secret::{self, Secret};
 use apexrouter_core::store::Store;
@@ -81,6 +89,46 @@ pub struct TogetherExt {
 /// Fetch one injected client, or `None` when the daemon did not register it.
 pub fn ext<T: Any + Send + Sync>(ctx: &CheckCtx, key: &str) -> Option<Arc<T>> {
     ctx.ext.get(key)?.clone().downcast::<T>().ok()
+}
+
+/// The type every `CheckCtx::ext` map is.
+pub type ExtMap = std::collections::HashMap<String, Arc<dyn Any + Send + Sync>>;
+
+/// Put a vast client into an `ext` map under the key `vast.credit` and `vast.orphans` read.
+///
+/// The daemon already holds a client; it should hand that one over rather than build a
+/// second connection pool. Anything a caller already put under [`EXT_VAST`] wins, because
+/// an explicitly injected client is a test seam.
+pub fn insert_vast(ext: &mut ExtMap, api: Arc<dyn VastApi>) {
+    ext.entry(EXT_VAST.to_owned())
+        .or_insert_with(|| Arc::new(VastExt(api)));
+}
+
+/// Every provider client that can be built from configuration alone, for the surfaces that
+/// run the registry **without** a daemon — `apexrouter doctor` is the whole reason this
+/// exists.
+///
+/// Before this, nothing anywhere put a `VastExt` into a `CheckCtx`, so `vast.credit` and
+/// `vast.orphans` skipped with "no vast.ai client" on every machine, including one whose
+/// `creds.vast` row passed immediately above them. A check that can never run is worse than
+/// no check, because `doctor --json` then reports zero failures while having asked nothing.
+///
+/// **Nothing here spends money and nothing here dials anything.** Building a client resolves
+/// a credential and constructs a connection pool; the first byte on the wire is the
+/// read-only `GET /users/current/` a check makes later. A machine with no vast credential
+/// gets an empty map and an honest `Skipped`.
+///
+/// `ssh.*` and `net.stall` are deliberately absent: they are *per instance*, and the
+/// instance is chosen by the caller, not by configuration.
+pub fn provider_ext(cfg: &Config, paths: &Paths) -> ExtMap {
+    let mut ext = ExtMap::new();
+    match crate::vast::VastApiHttp::from_config(cfg, paths) {
+        Ok(api) => insert_vast(&mut ext, Arc::new(api)),
+        // Not an error and not worth a warning: a machine that does not rent GPUs has no
+        // vast key, and the two checks say so themselves.
+        Err(e) => tracing::debug!(reason = %e, "no vast client for the check registry"),
+    }
+    ext
 }
 
 // ----------------------------------------------------------------------------------------
@@ -494,17 +542,18 @@ impl Check for VastOrphans {
                 )
             }
         };
-        let active = match Ledger::open(&ctx.paths).and_then(|l| l.active()) {
-            Ok(rows) => rows,
-            Err(e) => {
-                return result(
+        let active =
+            match Ledger::open(&ctx.paths).and_then(|l| l.active()) {
+                Ok(rows) => rows,
+                Err(e) => return result(
                     self,
                     CheckStatus::Warn,
                     format!("the ledger could not be read: {e}"),
-                    Some("check `state.writable`"),
-                )
-            }
-        };
+                    Some(
+                        "`apexrouter doctor --only state.writable` says whether $STATE is writable",
+                    ),
+                ),
+            };
         let (status, detail, fix) = orphan_report(&active, &live).verdict();
         result(self, status, detail, fix.as_deref())
     }
@@ -593,12 +642,19 @@ fn join_ids(ids: &[u64]) -> String {
 }
 
 /// The one wording for "there is no vast client here".
+///
+/// Since [`provider_ext`] builds the client from configuration, this now means exactly one
+/// thing — **no credential resolved** — so the fix line is the command that supplies one.
+/// It used to mean "nobody injected a client", which no operator could act on.
 fn skipped_no_vast(check: &dyn Check) -> CheckResult {
     result(
         check,
         CheckStatus::Skipped,
-        "no vast.ai client — configure a credential to enable the fleet checks",
-        None,
+        "no vast.ai credential on this machine, so there is no fleet to check",
+        Some(
+            "`apexrouter provider set vast --key-stdin`, or export $VAST_API_KEY — \
+             skip this if you do not rent GPUs",
+        ),
     )
 }
 
@@ -828,17 +884,18 @@ impl Check for EndpointOrphans {
     }
     async fn run(&self, ctx: &CheckCtx) -> CheckResult {
         let store = Store::new(ctx.paths.clone());
-        let records = match store.list_endpoints() {
-            Ok(r) => r,
-            Err(e) => {
-                return result(
+        let records =
+            match store.list_endpoints() {
+                Ok(r) => r,
+                Err(e) => return result(
                     self,
                     CheckStatus::Warn,
                     format!("the endpoint records could not be read: {e}"),
-                    Some("check `state.writable`"),
-                )
-            }
-        };
+                    Some(
+                        "`apexrouter doctor --only state.writable` says whether $STATE is writable",
+                    ),
+                ),
+            };
 
         let mut foreign = Vec::new();
         let mut vanished = Vec::new();
@@ -871,7 +928,14 @@ impl Check for EndpointOrphans {
                 self,
                 CheckStatus::Warn,
                 format!("recorded as running, but gone: {}", vanished.join(", ")),
-                Some("`apexrouter endpoint start <id>` restarts it, `endpoint rm <id>` forgets it"),
+                // NOT `endpoint start <id>`: that verb takes a **model**, resolved through
+                // `/v1/models/local`, and an endpoint id is not a model id — the advice
+                // this replaces produced "no model matching `local-carnice-9b-q6-k`".
+                // `restart` is the verb that relaunches a record from its own spec.
+                Some(
+                    "`apexrouter endpoint restart <id>` relaunches it from the recorded spec; \
+                     `endpoint rm <id>` forgets it",
+                ),
             );
         }
         result(
@@ -1329,8 +1393,71 @@ mod tests {
     #[tokio::test]
     async fn no_vast_client_is_skipped_not_failed() {
         let ctx = ctx();
-        assert_eq!(VastCredit.run(&ctx).await.status, CheckStatus::Skipped);
-        assert_eq!(VastOrphans.run(&ctx).await.status, CheckStatus::Skipped);
+        for r in [VastCredit.run(&ctx).await, VastOrphans.run(&ctx).await] {
+            assert_eq!(r.status, CheckStatus::Skipped);
+            // A skip an operator can act on: the credential, not the injection.
+            let fix = r
+                .fix
+                .expect("a skipped vast check names the credential command");
+            assert!(fix.contains("provider set vast"), "{fix}");
+        }
+    }
+
+    #[test]
+    fn an_injected_client_is_the_one_the_checks_see_and_is_never_replaced() {
+        let mut ext = ExtMap::new();
+        insert_vast(
+            &mut ext,
+            Arc::new(FakeVast {
+                account: account(1.0),
+                instances: Vec::new(),
+            }),
+        );
+        assert!(ext.contains_key(EXT_VAST));
+
+        // A second insert must not evict the first: an explicitly injected client is a test
+        // seam, and `provider_ext` running afterwards must not silently swap in a live one.
+        let first = Arc::as_ptr(ext.get(EXT_VAST).expect("vast")) as *const ();
+        insert_vast(
+            &mut ext,
+            Arc::new(FakeVast {
+                account: account(2.0),
+                instances: Vec::new(),
+            }),
+        );
+        let second = Arc::as_ptr(ext.get(EXT_VAST).expect("vast")) as *const ();
+        assert_eq!(first, second, "the first client survived");
+    }
+
+    #[tokio::test]
+    async fn a_context_built_from_provider_ext_actually_runs_the_fleet_checks() {
+        // HERMETICITY: `provider_ext` resolves a credential and builds a connection pool;
+        // it dials nothing. The client it builds here points at a closed loopback port, and
+        // the check below never runs against it — the assertion is that the *map* is filled,
+        // which is the thing that was missing.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("vast_key"), "not-a-real-key\n").expect("key file");
+
+        let mut cfg = Config::default();
+        cfg.vast.base_url = "http://127.0.0.1:1/api/v0".to_owned();
+        cfg.vast.api_key_file = dir.path().join("vast_key").display().to_string();
+
+        let paths = Paths::resolve().expect("paths");
+        let ext = provider_ext(&cfg, &paths);
+        assert!(
+            ext.contains_key(EXT_VAST),
+            "a resolvable credential must yield a client"
+        );
+
+        // The point of the map: the two checks stop skipping. They will `Warn` here — the
+        // base URL is a closed port, and "vast.ai did not answer" is the honest verdict —
+        // but a `Warn` means the check *ran*, which is what could not happen before.
+        let mut c = ctx();
+        c.cfg = Arc::new(cfg);
+        c.ext = ext;
+        let r = VastCredit.run(&c).await;
+        assert_eq!(r.status, CheckStatus::Warn, "{}", r.detail);
+        assert!(r.detail.contains("did not answer"), "{}", r.detail);
     }
 
     #[test]

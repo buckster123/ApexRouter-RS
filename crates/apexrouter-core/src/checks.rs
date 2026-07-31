@@ -404,12 +404,18 @@ impl Check for CredsCheck {
             ),
             // No key is a normal state for a provider nobody uses, so: Skipped, with the
             // one command that fixes it if it was not intentional.
+            // The verb is `provider set`, and there is no `provider key`: the fix line this
+            // replaces named a subcommand `apexrouter` does not have, so following it
+            // printed a clap usage error rather than storing a key.
             Ok(None) => result(
                 &self.id,
                 &self.label,
                 CheckStatus::Skipped,
                 "no credential configured",
-                Some("set one with `apexrouter provider key <id>`, an env var or a key file"),
+                Some(&format!(
+                    "`apexrouter provider set {} --key-stdin`, or an env var, or a key file",
+                    self.id.as_str().rsplit('.').next().unwrap_or("<id>")
+                )),
             ),
             // A *present but unreadable* file is a real defect, and that is what an error
             // out of the chain means.
@@ -492,6 +498,13 @@ impl Check for PortCheck {
 // ---------------------------------------------------------------------------------------
 
 /// `ctx.rig`, or the reason there is nothing to look at.
+///
+/// Both surfaces that run this registry now put a [`RigSnapshot`] in the context — the
+/// daemon from its cache, `apexrouter doctor` by scanning — so reaching this arm means the
+/// **scan itself failed**, not that nobody has run one. The old fix line said "run
+/// `apexrouter rig` first", which was advice that could not work: nothing was injecting the
+/// snapshot, so running it changed nothing. What `apexrouter rig` is actually good for here
+/// is showing the scan's own error.
 macro_rules! rig_or_skip {
     ($self:expr, $ctx:expr) => {
         match $ctx.rig.as_ref() {
@@ -501,8 +514,11 @@ macro_rules! rig_or_skip {
                     &$self.id(),
                     $self.label(),
                     CheckStatus::Skipped,
-                    "no rig scan yet",
-                    Some("run `apexrouter rig` first"),
+                    "the rig could not be scanned",
+                    Some(
+                        "`apexrouter rig` runs the same scan and prints where it looked; \
+                         `[endpoints] build_roots` is what it searched",
+                    ),
                 )
             }
         }

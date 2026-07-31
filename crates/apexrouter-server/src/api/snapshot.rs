@@ -156,7 +156,16 @@ pub async fn build(state: &Arc<AppState>) -> Snapshot {
             table_valid: err.is_none(),
             table_error: err,
         },
-        backends: state.router.registry().snapshot(),
+        // `observed`, not `snapshot()`: the dashboard, `apexrouter status` and
+        // `apexrouter backend ls` must not be able to disagree about whether a backend is
+        // serving, and health is computed on read (invariant 3).
+        backends: state
+            .router
+            .registry()
+            .all()
+            .iter()
+            .map(|live| super::backends::observed(live))
+            .collect(),
         routes: state
             .store
             .load_routes()
@@ -295,13 +304,22 @@ fn alerts(state: &Arc<AppState>) -> Vec<Alert> {
             at_unix: now,
         });
     }
-    for b in state.router.registry().snapshot() {
+    for live in state.router.registry().all() {
+        let b = super::backends::observed(&live);
         if let Some(err) = b.last_error.as_deref() {
             out.push(Alert {
                 id: format!("backend.error.{}", b.id),
                 level: AlertLevel::Warning,
                 message: format!("{}: {err}", b.id),
-                action: Some(format!("apexrouter backend probe {}", b.id)),
+                // The action has to be the one that *works*. A disabled backend answers a
+                // probe perfectly well and stays out of the table regardless, so offering
+                // `probe` there sends the operator round a loop — this is the one recovery
+                // (`apexrouter backend enable`) that FIX-5 found surfaced nowhere at all.
+                action: Some(if b.enabled {
+                    format!("apexrouter backend probe {}", b.id)
+                } else {
+                    format!("apexrouter backend enable {}", b.id)
+                }),
                 at_unix: now,
             });
         }

@@ -87,13 +87,29 @@ pub struct LogQuery {
 }
 
 /// `GET /v1/backends` — every live backend, from the registry rather than from disk.
+///
+/// Health is [`observed`], not read back: `apexrouter backend ls` is where an operator looks
+/// during a 503 storm, and a row that says `ready` for a backend the proxy is refusing to
+/// dispatch to is worse than no row at all.
 pub async fn list(State(s): State<Arc<AppState>>) -> ApiResult<Vec<Backend>> {
-    Ok(Json(s.router.registry().snapshot()))
+    Ok(Json(
+        s.router
+            .registry()
+            .all()
+            .iter()
+            .map(|live| observed(live))
+            .collect(),
+    ))
 }
 
-/// `GET /v1/backends/{id}` — one backend.
+/// `GET /v1/backends/{id}` — one backend, with health computed the same way [`list`] does.
 pub async fn one(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Backend> {
-    Ok(Json(lookup(&s, &id)?))
+    let parsed = parse_id(&id)?;
+    s.router
+        .registry()
+        .get(&parsed)
+        .map(|live| Json(observed(&live)))
+        .ok_or_else(|| ApiError::not_found(format!("backend {id}")))
 }
 
 /// `POST /v1/backends` — register a plain OpenAI-compatible URL as a backend.
@@ -202,13 +218,29 @@ pub async fn remove_backend(
 }
 
 /// `POST /v1/backends/{id}/probe` — ask the upstream what it is, now.
-///
-/// The probe's findings are folded into the record: health, the model list, the slot count
-/// and the advertised context. `slots_total` matters beyond display — R-01 sizes the
-/// backend's permit pool from it, so a probe is also how a `--parallel 4` server stops being
-/// treated as `--parallel 1`.
 pub async fn probe(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> ApiResult<Backend> {
-    let mut b = lookup(&s, &id)?;
+    probe_into_record(&s, &id).await.map(Json)
+}
+
+/// Ask the upstream what it is **now**, and fold the answer into the live record.
+///
+/// The probe's findings become the record: health, the model list, the slot count and the
+/// advertised context. `slots_total` matters beyond display — R-01 sizes the backend's
+/// permit pool from it, so a probe is also how a `--parallel 4` server stops being treated
+/// as `--parallel 1`.
+///
+/// `pub(super)` because [`super::routes::swap`] must not point an alias at a backend it has
+/// not proven can answer, and invariant 3 says that proof is a **probe**, not a stored
+/// `Health` string. Two probe implementations could disagree; there is one.
+///
+/// # Errors
+/// An unparseable or unregistered id. A backend that answers badly is not an error here —
+/// it is a `Down` record, which is the finding.
+pub(super) async fn probe_into_record(
+    state: &Arc<AppState>,
+    id: &str,
+) -> Result<Backend, ApiError> {
+    let mut b = lookup(state, id)?;
     let cred = credential_for(&b.credential).await;
     let found = upstream::probe(super::http(), &b.base_url, cred.as_ref(), PROBE_TIMEOUT).await;
 
@@ -246,11 +278,11 @@ pub async fn probe(State(s): State<Arc<AppState>>, Path(id): Path<String>) -> Ap
         }
     };
 
-    if let Some(live) = s.router.registry().get(&b.id) {
+    if let Some(live) = state.router.registry().get(&b.id) {
         live.set_models(b.models.iter().map(|m| m.id.clone()).collect());
     }
-    register_backend(&s, b.clone());
-    Ok(Json(b))
+    register_backend(state, b.clone());
+    Ok(b)
 }
 
 /// `POST /v1/backends/{id}/enable`.
@@ -343,7 +375,36 @@ fn parse_id(id: &str) -> Result<BackendId, ApiError> {
         .map_err(|e| ApiError::bad_request("bad_id", e.to_string()).with_param("id"))
 }
 
-/// One backend out of the live registry.
+/// The health a backend has **right now**, computed rather than read back.
+///
+/// Invariant 3 (`docs/CLAUDE.md`): liveness and health are *computed on read*, never a stored
+/// string. `Backend::health` is a description that was true when the prober last wrote it;
+/// `LiveBackend::accepting` is the truth as of this instant and is what `resolve()` actually
+/// consults. When they disagree the live flag wins — a row reading `ready` while the proxy
+/// answers `no_healthy_backend` for that very id is exactly the lie a swap used to leave
+/// behind.
+///
+/// Only the direction that can produce a lie is corrected. Nothing here ever *promotes* a
+/// backend: proving one healthy takes a probe, and the probe is [`probe_into_record`].
+pub(super) fn observed(live: &apexrouter_router::LiveBackend) -> Backend {
+    let mut b = live.meta.load_full().as_ref().clone();
+    if b.health.is_routable() && !live.accepting.load(Ordering::Relaxed) {
+        b.health = if b.enabled {
+            Health::Draining {
+                in_flight: live.inflight.load(Ordering::Relaxed),
+            }
+        } else {
+            Health::Down {
+                reason: "disabled".to_owned(),
+                retry_at_unix: super::now_unix(),
+            }
+        };
+    }
+    b
+}
+
+/// One backend out of the live registry, **as recorded** — the raw row a mutation starts
+/// from, so a computed display value can never round-trip back into the record.
 fn lookup(state: &Arc<AppState>, id: &str) -> Result<Backend, ApiError> {
     let parsed = parse_id(id)?;
     state
@@ -355,9 +416,18 @@ fn lookup(state: &Arc<AppState>, id: &str) -> Result<Backend, ApiError> {
 }
 
 /// Flip `enabled` — both on the record and on the live `accepting` flag — and recompile.
+///
+/// Enabling clears `last_error`. It was recorded about a backend in a state this call has
+/// just ended, and the snapshot lifts every `last_error` into a **standing** alert — so a
+/// remedy left behind after it was taken would go on telling the operator to run the command
+/// they just ran. The next probe re-establishes the truth within one interval; a stale
+/// warning has no such expiry.
 fn set_enabled(state: &Arc<AppState>, id: &str, enabled: bool) -> Result<Backend, ApiError> {
     let mut b = lookup(state, id)?;
     b.enabled = enabled;
+    if enabled {
+        b.last_error = None;
+    }
     if let Some(live) = state.router.registry().get(&b.id) {
         live.accepting.store(enabled, Ordering::Release);
     }

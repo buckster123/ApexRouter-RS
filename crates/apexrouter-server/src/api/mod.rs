@@ -381,6 +381,25 @@ pub fn register_backend(state: &Arc<AppState>, b: Backend) {
     );
 }
 
+/// Put a **freshly started** backend into the registry, armed.
+///
+/// The difference from [`register_backend`] is one flag, and it is load-bearing.
+/// `BackendRegistry::upsert` deliberately preserves live state across a re-registration — the
+/// permit pool, the breaker, the drain flag — because a table recompile must be invisible to
+/// the request path. A *new process* under an old id is the one case where that is wrong: the
+/// `accepting = false` left behind by the drain that stopped the previous process belongs to
+/// a corpse, and inheriting it gives you a backend that is `Ready`, in the table, and never
+/// dispatched to. That is the same invisible-outage shape FIX-5 exists to close, so a start
+/// says so explicitly instead of hoping nothing drained the id earlier.
+pub fn register_started(state: &Arc<AppState>, b: Backend) {
+    let enabled = b.enabled;
+    let id = b.id.clone();
+    register_backend(state, b);
+    if let Some(live) = state.router.registry().get(&id) {
+        live.accepting.store(enabled, Ordering::Release);
+    }
+}
+
 /// Persist the backends that have no lifecycle — nodes and managed providers.
 ///
 /// Endpoint-backed backends are **not** written here: `$STATE/endpoints/<id>.json` already

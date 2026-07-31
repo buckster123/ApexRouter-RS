@@ -19,14 +19,31 @@
 //!
 //! A check that cannot be meaningful here reports `Skipped`, never `Fail`: being offline,
 //! having no vast credential, or not owning a rented box are not defects.
+//!
+//! # What has to be *in* the context, or the check may as well not exist
+//!
+//! Six of nineteen checks used to be unrunnable, and none of them said so honestly:
+//! `builds.discovered`, `builds.flags` and `devices.enumerated` skipped with "no rig scan
+//! yet" and told the operator to run `apexrouter rig` — which changed nothing, because
+//! nothing ever put a [`apexrouter_protocol::RigSnapshot`] into the `CheckCtx`. `vast.credit`
+//! and `vast.orphans` skipped with "no vast.ai client" on the line below a passing
+//! `creds.vast`, because nothing ever put one into `ext` either.
+//!
+//! So this function fills both. The rig comes from a **discovery scan** — `--help`,
+//! `--version` and `--list-devices` against each `llama-server`, which are metadata calls
+//! that read no weights — and it is skipped entirely unless the `--only` selection could
+//! want it, so `doctor --only rate-limits` stays instant. `ext` comes from
+//! [`apexrouter_providers::checks::provider_ext`], which builds a vast client when a
+//! credential resolves and hands back an empty map when none does.
+//!
+//! A `doctor --json` that reports zero failures has to mean the checks ran.
 
 use crate::cli::DoctorArgs;
-use crate::cmd::{url, Ctx};
-use crate::daemon::Need;
+use crate::cmd::Ctx;
+use crate::daemon::{self, Need};
 use crate::render;
 use apexrouter_core::checks::{CheckCtx, Registry};
 use apexrouter_protocol::{CheckResult, CheckStatus};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Run `apexrouter doctor`.
@@ -68,18 +85,30 @@ pub async fn diagnose(ctx: &Ctx, only: Option<&str>) -> Vec<CheckResult> {
         registry.register(c);
     }
 
+    let cfg = Arc::new(ctx.cfg.clone());
     let check_ctx = CheckCtx {
         paths: ctx.paths.clone(),
-        cfg: Arc::new(ctx.cfg.clone()),
+        cfg: Arc::clone(&cfg),
         // `reqwest::Client: Default`; naming the type would make `reqwest` a dependency of
         // this crate for one value the check registry immediately takes ownership of.
         http: Default::default(),
-        rig: None,
+        rig: rig_for(ctx, only).await,
         // A daemon that is up is the honest `proxy_url`; one that is not is `None`, and a
         // check that needs a daemon then reports `Skipped` rather than a fabricated `Fail`.
-        proxy_url: url::proxy_base(ctx).ok().map(|(base, _)| base),
+        //
+        // Read from the **owner record**, not `url::proxy_base`: that helper falls back to
+        // the configured bind address when no daemon owns the lock, so it is never `None` —
+        // which turned `CheckNeeds::Daemon` into a decoration and made `proxy.roundtrip`
+        // report `fail: unreachable` on every machine that simply was not serving yet. The
+        // owner record is `Some` only while a live daemon holds the lock.
+        proxy_url: daemon::owner_record(&ctx.paths, std::time::Duration::ZERO)
+            .ok()
+            .flatten()
+            .map(|rec| rec.proxy_url.trim_end_matches('/').to_owned()),
         instance: None,
-        ext: HashMap::new(),
+        // The vast client, when a credential resolves. Without this the two fleet checks
+        // can never run; with it they run read-only calls and nothing else.
+        ext: apexrouter_providers::checks::provider_ext(&cfg, &ctx.paths),
     };
 
     // The registry documents a dropped receiver as normal: `doctor` renders the returned
@@ -97,6 +126,59 @@ pub async fn diagnose(ctx: &Ctx, only: Option<&str>) -> Vec<CheckResult> {
         }
     }
     results
+}
+
+/// The check ids that are meaningless without a [`RigSnapshot`], and are the only reason
+/// `doctor` would pay for a discovery scan.
+const RIG_CHECKS: [&str; 3] = ["builds.discovered", "builds.flags", "devices.enumerated"];
+
+/// The rig, scanned here, or `None` when the selection cannot want it and when the scan
+/// fails.
+///
+/// A scan runs `llama-server --help`, `--version` and `--list-devices` per discovered
+/// binary. Those are **metadata calls that load no weights** — the flag probe is cached
+/// under `$CACHE` — so this is seconds at worst and nothing at all on the second run.
+///
+/// A failed scan is `None` and the three checks skip, which is the same honest outcome as
+/// before; the difference is that on a working machine they now run.
+async fn rig_for(ctx: &Ctx, only: Option<&str>) -> Option<Arc<apexrouter_protocol::RigSnapshot>> {
+    if !wants_rig(only) {
+        return None;
+    }
+    match apexrouter_providers::local::supervisor::scan_rig(&ctx.cfg.endpoints, ctx.paths.cache())
+        .await
+    {
+        Ok(rig) => Some(Arc::new(rig)),
+        Err(e) => {
+            tracing::debug!(error = %e, "the rig scan failed; the rig checks will skip");
+            None
+        }
+    }
+}
+
+/// Could this `--only` selection reach a check that reads the rig?
+///
+/// Deliberately **wider** than `Registry`'s own filter, which is private to `core`: this
+/// matches when either side contains the other, so the worst a mismatch can do is scan a rig
+/// nobody looks at. Being narrower would put the "check that can never run" defect straight
+/// back, so the asymmetry is the point.
+fn wants_rig(only: Option<&str>) -> bool {
+    let Some(pattern) = only.map(normalise).filter(|p| !p.is_empty()) else {
+        return true;
+    };
+    RIG_CHECKS
+        .iter()
+        .map(|id| normalise(id))
+        .any(|id| id.contains(&pattern) || pattern.contains(&id))
+}
+
+/// Lower-case, with everything that is not a letter or a digit removed — `core`'s own rule
+/// for `--only`, so `--only rig-devices` and `devices.enumerated` still meet.
+fn normalise(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 /// The honest answer when `--only` selected no check at all.
@@ -226,6 +308,39 @@ mod tests {
             fix.contains("creds.vast") && fix.contains("ports.proxy"),
             "{fix}"
         );
+    }
+
+    #[test]
+    fn the_rig_is_scanned_for_every_selection_that_could_read_it() {
+        // The whole run, and the two namespaces the rig checks live in.
+        assert!(wants_rig(None));
+        assert!(wants_rig(Some("")));
+        assert!(wants_rig(Some("   ")));
+        assert!(wants_rig(Some("builds")));
+        assert!(wants_rig(Some("devices")));
+        assert!(wants_rig(Some("devices.enumerated")));
+        // Separators and case are ignored on both sides, as `--only` matching is.
+        assert!(wants_rig(Some("DEVICES_ENUMERATED")));
+        assert!(wants_rig(Some("builds-flags")));
+
+        // …and nothing else pays for a Vulkan enumeration.
+        assert!(!wants_rig(Some("rate-limits")));
+        assert!(!wants_rig(Some("creds")));
+        assert!(!wants_rig(Some("ports.proxy")));
+        assert!(!wants_rig(Some("vast")));
+    }
+
+    #[test]
+    fn every_rig_check_this_gate_names_is_a_check_that_exists() {
+        // A typo here would silently reintroduce "the check can never run": the gate would
+        // decline to scan for a selection that does in fact reach a rig check.
+        let ids: Vec<String> = apexrouter_core::checks::local_checks()
+            .iter()
+            .map(|c| c.id().as_str().to_owned())
+            .collect();
+        for want in RIG_CHECKS {
+            assert!(ids.iter().any(|id| id == want), "{want} is not registered");
+        }
     }
 
     #[test]

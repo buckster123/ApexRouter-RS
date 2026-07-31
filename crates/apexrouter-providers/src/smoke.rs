@@ -19,6 +19,16 @@
 //! Probe order is `smoke.sh`'s order and it is load-bearing: `smoke.models` is what supplies
 //! a model id when the caller did not resolve one, and `smoke.warmup` pays the weight-load
 //! and prompt-cache cost so `smoke.throughput` measures generation rather than a cold start.
+//!
+//! # A reasoning model answers in a different field
+//!
+//! llama.cpp b9199 under `--reasoning-format deepseek` (and every managed provider that
+//! exposes chain-of-thought separately) puts the model's thinking in
+//! `choices[].message.reasoning_content` and may leave `content` empty or `null`. A probe
+//! that reads only `content` calls that "answered, but with empty content" — a **false**
+//! failure, and one that makes `smoke` untrustworthy on exactly the models this project
+//! runs. [`answer`] is therefore the one place either field is read, it names which field
+//! replied, and every probe and `compare` go through it.
 
 use apexrouter_core::secret::Secret;
 use apexrouter_core::upstream::{join_v1, parse_timings, parse_usage};
@@ -149,13 +159,25 @@ pub async fn warmup(http: &reqwest::Client, target: &SmokeTarget) -> SmokeProbe 
     let outcome = chat(http, target, &body).await;
     let mut p = finish(SMOKE_WARMUP, started, &outcome);
     if let (true, Some(v)) = (p.ok, outcome.body.as_ref()) {
-        let text = content(v).unwrap_or_default();
-        p.ok = !text.trim().is_empty();
-        p.detail = if p.ok {
-            first_chars(&text, 120)
-        } else {
-            "answered, but with empty content".to_owned()
-        };
+        match answer(v) {
+            // A reasoning model with an empty `content` **answered**. Naming the field is
+            // the point: "it replied in reasoning_content" is a fact about the endpoint's
+            // `--reasoning-format`, not a defect, and the operator should see which it was.
+            Some(Answer { text, field }) => {
+                p.ok = true;
+                p.detail = match field {
+                    AnswerField::Content => first_chars(&text, 120),
+                    AnswerField::Reasoning => {
+                        format!("via {}: {}", field.as_str(), first_chars(&text, 120))
+                    }
+                };
+            }
+            None => {
+                p.ok = false;
+                p.detail =
+                    "answered, but with neither `content` nor `reasoning_content`".to_owned();
+            }
+        }
     }
     p
 }
@@ -198,9 +220,12 @@ pub async fn tools(http: &reqwest::Client, target: &SmokeTarget) -> SmokeProbe {
         let names = tool_call_names(v);
         if names.is_empty() {
             p.ok = false;
+            // The prose it answered with instead is the finding, and on a thinking model
+            // that prose lives in `reasoning_content` — reading only `content` here would
+            // report "no tool_calls: " with nothing after the colon.
             p.detail = format!(
                 "the endpoint answered, but with no tool_calls: {}",
-                first_chars(&content(v).unwrap_or_default(), 120)
+                first_chars(&answer_text(v).unwrap_or_default(), 120)
             );
         } else {
             p.ok = names.iter().any(|n| n == "get_weather");
@@ -341,14 +366,84 @@ pub(crate) fn read_timings(body: &Value) -> (Option<u32>, Option<f32>, Option<u3
     (ttft, rate, tokens)
 }
 
-/// `choices[0].message.content`, when it is a string.
+/// `choices[0].message.content`, when it is a non-empty string.
+///
+/// Empty is `None` on purpose: a thinking model sends `"content": ""` alongside a full
+/// `reasoning_content`, and an empty string is not an answer. [`answer`] is what callers
+/// should use; this is its first half.
 pub(crate) fn content(body: &Value) -> Option<String> {
-    body.get("choices")?
+    message_field(body, "content")
+}
+
+/// `choices[0].message.reasoning_content`, when it is a non-empty string.
+///
+/// llama.cpp b9199 emits this under `--reasoning-format deepseek`; several managed
+/// providers emit it unconditionally.
+pub(crate) fn reasoning_content(body: &Value) -> Option<String> {
+    message_field(body, "reasoning_content")
+}
+
+/// Which field of the assistant message carried the reply.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AnswerField {
+    /// The ordinary `message.content`.
+    Content,
+    /// `message.reasoning_content`, with `content` empty or absent.
+    Reasoning,
+}
+
+impl AnswerField {
+    /// The wire name, for a `detail` line.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AnswerField::Content => "content",
+            AnswerField::Reasoning => "reasoning_content",
+        }
+    }
+}
+
+/// What the assistant actually said, and where it said it.
+#[derive(Clone, Debug)]
+pub(crate) struct Answer {
+    /// The text.
+    pub(crate) text: String,
+    /// Which field it came out of.
+    pub(crate) field: AnswerField,
+}
+
+/// The assistant's reply, from `content` if there is one and `reasoning_content` if there
+/// is not.
+///
+/// `content` wins when both are present and non-empty: the reasoning is the model's working,
+/// the content is its answer. `None` means the endpoint returned a message with neither,
+/// which is the only shape that is genuinely a failed probe.
+pub(crate) fn answer(body: &Value) -> Option<Answer> {
+    if let Some(text) = content(body) {
+        return Some(Answer {
+            text,
+            field: AnswerField::Content,
+        });
+    }
+    reasoning_content(body).map(|text| Answer {
+        text,
+        field: AnswerField::Reasoning,
+    })
+}
+
+/// [`answer`]'s text, for the callers that only want something to show a human.
+pub(crate) fn answer_text(body: &Value) -> Option<String> {
+    answer(body).map(|a| a.text)
+}
+
+/// One string field of `choices[0].message`, `None` when absent, non-string or blank.
+fn message_field(body: &Value, name: &str) -> Option<String> {
+    let text = body
+        .get("choices")?
         .get(0)?
         .get("message")?
-        .get("content")?
-        .as_str()
-        .map(str::to_owned)
+        .get(name)?
+        .as_str()?;
+    (!text.trim().is_empty()).then(|| text.to_owned())
 }
 
 /// The response's own `model` field. Managed providers echo the canonical id here, which is
@@ -683,6 +778,119 @@ mod tests {
         assert!(!p.ok);
         assert!(p.detail.starts_with("HTTP 400"), "{}", p.detail);
         assert!(p.detail.contains("Unable to access model"), "{}", p.detail);
+    }
+
+    /// A thinking model's completion: the answer is in `reasoning_content` and `content` is
+    /// empty. This is what llama.cpp b9199 sends under `--reasoning-format deepseek`, and
+    /// what the fake `llama-server`'s `reasoning` behaviour produces.
+    fn reasoning_completion(thought: &str, content: Value) -> Value {
+        json!({
+            "model": "Carnice-9b-Q6_K",
+            "choices": [{"index": 0, "finish_reason": "stop", "message": {
+                "role": "assistant", "content": content, "reasoning_content": thought}}],
+            "usage": {"prompt_tokens": 37, "completion_tokens": 80},
+            "timings": {"prompt_n": 37, "prompt_ms": 412.5, "predicted_n": 80,
+                        "predicted_ms": 8000.0, "predicted_per_second": 10.0}
+        })
+    }
+
+    #[tokio::test]
+    async fn a_thinking_model_that_answers_in_reasoning_content_is_a_pass() {
+        // Both spellings of "no content": the field absent, and the field present but empty.
+        for empty in [json!(""), json!(null)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(reasoning_completion(
+                        "A hash table maps keys to buckets by hashing the key.",
+                        empty.clone(),
+                    )),
+                )
+                .mount(&server)
+                .await;
+
+            let p = warmup(&client(), &target(&server)).await;
+
+            assert!(p.ok, "a reasoning model answered: {p:#?}");
+            assert!(
+                p.detail.contains("reasoning_content"),
+                "the detail must say which field replied: {}",
+                p.detail
+            );
+            assert!(p.detail.contains("hash table maps keys"), "{}", p.detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_with_neither_field_is_still_a_failed_warmup() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "Carnice-9b-Q6_K",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}}]
+            })))
+            .mount(&server)
+            .await;
+
+        let p = warmup(&client(), &target(&server)).await;
+        assert!(!p.ok);
+        assert!(p.detail.contains("reasoning_content"), "{}", p.detail);
+    }
+
+    /// The same thing again, but against the **fake `llama-server`** rather than a
+    /// hand-written body: `reasoning` is its b9199 `--reasoning-format` shape, and this is
+    /// the difference between "our JSON reader handles the shape we imagined" and "the
+    /// probe passes against a server that answers the way the real one does".
+    #[tokio::test]
+    async fn the_fake_server_answering_in_reasoning_content_passes_the_whole_run() {
+        use apexrouter_tests_support::Stub;
+
+        let upstream = Stub::with("reasoning,content=A hash table maps keys to buckets.");
+        let t = SmokeTarget::new(upstream.base_url(), "stub-model")
+            .with_timeout(Duration::from_secs(10));
+
+        let p = warmup(&client(), &t).await;
+        assert!(
+            p.ok,
+            "the fake answered and the probe called it empty: {p:#?}"
+        );
+        assert!(p.detail.contains("reasoning_content"), "{}", p.detail);
+        assert!(p.detail.contains("hash table"), "{}", p.detail);
+
+        // The warm-up is what `smoke` gates on, so the whole run must not fail on it either.
+        let (tx, _rx) = mpsc::channel(8);
+        let all = run(&client(), &t, tx).await;
+        let warm = all
+            .iter()
+            .find(|p| p.name == SMOKE_WARMUP)
+            .expect("the warm-up ran");
+        assert!(warm.ok, "{warm:#?}");
+
+        // …and the endpoint really did leave `content` empty, so the pass came from the
+        // fallback rather than from the fake being unfaithful.
+        let seen = upstream.last_request().expect("a request reached the fake");
+        assert_eq!(seen.model().as_deref(), Some("stub-model"));
+    }
+
+    #[test]
+    fn content_wins_over_reasoning_when_both_are_there() {
+        let both = json!({"choices": [{"message": {
+            "content": "the answer", "reasoning_content": "the working"}}]});
+        let a = answer(&both).expect("an answer");
+        assert_eq!(a.field, AnswerField::Content);
+        assert_eq!(a.text, "the answer");
+
+        // Whitespace is not an answer, so the reasoning is used.
+        let blank = json!({"choices": [{"message": {
+            "content": "   ", "reasoning_content": "the working"}}]});
+        let a = answer(&blank).expect("an answer");
+        assert_eq!(a.field, AnswerField::Reasoning);
+        assert_eq!(a.text, "the working");
+
+        assert!(answer(&json!({"choices": [{"message": {"content": null}}]})).is_none());
+        assert!(answer(&json!({})).is_none());
     }
 
     #[tokio::test]

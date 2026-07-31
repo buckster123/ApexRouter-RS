@@ -21,7 +21,7 @@
 //! "is the rented box worth it against the laptop?" — was the one it could not make.
 
 use crate::smoke::{
-    chat, content, first_chars, read_timings, response_model, ChatOutcome, SmokeTarget,
+    answer_text, chat, first_chars, read_timings, response_model, ChatOutcome, SmokeTarget,
 };
 use apexrouter_core::pricing::PriceTable;
 use apexrouter_core::secret::Secret;
@@ -186,7 +186,9 @@ pub async fn one(
     let (ttft_ms, tok_per_s, tokens) = read_timings(v);
     row.ttft_ms = ttft_ms;
     row.tok_per_s = tok_per_s;
-    row.preview = first_chars(&content(v).unwrap_or_default(), PREVIEW_CHARS);
+    // `answer_text`, not `content`: a thinking model leaves `content` empty and puts its
+    // reply in `reasoning_content`, and a blank preview column reads as "it said nothing".
+    row.preview = first_chars(&answer_text(v).unwrap_or_default(), PREVIEW_CHARS);
 
     // The **real** numbers, or none at all. `word_count * 1.3` appears nowhere.
     if let Some(usage) = apexrouter_core::upstream::parse_usage(v) {

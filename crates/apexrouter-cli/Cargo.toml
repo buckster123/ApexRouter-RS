@@ -35,6 +35,9 @@ rustix             = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The fake `llama-server`: `endpoint restart --ctx N` is only provable by reading the argv
+# the child was actually handed, and only the fake writes that down.
+apexrouter-tests-support = { workspace = true }
 # I-01's migration e2e hashes the legacy tree before and after every run: `~/.vastai-gguf`
 # is another tool's state directory and "we did not write to it" has to be proven, not assumed.
 sha2     = { workspace = true }

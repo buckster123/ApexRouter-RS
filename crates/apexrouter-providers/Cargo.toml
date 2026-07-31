@@ -28,3 +28,6 @@ glob         = { workspace = true }
 tempfile = { workspace = true }
 wiremock = { workspace = true }
 tokio    = { workspace = true, features = ["test-util"] }
+# The fake `llama-server` / stub upstream, for the probes whose defect is only visible
+# against a real HTTP server that answers the way b9199 does.
+apexrouter-tests-support = { workspace = true }

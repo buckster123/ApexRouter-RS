@@ -35,6 +35,9 @@ sha2         = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# FIX-5's swap acceptance drives a real supervisor against the fake `llama-server` and a
+# stub upstream — no GPU, no GGUF, no model load. See `tests-support/README.md`.
+apexrouter-tests-support = { workspace = true }
 # S-02 asserts the TraceLayer span records method+path and never the `?token=` query, which
 # takes a real subscriber to capture the recorded fields.
 tracing-subscriber = { workspace = true }

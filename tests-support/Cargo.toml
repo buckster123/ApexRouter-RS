@@ -1,0 +1,37 @@
+[package]
+name = "apexrouter-tests-support"
+description = "Test doubles for ApexRouter-RS: a fake llama-server and a stub OpenAI upstream"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+publish = false
+
+# The fake `llama-server` deliberately depends on NOTHING heavy. `FakeBuild` builds this
+# binary on demand into its own target directory when it is missing, and a build that had
+# to pull in tokio/hyper/axum first would turn a one-line helper call into a two-minute
+# stall. std + serde_json is the whole of it.
+[dependencies]
+apexrouter-protocol = { workspace = true }
+serde               = { workspace = true }
+serde_json          = { workspace = true }
+tempfile            = { workspace = true }
+
+# Only this crate's own acceptance tests use these; they are never in the fake's own
+# dependency graph.
+[dev-dependencies]
+apexrouter-core      = { workspace = true }
+apexrouter-providers = { workspace = true }
+apexrouter-router    = { workspace = true }
+axum                 = { workspace = true }
+reqwest              = { workspace = true }
+tokio                = { workspace = true }
+tower                = { workspace = true }
+
+# The name is load-bearing: `core::discover::builds` only ever looks for a file called
+# `llama-server`, and labels the build after the directory two levels above it.
+[[bin]]
+name = "llama-server"
+path = "src/bin/llama-server.rs"

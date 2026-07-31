@@ -13,6 +13,17 @@
 //! re-pointing), then a **recipe**, then a **model**. A `Vast` recipe is refused here on
 //! purpose: swapping is a routing operation, and one that quietly starts an hourly bill is
 //! not one — `apexrouter recipe run --yes` is where that decision is made out loud.
+//!
+//! **Resolution stops at naming the target; deciding whether it can serve is the daemon's.**
+//! `--to <model>` is sent as an `EndpointSpec` even when something is already running those
+//! weights, because only the daemon knows what is resident and whether it is healthy — it
+//! re-points at the running copy instead of starting a second one that would OOM the box.
+//! Guessing that here would put a second answer to "what is active" in the tree, which is
+//! the thing invariant 1 exists to forbid.
+//!
+//! A refusal is unwrapped from the daemon's `ErrorEnvelope` before it is printed, so the
+//! sentence the operator sees is the daemon's — including the command that fixes it. The
+//! failure this replaces was a silent storm of `503`s whose remedy appeared nowhere.
 
 use crate::cli::SwapArgs;
 use crate::cmd::{route, up, Ctx};
@@ -38,7 +49,8 @@ pub async fn run(ctx: &Ctx, args: &SwapArgs) -> anyhow::Result<()> {
     };
     let report: SwapReport = client
         .post(&format!("/v1/routes/{}/swap", alias.as_str()), &body)
-        .await?;
+        .await
+        .map_err(refusal)?;
 
     if args.json {
         return render::print_json(ServedBy::Daemon, render::now_unix(), false, &report);
@@ -62,6 +74,23 @@ pub async fn run(ctx: &Ctx, args: &SwapArgs) -> anyhow::Result<()> {
         }
     ));
     Ok(())
+}
+
+/// Unwrap a daemon refusal so the operator reads the sentence, not the envelope around it.
+///
+/// A swap is refused with `{"error":{"kind":…,"message":…}}` and the message is where the
+/// recovery lives — "…Fix it with: `apexrouter backend enable dead-b`". Printed raw, that
+/// arrives as `409 from /v1/routes/auto/swap: {"error":{"kind":…` and the remedy is buried in
+/// JSON on a terminal. `kind` is kept as a prefix so `--json` mode and a human read the same
+/// discriminator; anything that is not an envelope is passed through untouched, because a
+/// mangled error is worse than a verbose one.
+fn refusal(e: apexrouter_client::Error) -> anyhow::Error {
+    if let apexrouter_client::Error::Status { body, .. } = &e {
+        if let Ok(env) = serde_json::from_str::<apexrouter_protocol::ErrorEnvelope>(body) {
+            return anyhow::anyhow!("{}: {}", env.error.kind, env.error.message);
+        }
+    }
+    anyhow::Error::new(e)
 }
 
 /// Turn `--to` into a `SwapTarget`: a bare backend id, or an `EndpointSpec` to start first.
@@ -190,6 +219,38 @@ mod tests {
     fn a_local_recipe_becomes_the_spec_it_launches() {
         let spec = spec_of(&recipe_with(vllm_kind())).expect("spec");
         assert!(matches!(spec, EndpointSpec::LocalVllm(_)));
+    }
+
+    #[test]
+    fn a_refusal_reaches_the_operator_as_a_sentence_with_the_remedy_in_it() {
+        // What the daemon answers when the target cannot serve. The recovery is IN the
+        // message, and printing the envelope raw buries it in JSON on a terminal.
+        let e = refusal(apexrouter_client::Error::Status {
+            status: 409,
+            path: "/v1/routes/auto/swap".to_string(),
+            body: r#"{"error":{"kind":"backend_not_ready","message":"not pointing auto at dead-b: it is disabled. Fix it with: apexrouter backend enable dead-b"}}"#
+                .to_string(),
+        });
+        let msg = e.to_string();
+        assert!(msg.starts_with("backend_not_ready: "), "{msg}");
+        assert!(msg.contains("apexrouter backend enable dead-b"), "{msg}");
+        assert!(
+            !msg.contains('{'),
+            "the envelope is unwrapped, not quoted: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_body_that_is_not_an_envelope_is_passed_through_untouched() {
+        // An HTML error page from something that is not our daemon must stay debuggable; a
+        // mangled error is worse than a verbose one.
+        let e = refusal(apexrouter_client::Error::Status {
+            status: 502,
+            path: "/v1/routes/auto/swap".to_string(),
+            body: "<title>502 Bad Gateway</title>".to_string(),
+        });
+        let msg = e.to_string();
+        assert!(msg.contains("502 Bad Gateway"), "{msg}");
     }
 
     #[test]

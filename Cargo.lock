@@ -290,6 +290,7 @@ dependencies = [
  "apexrouter-providers",
  "apexrouter-router",
  "apexrouter-server",
+ "apexrouter-tests-support",
  "async-trait",
  "chrono",
  "clap",
@@ -363,6 +364,7 @@ dependencies = [
  "anyhow",
  "apexrouter-core",
  "apexrouter-protocol",
+ "apexrouter-tests-support",
  "async-trait",
  "chrono",
  "futures-util",
@@ -411,6 +413,7 @@ dependencies = [
  "apexrouter-protocol",
  "apexrouter-providers",
  "apexrouter-router",
+ "apexrouter-tests-support",
  "arc-swap",
  "axum",
  "bytes",
@@ -445,6 +448,23 @@ dependencies = [
  "slint",
  "slint-build",
  "tokio",
+]
+
+[[package]]
+name = "apexrouter-tests-support"
+version = "0.1.0"
+dependencies = [
+ "apexrouter-core",
+ "apexrouter-protocol",
+ "apexrouter-providers",
+ "apexrouter-router",
+ "axum",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
