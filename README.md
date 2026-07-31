@@ -94,13 +94,41 @@ Five invariants hold the thing together, and every one of them is a test:
 4. **Money is deliberate.** Ledger before billing call; nothing paid-for is auto-destroyed.
 5. **State lives in one XDG dir.** Nothing is ever written into a repo directory.
 
-## Quick start
+## Install
 
 ```sh
 git clone https://github.com/buckster123/ApexRouter-RS && cd ApexRouter-RS
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
+./install.sh                      # asks two things: automatic-or-manual, then the plan. Defaults do it.
+./install.sh --yes                # unattended — every default, nothing asked. Implied when piped.
+./install.sh --dry-run            # print the whole plan and touch nothing
+```
 
+Rust ≥ 1.75 and a C linker are the entire build dependency list — no npm, no OpenSSL, no `sudo`,
+nothing outside your home directory. It builds **one** ~19 MB binary (the CLI, the daemon, the MCP
+server and the web UI are all the same executable), puts it in `~/.local/bin`, offers you a systemd
+`--user` service, and finishes by running `doctor`. Linux only in mk1 — the process model is
+`/proc`, `flock`, `setsid` and `boot_id`.
+
+You are installed when `apexrouter doctor` prints a table. Warnings on day one are normal; it tells
+you what each one wants.
+
+Prefer not to pipe a script anywhere near your shell — or did something already go wrong?
+**[`docs/INSTALL.md`](docs/INSTALL.md)** is every step written out by hand: prerequisites per
+distro, `cargo build --release` and what it produces, the llama.cpp backend matrix
+(Vulkan/CUDA/ROCm/CPU), the systemd unit and the one line in it that is load-bearing, and a
+troubleshooting section built entirely from edges this project has actually cut itself on. Leaving
+again is [`./uninstall.sh`](uninstall.sh), which keeps your data unless you say otherwise and prints
+exactly what it will delete first.
+
+> Field-testing this on a real multi-GPU rig? Read
+> [`docs/RELEASE-NOTES-mk1.md` §6](docs/RELEASE-NOTES-mk1.md#6-what-to-trust--the-three-buckets)
+> first — it splits every claim into *verified*, *banked from real hardware*, and *never run against
+> the real thing*. The third bucket is the honest one and it is where your rig can find things this
+> laptop cannot.
+
+## Quick start
+
+```sh
 apexrouter doctor                 # what's here, what's missing, one fix line per row
 apexrouter rig                    # GPUs (free/total), llama.cpp builds, RAM, swap
 apexrouter models ls              # local GGUFs, shards grouped into one row
@@ -209,7 +237,7 @@ with LocalRouter's proxy, so existing scripts keep working unchanged.
 | `apexrouter-slint` | `apexrouter-ui`, the native app (GPL-3.0-only, out of `default-members`) |
 | `ui-web/` | the embedded web UI — `index.html`, `app.js`, `style.css` |
 | `openapi/` | `apexrouter-v1.yaml`, checked in CI against the live route table |
-| `docs/` | [ARCHITECTURE](docs/ARCHITECTURE.md) · [API](docs/API.md) · [ROUTING](docs/ROUTING.md) · [CHARTER](docs/CHARTER.md) · [MIGRATION](docs/MIGRATION.md) · [LICENSING](docs/LICENSING.md) |
+| `docs/` | [INSTALL](docs/INSTALL.md) · [RELEASE NOTES](docs/RELEASE-NOTES-mk1.md) · [ARCHITECTURE](docs/ARCHITECTURE.md) · [API](docs/API.md) · [ROUTING](docs/ROUTING.md) · [CHARTER](docs/CHARTER.md) · [MIGRATION](docs/MIGRATION.md) · [LICENSING](docs/LICENSING.md) |
 
 ## Security posture
 
@@ -246,13 +274,15 @@ with LocalRouter's proxy, so existing scripts keep working unchanged.
 
 ## License
 
-**MIT OR Apache-2.0** for the whole headless stack — protocol, core, router, providers, client,
-server, CLI, MCP server and the embedded web UI. Use it however you like.
+**MIT OR Apache-2.0** ([`LICENSE-MIT`](LICENSE-MIT) · [`LICENSE-APACHE`](LICENSE-APACHE)) for the
+whole headless stack — protocol, core, router, providers, client, server, CLI, MCP server and the
+embedded web UI. Use it however you like.
 
 One caveat, stated plainly: the optional native app `apexrouter-slint` links the
 [Slint](https://slint.dev) toolkit, which is separately licensed (GPL-3.0 / Royalty-Free Desktop /
-commercial). That one crate is therefore **GPL-3.0-only**, and it is deliberately kept out of
-`default-members` so a normal `cargo build` never pulls it in. If you ship the native GUI, you take
+commercial). That one crate is therefore **GPL-3.0-only** ([`LICENSE-GPL`](LICENSE-GPL)), and it is
+deliberately kept out of `default-members` so a normal `cargo build` never pulls it in. If you ship
+the native GUI, you take
 on GPL obligations *for that binary*; the daemon, proxy, web UI, CLI, MCP server and SDK are
 Slint-free and stay permissive. Details in [`docs/LICENSING.md`](docs/LICENSING.md).
 

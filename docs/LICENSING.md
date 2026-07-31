@@ -64,8 +64,29 @@ into CI today.
 
 ## Licence texts
 
-The workspace declares `license = "MIT OR Apache-2.0"` in `[workspace.package]` and
-`license = "GPL-3.0-only"` in `crates/apexrouter-slint/Cargo.toml`. The corresponding
-`LICENSE-MIT`, `LICENSE-APACHE` and `LICENSE-GPL` files at the repository root are **not yet
-present** — no mk1 work unit owns them (`BUILD-PLAN.md` §5). Add them before the first public
-release; until then the SPDX expressions above are the authoritative statement of intent.
+Copyright © 2026 Andre (buckster123) and ApexRouter-RS contributors.
+
+Three files at the repository root, and every SPDX expression in the manifests names one of them:
+
+| File | SPDX | Applies to | Provenance |
+|---|---|---|---|
+| [`LICENSE-MIT`](../LICENSE-MIT) | `MIT` | the headless stack, at your option | the standard MIT text, with this project's copyright line |
+| [`LICENSE-APACHE`](../LICENSE-APACHE) | `Apache-2.0` | the headless stack, at your option | verbatim `https://www.apache.org/licenses/LICENSE-2.0.txt` |
+| [`LICENSE-GPL`](../LICENSE-GPL) | `GPL-3.0-only` | `crates/apexrouter-slint` only | verbatim `https://www.gnu.org/licenses/gpl-3.0.txt` |
+
+`LICENSE-APACHE` and `LICENSE-GPL` are byte-for-byte the upstream texts — both carry their own
+"changing it is not allowed" clause, so neither has a copyright line inserted into it. The holder is
+the line above, and `LICENSE-MIT` states it in the file.
+
+Where the manifests say so:
+
+```toml
+# Cargo.toml, [workspace.package]        — inherited by the seven headless crates
+license = "MIT OR Apache-2.0"
+
+# crates/apexrouter-slint/Cargo.toml     — the one exception, deliberate
+license = "GPL-3.0-only"
+```
+
+Every other crate manifest carries `license.workspace = true` and nothing else, so there is exactly
+one place the permissive claim is made and exactly one place it is departed from.
