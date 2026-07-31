@@ -1202,9 +1202,9 @@ unit-tested against it, but no `.route("/metrics", …)` line exists in
 `server::lib::v1_routes()`, so the control listener currently `404`s it. That gap is *held open
 deliberately rather than forgotten*: `crates/apexrouter-server/tests/openapi_routes.rs` carries it
 on an explicit `PENDING` list naming the owing unit, and **the test fails the moment it is wired**
-so the list cannot rot. `POST /v1/migrate` (§6.2) is in the same position — the `apexrouter
-migrate` CLI verb is fully implemented; only the HTTP route is unmounted. Treat `PENDING` in that
-test as the authority on which of these two is still outstanding.
+so the list cannot rot. (`POST /v1/migrate` (§6.2) sat in the same position until 2026-08-01, when
+`api::migrate` and its `.merge(…)` line landed; `/metrics` is now that list's one entry.) Treat
+`PENDING` in that test as the authority on what is still outstanding.
 
 `GET /metrics` on the control listener (Prometheus text): `apexrouter_requests_total{alias,backend,
 status}`, `apexrouter_ttft_seconds`, `apexrouter_tokens_total{kind}`,
@@ -1750,15 +1750,15 @@ POST   /v1/smoke            {alias|base_url}                          SSE, one e
 GET    /v1/diagnose?only=                                             SSE, one event per check
 GET    /v1/checks                                                     -> the registry
 GET    /v1/jobs   GET /v1/jobs/{id}   POST /v1/jobs/{id}/cancel
-POST   /v1/migrate          {dry_run: bool}    -> MigrationPlan | MigrationReport
-                                               [NOT MOUNTED YET — the `apexrouter migrate` CLI
-                                                verb is complete; only the route is missing]
+POST   /v1/migrate          {dry_run, skip[]}  -> MigrationPlan | MigrationReport
+                                               [skip strikes plan rows first, with
+                                                core::migrate::strike's matching; a pattern
+                                                that matches no row is a 400]
 ```
 
-**As built, two of the paths above are not registered** — `/metrics` and `/v1/migrate`. Both are
-on the `PENDING` list in `crates/apexrouter-server/tests/openapi_routes.rs`, which fails the build
-if a documented path is neither registered nor listed there **and** fails if a listed one has
-since been wired. That test, not this table, is the authority on what the daemon serves today.
+**As built, one path above is not registered** — `/metrics`. It is on the `PENDING` list in
+`crates/apexrouter-server/tests/openapi_routes.rs`, which fails the build if a documented path is
+neither registered nor listed there **and** fails if a listed one has since been wired. That test, not this table, is the authority on what the daemon serves today.
 Everything else here is registered and is proved reachable in the composed application by
 `crates/apexrouter-server/tests/mounted_routes.rs` — the guard that exists because three separate
 API modules once shipped implemented, tested and unreachable.
@@ -1860,9 +1860,16 @@ apexrouter usage [--since 24h|7d|all] [--by provider|model|backend|alias|day] [-
 apexrouter compare --alias A --alias B --prompt P [--max-tokens N] [--json]
 apexrouter smoke [--alias A | --base-url URL] [--model M] [--json]
 apexrouter doctor [--only <check>] [--json]
-apexrouter migrate [--dry-run] [--apply] [--from ~/.vastai-gguf] [--localrouter PATH] [--json]
+apexrouter migrate [--dry-run] [--apply] [--skip PATTERN]… [--from ~/.vastai-gguf]
+                   [--localrouter PATH] [--json]
       # --dry-run is the DEFAULT. Without --apply, `migrate` only ever prints.
-apexrouter config init [--force] | show [--json] | path | edit
+      # --skip strikes rows out of the plan (a category name, or a `from` substring);
+      # a pattern that matches nothing is an error, and the strike shows on the dry run.
+apexrouter config init [--force] | show [--json] | path | edit | validate [--json]
+apexrouter update [--no-pull]
+      # git pull --ff-only on the checkout $STATE/install.conf records, then hand over to
+      # its install.sh --yes, which rebuilds, reinstalls and re-verifies with the recorded
+      # choices. Installs not made by install.sh: `git pull && cargo build --release`.
 apexrouter token create [--scope read|write|admin] | ls | revoke <id>
 apexrouter mcp [--proxy URL]
       # NOT a clap subcommand: `mcp` is intercepted in main() before Cli::parse(), so it does

@@ -107,6 +107,13 @@ It **never compiles llama.cpp** — that is a long, hardware-specific job and yo
 It resolves your choices into `$STATE/install.conf` and restores them on the next run, so
 re-running to upgrade does not re-ask everything.
 
+**Updating**, thereafter, is one verb: `apexrouter update` runs `git pull --ff-only` on the
+checkout `install.conf` records (`--ff-only`, so a checkout you also work in is never merged for
+you) and hands over to that checkout's `install.sh --yes` — same choices, same rebuild, same
+final verify that the daemon serving is the binary the run wrote. `--no-pull` rebuilds what is
+already checked out. An install not made by `install.sh` has nothing to update this way: its
+whole update story is `git pull && cargo build --release`, as before.
+
 Everything the script does is in this document as a command you can run yourself. If a flag you need
 is missing, the manual path always works.
 

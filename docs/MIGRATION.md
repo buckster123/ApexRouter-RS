@@ -191,13 +191,19 @@ timestamps parse leniently.
 
 > [!WARNING]
 > **`--apply` turns the usage mirror on.** The `usage mirror` row is a `Warn` you are meant to
-> strike out, and the CLI has no way to strike a row — so a plain `--apply` keeps it and writes
-> `[compat] mirror_usage_log = true`. From then on **the daemon appends every new usage row to
-> `~/.vastai-gguf/usage.log`**, which is the one and only thing in ApexRouter that writes into the
-> legacy directory. That is the case the setting exists for (the old LocalRouter TUI's `cost.py`
-> view keeps working during a transition), but it is opt-**out** here and opt-in everywhere else.
+> strike out — so a plain `--apply` keeps it and writes `[compat] mirror_usage_log = true`. From
+> then on **the daemon appends every new usage row to `~/.vastai-gguf/usage.log`**, which is the
+> one and only thing in ApexRouter that writes into the legacy directory. That is the case the
+> setting exists for (the old LocalRouter TUI's `cost.py` view keeps working during a
+> transition), but it is opt-**out** here and opt-in everywhere else.
 >
-> To decline it, after `--apply`:
+> To decline it at the door (§10 documents the matching):
+>
+> ```sh
+> apexrouter migrate --apply --skip 'usage mirror'
+> ```
+>
+> Or after a plain `--apply`:
 >
 > ```sh
 > apexrouter config edit          # set [compat] mirror_usage_log = false
@@ -301,21 +307,29 @@ deleting both. The resolution is a **field-wise merge, not a pick** — see §4.
 `apply_never_writes_two_recipes_under_the_same_id` is no longer `#[ignore]`d, and `--apply` is
 byte-idempotent from run 1.
 
-1. **There is no way to strike a row through the CLI.** The plan exists so a human can delete rows
-   before `--apply`, and `core::migrate::apply` honours that (a row downgraded to `Skip` is not
-   written) — but no surface exposes it. `apexrouter migrate --apply` recomputes the plan and passes
-   it whole. This is what makes §6's mirror warning necessary.
-2. **`POST /v1/migrate` is documented and not built.** It is in `ARCHITECTURE.md` §6 and in
-   `openapi/apexrouter-v1.yaml`, and `crates/apexrouter-server/tests/openapi_routes.rs` lists it in
-   `PENDING` as owed by "I-01/S-08". No unit's file-ownership list in `BUILD-PLAN.md` §5 contains
-   `crates/apexrouter-server/src/api/migrate.rs`, so it is documented, unowned and unbuilt. Building
-   it needs a new `api` module **and** its one `.merge(…)` line in `server/src/lib.rs::v1_routes()`,
-   which only S-01 may edit — see `CLAUDE.md`, "mount it, don't describe it". Its request body
-   (`MigrateRequest { dry_run }`) also cannot express item (1) above, so the two should be designed
-   together.
-3. **`apexrouter config validate` is not a CLI verb.** `Config::validate(&Paths)` and
-   `Config::validate_file(&Path)` exist in `apexrouter-core` and are infallible, reporting parse
-   error + unknown keys + the addresses actually bound. Rendering them is a two-liner in
-   `cli/src/cmd/config.rs` plus an arm on `ConfigCmd`, class `Pure`. Until then the same
-   information is available from `apexrouter config show --json | jq .unknown_keys`, and every
-   unknown key is already logged at WARN on stderr whenever the config is read. Owner: unit S-06.
+**Closed 2026-08-01 — rows can be struck, through both surfaces.** Items (1) and (2) as recorded
+at the mk1 gate said "design these together", and they were: one implementation,
+`core::migrate::strike`, used verbatim by both.
+
+`apexrouter migrate --skip PATTERN` (repeatable, works on the dry run and on `--apply`) downgrades
+matching rows to `Skip` before the plan is printed or applied, so the dry run shows exactly what
+the same flags would honour. A pattern that exactly names a category (`recipe`, `known_fork`,
+`usage mirror`, …) strikes that category and **only** matches that way — `--skip recipe` cannot
+also catch a `known_fork` row whose `from` contains `recipes.toml`. Anything else strikes rows
+whose `from` contains it; `from` is unique per row, so a full `from` names exactly one and a
+`#recipes.foo` suffix is usually enough. A pattern that matches nothing is an **error**, never a
+silently unhonoured intent, and the strike is atomic: one typo strikes nothing at all.
+
+`POST /v1/migrate` is mounted — `server/src/api/migrate.rs` plus its one `.merge(…)` line in
+`v1_routes()`, proved reachable by `mounted_routes.rs`. The body is `{dry_run, skip[]}`; a pattern
+matching no row is a `400`. The `PENDING` list in `openapi_routes.rs` now holds `/metrics` alone.
+Applying while the daemon serves is sound: `config.toml` is reloaded by the S-05 watcher on
+content hash, `catalog.toml` is read from disk by every `/v1/recipes*` handler, and the request
+path (invariant 2) reads neither.
+
+**Closed 2026-08-01 — `apexrouter config validate [--json]` exists** (item 3 as recorded at the
+gate). It renders `Config::validate`: path, existence, parse error, every ignored key with its
+did-you-mean, and the two addresses that would actually be bound. Without `--json` it is a gate in
+the `sshd -t` tradition — a file that does not parse exits non-zero, after the report prints. With
+`--json` the report itself is the answer, parse failure included, and a script gates on
+`.parse_error` the way `config show --json | jq` always has.

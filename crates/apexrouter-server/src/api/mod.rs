@@ -35,6 +35,7 @@ pub mod endpoints;
 pub mod fit;
 pub mod hf;
 pub mod jobs;
+pub mod migrate;
 pub mod providers;
 pub mod requests;
 pub mod rig;

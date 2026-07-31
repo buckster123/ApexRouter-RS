@@ -78,6 +78,8 @@ pub enum Command {
     Status(StatusArgs),
     /// Run the daemon (or stop it).
     Serve(ServeArgs),
+    /// Pull the installed checkout and re-run its installer.
+    Update(UpdateArgs),
     /// Print the OpenAI base URL, and nothing else.
     Url(JsonFlag),
     /// Version information.
@@ -269,6 +271,8 @@ pub enum ConfigCmd {
     Path(JsonFlag),
     /// Open the config in `$VISUAL`/`$EDITOR`.
     Edit,
+    /// Does the file parse, what does this build ignore, and what would be bound.
+    Validate(JsonFlag),
 }
 
 /// `apexrouter rig [--json] [--rescan]`.
@@ -1202,9 +1206,23 @@ pub struct MigrateArgs {
     /// The LocalRouter checkout.
     #[arg(long, value_name = "PATH")]
     pub localrouter: Option<PathBuf>,
+    /// Strike rows out of the plan before it is printed or applied. A pattern that
+    /// exactly names a category (`recipe`, `known_fork`, …) strikes that category;
+    /// anything else strikes rows whose FROM contains it. Repeatable; a pattern that
+    /// matches nothing is an error.
+    #[arg(long, value_name = "PATTERN")]
+    pub skip: Vec<String>,
     /// Print the JSON envelope and nothing else.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `apexrouter update [--no-pull]`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct UpdateArgs {
+    /// Rebuild and reinstall whatever the checkout already holds, without pulling.
+    #[arg(long)]
+    pub no_pull: bool,
 }
 
 /// `apexrouter token …`.
@@ -1484,6 +1502,9 @@ impl Command {
             // the catalog and the ledger, so autostarting a daemon that would then be
             // holding a stale copy of all three is exactly the wrong reflex.
             Command::Migrate(_) => Need::Pure,
+            // `update` hands over to the recorded installer, which owns the daemon
+            // question itself (its verify step proves the serving pid runs the new inode).
+            Command::Update(_) => Need::Pure,
             // A token is minted here and shown once; no daemon has to exist for that.
             Command::Token { .. } => Need::Pure,
             // Every check either reads this machine or reaches the network, and §7 puts
@@ -1523,7 +1544,7 @@ impl Command {
                 // `config init` is an offline *writer*: it takes the daemon lock itself,
                 // and thereby proves no daemon is running. It never wants one started.
                 ConfigCmd::Init { .. } | ConfigCmd::Edit => Need::Pure,
-                ConfigCmd::Show(_) | ConfigCmd::Path(_) => Need::Pure,
+                ConfigCmd::Show(_) | ConfigCmd::Path(_) | ConfigCmd::Validate(_) => Need::Pure,
             },
 
             // ReadState: `$STATE` can answer when no daemon is running.
@@ -1556,9 +1577,12 @@ impl Command {
             Command::Url(a) | Command::Version(a) => a.json,
             Command::Rig(a) => a.json,
             Command::Fit(a) => a.json,
-            Command::Serve(_) | Command::Completions(_) | Command::External(_) => false,
+            Command::Serve(_)
+            | Command::Update(_)
+            | Command::Completions(_)
+            | Command::External(_) => false,
             Command::Config { cmd } => match cmd {
-                ConfigCmd::Show(a) | ConfigCmd::Path(a) => a.json,
+                ConfigCmd::Show(a) | ConfigCmd::Path(a) | ConfigCmd::Validate(a) => a.json,
                 ConfigCmd::Init { .. } | ConfigCmd::Edit => false,
             },
             Command::Models { cmd } => match cmd {

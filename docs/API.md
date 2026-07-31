@@ -1763,7 +1763,10 @@ data: {"type":"check_result","result":{
 #### `POST /v1/migrate` → `MigrationPlan` | `MigrationReport`
 
 ```jsonc
-{ "dry_run": true }            // true ⇒ MigrationPlan and NOTHING is written
+{ "dry_run": true,             // true ⇒ MigrationPlan and NOTHING is written
+  "skip": ["usage mirror"] }   // strike rows first: a category name strikes the category,
+                               // anything else strikes rows whose `from` contains it;
+                               // a pattern matching no row is a 400
 ```
 
 ```jsonc

@@ -3260,6 +3260,13 @@ components:
       required: [dry_run]
       properties:
         dry_run: { type: boolean, description: 'true returns a MigrationPlan and writes NOTHING.' }
+        skip:
+          type: array
+          items: { type: string }
+          description: >-
+            Strike patterns, applied to the plan first. A pattern equal to a row category
+            (`recipe`, `known_fork`, …) strikes that category; anything else strikes rows
+            whose `from` contains it. A pattern matching no row is a 400.
     MigrationItem:
       type: object
       properties:

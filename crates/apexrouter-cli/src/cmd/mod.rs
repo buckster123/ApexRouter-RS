@@ -1,7 +1,7 @@
 //! OWNER: unit S-06 (cli/src/{main,cli,daemon,render}.rs, cli/src/cmd/{mod,status,serve,
-//! config,rig,models,fit,endpoint,route,switch,url,version,completions}.rs). Do not edit
-//! outside that unit — the remaining `cmd/*` modules belong to S-08 and `cmd/mcp.rs` to
-//! M-01.
+//! config,rig,models,fit,endpoint,route,switch,url,version,completions,update}.rs). Do not
+//! edit outside that unit — the remaining `cmd/*` modules belong to S-08 and `cmd/mcp.rs`
+//! to M-01.
 //!
 //! One module per noun group. `--json` is **per subcommand, never global**, and prints
 //! `serde_json::to_string_pretty` of the protocol type and **nothing else** on stdout.
@@ -37,6 +37,7 @@ pub mod switch;
 pub mod token;
 pub mod tunnel;
 pub mod up;
+pub mod update;
 pub mod url;
 pub mod usage;
 pub mod vast;
@@ -97,11 +98,20 @@ pub async fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     if let Command::External(args) = &verb {
         return pending(args);
     }
+    // `config validate` must answer about a config that does not parse; `Ctx::load` would
+    // refuse to build the very report the verb exists to print.
+    if let Command::Config {
+        cmd: crate::cli::ConfigCmd::Validate(args),
+    } = &verb
+    {
+        return config::validate(args);
+    }
 
     let ctx = Ctx::load(cli)?;
     match &verb {
         Command::Status(a) => status::run(&ctx, a).await,
         Command::Serve(a) => serve::run(&ctx, a).await,
+        Command::Update(a) => update::run(&ctx, a),
         Command::Url(a) => url::run(&ctx, a).await,
         Command::Version(a) => version::run(&ctx, a).await,
         Command::Config { cmd } => config::run(&ctx, cmd),

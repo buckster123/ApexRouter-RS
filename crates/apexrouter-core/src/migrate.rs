@@ -96,6 +96,89 @@ pub fn plan(paths: &Paths, cfg: &Config) -> Result<MigrationPlan> {
     })
 }
 
+/// What one strike pattern did to a plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Strike {
+    /// The pattern, as the operator gave it.
+    pub pattern: String,
+    /// Rows the pattern matched, rows already `Skip` included.
+    pub matched: u32,
+    /// Rows this pattern actually downgraded to `Skip`.
+    pub struck: u32,
+}
+
+/// Downgrade the rows an operator struck out to [`MigrationAction::Skip`].
+///
+/// This is the editing surface `apply`'s contract promises: render the plan, strike rows,
+/// apply the remainder. A pattern selects rows one of two ways, tried in that order:
+///
+/// 1. **A category.** A pattern exactly equal to some row's `what` (`"recipe"`,
+///    `"known_fork"`, `"usage mirror"`, …) strikes every row of that category — and *only*
+///    matches that way, so `--skip recipe` cannot also catch a `known_fork` row whose
+///    `from` happens to contain `recipes.toml`.
+/// 2. **A source substring.** Anything else strikes every row whose `from` contains the
+///    pattern. `from` is unique per row (§10.1), so a full `from` names exactly one row and
+///    a `#recipes.foo` suffix is usually enough.
+///
+/// Striking is atomic: patterns are checked against the *unedited* plan first, so a typo
+/// cannot half-apply an operator's intent.
+///
+/// # Errors
+/// [`Error::Invalid`] when a pattern matches no row at all — a strike that hits nothing is
+/// a typo, not a no-op, and `--apply` must not proceed as if it were honoured.
+pub fn strike(plan: &mut MigrationPlan, patterns: &[String]) -> Result<Vec<Strike>> {
+    let categories: HashSet<String> = plan.items.iter().map(|i| i.what.clone()).collect();
+    let matches = move |p: &str, what: &str, from: &str| {
+        if categories.contains(p) {
+            what == p
+        } else {
+            from.contains(p)
+        }
+    };
+
+    // Atomicity: every pattern must land before any row is edited. Matching reads only
+    // `what` and `from`, which striking never changes, so the two passes agree.
+    for p in patterns {
+        if !plan.items.iter().any(|i| matches(p, &i.what, &i.from)) {
+            return Err(Error::Invalid {
+                what: format!("--skip pattern `{p}`"),
+                why: "it matches no plan row, by category or by source substring — \
+                      run without --apply to see the rows"
+                    .to_owned(),
+            });
+        }
+    }
+
+    let mut report = Vec::with_capacity(patterns.len());
+    for p in patterns {
+        let mut matched = 0u32;
+        let mut struck = 0u32;
+        for item in plan
+            .items
+            .iter_mut()
+            .filter(|i| matches(p, &i.what, &i.from))
+        {
+            matched += 1;
+            if item.action != MigrationAction::Skip {
+                let was = match item.action {
+                    MigrationAction::Import => "import",
+                    MigrationAction::Warn => "warn",
+                    MigrationAction::Skip => unreachable!("filtered above"),
+                };
+                item.action = MigrationAction::Skip;
+                item.detail = format!("struck by operator (`{p}`); was {was}: {}", item.detail);
+                struck += 1;
+            }
+        }
+        report.push(Strike {
+            pattern: p.clone(),
+            matched,
+            struck,
+        });
+    }
+    Ok(report)
+}
+
 /// Execute a plan. Import-only; never destructive to the legacy tree.
 ///
 /// The `plan` argument is *honoured*, not decoration: an artefact whose item was downgraded
@@ -2400,6 +2483,97 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::sync::{Mutex, OnceLock};
+
+    // -----------------------------------------------------------------------------------
+    // strike
+    // -----------------------------------------------------------------------------------
+
+    /// A plan shaped like the real one: categories repeat, `from` is unique per row.
+    fn strikeable_plan() -> MigrationPlan {
+        let row = |what: &str, from: &str, action: MigrationAction| MigrationItem {
+            what: what.to_owned(),
+            from: from.to_owned(),
+            action,
+            detail: "because reasons".to_owned(),
+        };
+        MigrationPlan {
+            items: vec![
+                row(
+                    "recipe",
+                    "recipes.toml#recipes.alpha",
+                    MigrationAction::Import,
+                ),
+                row("recipe", "recipes.toml#recipes.beta", MigrationAction::Warn),
+                row(
+                    "known_fork",
+                    "recipes.toml#recipes.alpha.llama_cpp_repo",
+                    MigrationAction::Import,
+                ),
+                row("usage log", "/legacy/usage.log", MigrationAction::Skip),
+            ],
+            source_paths: vec![],
+        }
+    }
+
+    #[test]
+    fn a_category_pattern_strikes_the_category_and_nothing_else() {
+        let mut plan = strikeable_plan();
+        let report = strike(&mut plan, &["recipe".to_owned()]).expect("strike");
+        // Both `recipe` rows go, and the `known_fork` row survives even though its `from`
+        // contains the substring `recipes.toml` — a category match never falls through.
+        assert_eq!(
+            report,
+            vec![Strike {
+                pattern: "recipe".to_owned(),
+                matched: 2,
+                struck: 2,
+            }]
+        );
+        assert!(plan
+            .items
+            .iter()
+            .filter(|i| i.what == "recipe")
+            .all(|i| i.action == MigrationAction::Skip));
+        assert_eq!(plan.items[2].action, MigrationAction::Import, "fork kept");
+        assert!(plan.items[0].detail.contains("struck by operator"));
+        assert!(plan.items[0].detail.contains("was import"));
+        assert!(plan.items[1].detail.contains("was warn"));
+    }
+
+    #[test]
+    fn a_source_substring_strikes_exactly_the_rows_it_names() {
+        let mut plan = strikeable_plan();
+        let report = strike(&mut plan, &["#recipes.alpha".to_owned()]).expect("strike");
+        assert_eq!(report[0].matched, 2, "the recipe and its fork row");
+        assert_eq!(report[0].struck, 2);
+        assert_eq!(plan.items[1].action, MigrationAction::Warn, "beta kept");
+    }
+
+    #[test]
+    fn a_pattern_matching_nothing_is_an_error_and_the_plan_is_untouched() {
+        let mut plan = strikeable_plan();
+        let before = plan.clone();
+        let e = strike(
+            &mut plan,
+            &["#recipes.alpha".to_owned(), "no-such-row".to_owned()],
+        )
+        .expect_err("must refuse");
+        assert!(e.to_string().contains("no-such-row"), "{e}");
+        // Atomic: the first pattern would have matched, and still nothing moved.
+        assert_eq!(plan, before);
+    }
+
+    #[test]
+    fn striking_an_already_skipped_row_is_a_match_but_not_an_edit() {
+        let mut plan = strikeable_plan();
+        let report = strike(&mut plan, &["usage log".to_owned()]).expect("strike");
+        assert_eq!(report[0].matched, 1);
+        assert_eq!(report[0].struck, 0);
+        assert_eq!(
+            plan.items[3].detail, "because reasons",
+            "an untouched row keeps its own reason"
+        );
+    }
 
     // -----------------------------------------------------------------------------------
     // harness

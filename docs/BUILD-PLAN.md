@@ -2245,7 +2245,7 @@ Quick check that no file is owned twice. If you are about to write a file not on
 | S-03 | `server/src/api/{mod,snapshot,backends,routes,endpoints}.rs` |
 | S-04 | `server/src/api/{rig,fit,catalog,usage,requests,jobs}.rs`, `server/src/jobs.rs` |
 | S-05 | `server/src/{ws,assets,prober,watcher}.rs` |
-| S-06 | `cli/src/{main,cli,daemon,render}.rs`, `cli/src/cmd/{mod,status,serve,config,rig,models,fit,endpoint,route,switch,url,version,completions}.rs` |
+| S-06 | `cli/src/{main,cli,daemon,render}.rs`, `cli/src/cmd/{mod,status,serve,config,rig,models,fit,endpoint,route,switch,url,version,completions,update}.rs` |
 | S-07 | `server/src/api/{vast,hf,providers,checks,compare}.rs` |
 | S-08 | `cli/src/cmd/{vast,tunnel,hf,provider,recipe,profile,usage,smoke,doctor,compare,backend,swap,up,approvals,token,open,env,migrate}.rs` |
 | CL-01 (Stage 4, with S-06) | `client/src/lib.rs`, `client/src/ws.rs` |
@@ -2256,7 +2256,7 @@ Quick check that no file is owned twice. If you are about to write a file not on
 | D-02 | `README.md`, `assets/banner.png` |
 | D-03 | `CLAUDE.md`, `docs/CHARTER.md`, `docs/LICENSING.md` |
 | D-04 | `docs/SLINT.md`, `docs/AGENTS.md`, `skills/apexrouter/SKILL.md` |
-| I-01 | `crates/apexrouter-cli/tests/migrate_e2e.rs`, `docs/MIGRATION.md` |
+| I-01 | `crates/apexrouter-cli/tests/migrate_e2e.rs`, `server/src/api/migrate.rs`, `docs/MIGRATION.md` |
 | I-02 | `scripts/acceptance.sh`, `docs/ACCEPTANCE.md` |
 
 **CL-01 · `apexrouter-client`** (belongs to Stage 4, runs alongside S-06):

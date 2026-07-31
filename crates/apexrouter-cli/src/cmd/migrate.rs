@@ -1,6 +1,8 @@
 //! OWNER: unit S-08 (cli/src/cmd/{vast,tunnel,hf,provider,recipe,profile,usage,smoke,doctor,compare,backend,swap,up,approvals,token,open,env,migrate}.rs). Do not edit outside that unit.
 //!
-//! `apexrouter migrate [--dry-run] [--from ~/.vastai-gguf] [--localrouter PATH]`. `--dry-run` writes nothing at all.
+//! `apexrouter migrate [--dry-run|--apply] [--skip PATTERN]… [--from ~/.vastai-gguf]
+//! [--localrouter PATH]`. `--dry-run` writes nothing at all; `--skip` strikes rows out of
+//! the plan (`core::migrate::strike` documents the matching) and works on both.
 //!
 //! # Plan-only is the default
 //!
@@ -45,13 +47,17 @@ const LEGACY_DIR_NAME: &str = ".vastai-gguf";
 /// failure writing one of the three files `--apply` touches.
 pub fn run(ctx: &Ctx, args: &MigrateArgs) -> anyhow::Result<()> {
     let paths = redirect(ctx, args)?;
-    let plan = migrate::plan(&paths, &ctx.cfg)?;
+    let mut plan = migrate::plan(&paths, &ctx.cfg)?;
+    // Struck rows are downgraded in the plan itself, so the dry run shows exactly what
+    // `--apply` with the same `--skip` flags would honour — same rows, same reasons.
+    let strikes = migrate::strike(&mut plan, &args.skip)?;
 
     if !args.apply {
         if args.json {
             return render::print_json(ServedBy::Offline, render::now_unix(), false, &plan);
         }
         print_plan(&plan);
+        print_strikes(&strikes);
         render::print_blank();
         render::print_line(
             "Nothing was written. Re-run with --apply to import the rows marked `import`.",
@@ -64,6 +70,7 @@ pub fn run(ctx: &Ctx, args: &MigrateArgs) -> anyhow::Result<()> {
         return render::print_json(ServedBy::Offline, render::now_unix(), false, &report);
     }
     print_plan(&plan);
+    print_strikes(&strikes);
     render::print_blank();
     render::print_line(&format!(
         "imported {} · skipped {}",
@@ -154,6 +161,16 @@ fn print_plan(plan: &MigrationPlan) {
 /// The action column, in its serde spelling.
 fn action(a: MigrationAction) -> String {
     render::variant(&a)
+}
+
+/// What each `--skip` pattern struck, printed after the plan it edited.
+fn print_strikes(strikes: &[migrate::Strike]) {
+    for s in strikes {
+        render::print_line(&format!(
+            "--skip `{}` struck {} of {} matching row(s)",
+            s.pattern, s.struck, s.matched
+        ));
+    }
 }
 
 #[cfg(test)]
