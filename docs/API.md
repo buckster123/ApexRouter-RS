@@ -51,6 +51,7 @@ hand-rolled JSON anywhere on the control plane.
                                // | no_healthy_backend | server_overloaded | request_too_large
                                // | loop_detected | provider_not_configured | starting
                                // | redacted_endpoint | protocol_not_supported
+                               // | warm_queue_full | warm_timeout
     "code": null,
     "param": null
   }
@@ -68,9 +69,27 @@ hand-rolled JSON anywhere on the control plane.
 | `loop_detected` | 508 | inbound `Via` already carried `apexrouter` |
 | `provider_not_configured` | 503 | a credential is missing, not a network failure |
 | `starting` | 503 | the target is in `Health::Starting` |
+| `warm_queue_full` | 503 + `Retry-After` | the alias is mid-swap and `warm_queue_max` requests are already parked |
+| `warm_timeout` | 503 + `Retry-After` | parked behind a swap that over-ran its whole budget |
 
 The 502-vs-503 distinction is load-bearing in both house projects: 502 means "it answered and it was
 wrong", 503 means "there was nothing to ask".
+
+**The two warm codes are the sequential-swap exits** (`ARCHITECTURE.md` §4.7). While
+`POST /v1/routes/{alias}/swap` is replacing what an alias points at, requests for that alias
+**park** rather than fail: the window closes the moment the replacement can serve, and the parked
+request is re-resolved against it and answered normally. `warm_queue_full` is the immediate refusal
+once the queue bound (`warm_queue_max`, **32**) is already reached — deepening a queue that is
+already the wrong answer only moves the failure later. `warm_timeout` is the backstop when the swap
+itself over-ran; it is **not an independent number** but
+`[supervisor] health_deadline_ms + [server] drain_timeout_secs`, floored at
+`[router] queue_timeout_ms`, because a park shorter than the operation it waits on is an arithmetic
+guarantee of failure — and it measures wall clock **since the last sign of life from the launch**,
+not since the swap began, so a load that is still visibly progressing never trips it. Both carry
+`Retry-After` in seconds, and both are rendered in the **envelope**
+the client spoke — an Anthropic-ingress client gets `{"type":"error","error":{"type":"warm_queue_full",…}}`,
+i.e. the Anthropic shape carrying the same code string. A park that *is* served is not an error at
+all: it is reported by `X-ApexRouter-Warm` (§4) on an ordinary `200`.
 
 **Control listener** errors are an `ErrorEnvelope`, so clients branch on `error.kind` rather than on
 prose:
@@ -290,10 +309,19 @@ neither is `anthropic-version`. `501` when `[router] anthropic_ingress = false`.
     }
   ],
   "stream": false,
-  "tools": []                  // with [router] anthropic_tools = false a non-empty `tools`
-                               // is a 400 naming the config key. Zero upstream hops.
+  "tools": []                  // translated by default ([router] anthropic_tools = true).
+                               // Set that key to false and a non-empty `tools` is a 400
+                               // naming it. Zero upstream hops.
 }
 ```
+
+`[router] anthropic_tools` defaults to **`true`** (CHARTER amendment, 2026-07-31). Claude Code sends
+92 tool definitions on *every* request, so an off-by-default flag made this endpoint a `400` on
+request one for the client it exists to serve. Translation is **best-effort** and says so: parallel
+tool calls, some `tool_choice` variants and a `tool_result` whose content is a block array do not map
+cleanly in every case. Turn it off explicitly and a body carrying `tools` is refused loudly —
+`400 tool translation is off: set [router] anthropic_tools = true to enable it` — rather than
+silently stripped and answered wrongly.
 
 Response, when the upstream is `Protocol::OpenAi` and the body was translated:
 
@@ -579,6 +607,16 @@ reachable through the proxy for the first time.
 | back | `X-ApexRouter-Fallback` | `true` when the answer came from a non-first candidate |
 | back | `X-ApexRouter-Protocol` | only when the ingress is not `open_ai`, e.g. `anthropic->open_ai` |
 | back | `X-ApexRouter-Usage-Deferred` | `true` on streams |
+| back | `X-ApexRouter-Warm` | `parked=N,waited_ms=N` — **only** on a response that parked behind a swap |
+
+`X-ApexRouter-Warm` is how a sequential swap becomes observable rather than merely invisible. A
+request that arrives while `POST /v1/routes/{alias}/swap` is mid-flight parks instead of failing
+(§1.2, `ARCHITECTURE.md` §4.7); when the window closes it is re-resolved against the replacement and
+answered normally, and this header is the only trace that anything happened. `parked` is the queue
+depth this request saw, `waited_ms` how long it waited. **Absent on every request that did not
+park** — its presence, not its value, is the signal, so a client can log "this one rode through a
+swap" without parsing anything. The two refusals that end a park instead of serving it are
+`warm_queue_full` and `warm_timeout`.
 
 ---
 
@@ -1146,8 +1184,29 @@ gate.
 
 #### `GET /v1/endpoints/{id}/argv` → `ArgvPreview`
 
-Exactly what would be exec'd. **No credential ever appears here** — `core::exec` takes an argv
-vector and there is no `sh -c` anywhere in the codebase.
+**What this endpoint *was* exec'd with** — resolved from the endpoint's own record, never from a
+fresh plan.
+
+That distinction is the whole contract. The route used to call `supervisor.plan(&spec)`, which
+re-scans the rig, re-solves `fit()` against whatever VRAM is free *now*, and leases a fresh port —
+a hypothetical *second* launch that diverges from the running child the moment anything moves.
+Measured after a VRAM budget change, the daemon served 34 tokens where `/proc/<pid>/cmdline` had
+36: `-c 4096` instead of `-c 32768` and no `-ngl` at all, i.e. it described a CPU-only launch for a
+fully-offloaded child, with an empty `warnings`. It now renders from `ResolvedSpec::from_record` —
+the record's draft with the record's `fit` folded back in, at the port the record was leased, using
+the build the record names — so the answer is a fact about the process, not a forecast. Any
+divergence between the rendered argv and the plan the record reports lands in `warnings` rather
+than being invisible.
+
+**No credential ever appears here** — a key is passed as `--api-key-file` and the preview names the
+real `$STATE/endpoints/<id>.key` path the supervisor wrote, never its contents. `core::exec` takes
+an argv vector and there is no `sh -c` anywhere in the codebase.
+
+| Status | When |
+|---|---|
+| `404` | no endpoint with that id |
+| `409` | the build the record names is no longer on this machine — rendering against a different build's `FlagSupport` would silently emit a different flag set, so it refuses and names `apexrouter rig` |
+| `409` | the endpoint is not one this daemon launches (a LAN node or a managed provider has no local argv) |
 
 ```jsonc
 {

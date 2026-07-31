@@ -39,11 +39,29 @@
 //!   backend that is already running allocates nothing, so there is nothing to sequence and
 //!   the swap is reported as [`SwapMode::Hot`] whatever was asked for. Honouring "sequential"
 //!   there would mean a deliberate gap in service for no benefit.
-//! * a sequential swap that *does* start something still has an unavoidable gap: the whole
-//!   point is that the replacement cannot fit until the old one is gone. `SwapReport::parked`
-//!   is where that gap is closed, and it needs a parking primitive on the request path that
-//!   `RouterInner` does not publish. Until it does, the gap is bounded by the launch and ends
-//!   without operator action — which is the difference between this and what shipped.
+//! * a sequential swap that *does* start something has an unavoidable gap in *capacity* — the
+//!   whole point is that the replacement cannot fit until the old one is gone — but that is
+//!   no longer a gap in *service*. `ARCHITECTURE.md` §4.7's parking primitive now exists on
+//!   `RouterInner::warm()`, and this module is its only opener.
+//!
+//! ## Parking, concretely
+//!
+//! The window is opened on the alias **before A is touched** and held until the alias points
+//! at B, so there is no instant in which a request can find the alias unserved and no window
+//! to park on. Arriving requests park on a `tokio::sync::Notify` behind a bounded queue
+//! ([`warm_queue_max`]); [`warm_timeout`] is not an independent number but the budget of the
+//! thing being started; closing the window wakes everything parked, which re-resolves and
+//! finds B. Every failure path closes it too — the guard's `Drop` does it — so a swap that
+//! rolls back releases its parked requests onto the restored A instead of making them wait
+//! out the timeout.
+//!
+//! And `warm_timeout` is **patience, not a stopwatch**: [`start_while_parked`] re-arms the
+//! window for as long as the launch is alive, because the health gate's own deadline resets
+//! on progress and a park that expires under a load that is still working just moves the
+//! outage nine seconds to the right. See that function for the measurement.
+//!
+//! `SwapReport::parked` is the **peak** depth the queue reached, which is the number an
+//! operator wants: "how many clients did this swap catch?".
 
 use super::{apply_routes, ApiError, ApiResult};
 use crate::state::AppState;
@@ -55,7 +73,7 @@ use apexrouter_protocol::{
     SwapReport, ValidationReport,
 };
 use apexrouter_providers::{DownMode, Provisioner};
-use apexrouter_router::{RequestClass, UnknownModelPolicy};
+use apexrouter_router::{RequestClass, UnknownModelPolicy, WarmWindow};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -385,13 +403,14 @@ pub async fn test(
 /// router's own in-flight counter, and stop A. A failure at the proving step aborts with A
 /// untouched.
 ///
-/// **Sequential**: drain and stop A first, then start B, then repoint — because B does not
-/// fit alongside A. If B does not come up, **A is put back and the alias re-points at it**
-/// before the failure is returned. The old behaviour left A stopped for ever, which is one
-/// `503` per request until somebody guessed the remedy.
+/// **Sequential**: open a warm window on the alias, drain and stop A, start B, repoint —
+/// because B does not fit alongside A. Requests that arrive while A is gone **park** rather
+/// than `503` (`ARCHITECTURE.md` §4.7); closing the window at the end wakes them onto B. If B
+/// does not come up, **A is put back and the alias re-points at it** before the failure is
+/// returned, and the window closes onto A. The old behaviour left A stopped for ever, which
+/// was one `503` per request until somebody guessed the remedy.
 ///
-/// `SwapReport::parked` is `0` in mk1 — see this module's header for why, and for what
-/// closing the sequential gap would take.
+/// `SwapReport::parked` is the peak queue depth the window saw.
 pub async fn swap(
     State(s): State<Arc<AppState>>,
     Path(alias): Path<String>,
@@ -448,9 +467,22 @@ pub async fn swap(
     // How to put A back, captured **before** A is touched. `None` means there is nothing to
     // undo — the hot path, where A is still serving.
     let mut undo: Option<Restore> = None;
+    // The warm window, held for exactly as long as the alias cannot serve. `Drop` closes it,
+    // so every `?` and every early return below releases the parked requests rather than
+    // leaving them to wait out `warm_timeout`.
+    let mut warm: Option<WarmWindow> = None;
 
     // Sequential: A goes away first, because B cannot fit next to it.
     if mode == SwapMode::Sequential {
+        // **Opened before A is touched, not after.** Between `accepting = false` and the
+        // window existing there would be a stretch — short on a fake, minutes on a 7 GB
+        // GGUF — in which a request finds the alias unserved and has nowhere to park, which
+        // is precisely the `503` storm §4.7 exists to prevent.
+        warm = Some(
+            s.router
+                .warm()
+                .open(&alias, warm_timeout(&s), warm_queue_max(&s)),
+        );
         if let Some(old) = from.clone() {
             undo = Restore::capture(&s, &old);
             drained_ms = drain_and_stop(&s, &old).await?;
@@ -459,7 +491,7 @@ pub async fn swap(
 
     let to = match action {
         Next::Existing(id) => id,
-        Next::Start(plan) => match s.supervisor.up(*plan, None).await {
+        Next::Start(plan) => match start_while_parked(&s, *plan, warm.as_ref()).await {
             Ok(backend) => {
                 let id = backend.id.clone();
                 // `register_started`, not `register_backend`: this is a new process, and the
@@ -477,6 +509,12 @@ pub async fn swap(
         return Err(rolled_back(&s, &alias, undo, why).await);
     }
 
+    // The alias answers again. Close the window and release everything parked behind it —
+    // each one re-resolves, and what it re-resolves to is B. This is after `bind_alias` and
+    // not before: a request woken against the *old* table would find the alias still pointing
+    // at the backend that was just stopped, and answer the `503` it parked to avoid.
+    let parked = warm.take().map_or(0, WarmWindow::close);
+
     // Hot: A keeps serving what it captured, then goes.
     if mode == SwapMode::Hot {
         if let Some(old) = from.clone().filter(|o| o != &to) {
@@ -489,10 +527,121 @@ pub async fn swap(
         mode,
         from,
         to,
-        parked: 0,
+        parked,
         drained_ms,
         total_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     }))
+}
+
+/// `warm_timeout` — **not an independent number, and not a total budget** (§4.7).
+///
+/// It is the budget of the operation being waited on, because "a 90 s park against a 180 s
+/// load is an arithmetic guarantee of failure". This daemon's start budget for an endpoint is
+/// the health gate's `[supervisor] health_deadline_ms`, and a sequential swap spends
+/// `[server] drain_timeout_secs` draining A *before* that budget even starts, so the park has
+/// to span both. Never shorter than `queue_timeout_ms`, which is what an ordinary busy
+/// backend already makes a client wait.
+///
+/// What it measures is **patience since the last sign of life**, not wall clock since the
+/// swap began: [`start_while_parked`] restates it for as long as the launch is alive, exactly
+/// as the health gate restates its own deadline on observed progress. Read as a total budget
+/// it was an outage with a delay on it — 4 parked requests `503`'d at 2977 ms of a 12,038 ms
+/// swap, and 74,550 `no_healthy_backend` responses for the nine seconds after that.
+///
+/// So it fires in one case only: the thing the park is waiting for stopped making progress
+/// **and** the swap did not notice. Then a `503` with `Retry-After` is the honest answer.
+fn warm_timeout(state: &Arc<AppState>) -> Duration {
+    let cfg = state.cfg.load_full();
+    Duration::from_millis(cfg.supervisor.health_deadline_ms)
+        .saturating_add(Duration::from_secs(cfg.server.drain_timeout_secs))
+        .max(Duration::from_millis(cfg.router.queue_timeout_ms))
+}
+
+/// `warm_queue_max` — how many requests a warm window admits before it refuses (§4.7).
+///
+/// **This is the one line that wires the key.** It is a function rather than the value
+/// inlined at the call site so that there is exactly one place the bound is decided;
+/// `WarmRegistry::open` has always taken it as an argument, and `warm_rearm.rs` proves the
+/// registry honours whatever it is handed by observing two different refusal points.
+///
+/// `apexrouter_router::DEFAULT_WARM_QUEUE_MAX` remains the fallback for callers that hold no
+/// `Config` — it is the same 32, asserted equal in `core::config`'s tests.
+fn warm_queue_max(state: &Arc<AppState>) -> u32 {
+    state.cfg.load().router.warm_queue_max
+}
+
+/// Start B while requests are parked on the alias, **keeping the window armed for as long as
+/// the launch is alive**.
+///
+/// # Why the park's deadline is not a stopwatch
+///
+/// `[supervisor] health_deadline_ms` is not the time a launch is allowed to take; it is the
+/// time it is allowed to spend making **no progress**. `supervisor::health_gate` resets it on
+/// every `503 {"status":"loading model"}` and on every recognised line in the child's log, so
+/// a 7 GB GGUF that loads for four minutes passes a 30-second gate. A warm window that treated
+/// its own `warm_timeout` as a total budget therefore gave up on a load that was working
+/// perfectly: measured, 4 parked requests `503`'d at 2977 ms of a swap that completed at
+/// 12,038 ms, and the alias then answered 74,550 requests with `no_healthy_backend` before it
+/// came back. Late, but exactly the outage §4.7 exists to prevent.
+///
+/// # The signal, and why it is this one
+///
+/// The gate and the park wait on the same event, so they share the gate's liveness signal —
+/// and the faithful relay of that signal is **the launch future still being pending**. The
+/// gate is defined to return within `health_deadline_ms` of the last progress it observed, so
+/// "`up()` has not returned" *is* "progress was observed recently", with no second opinion to
+/// drift from the first. One re-arm per gate probe, on the gate's own `health_interval_ms`
+/// clock.
+///
+/// `Event::BootProgress` is the tempting alternative and is the wrong one: it is emitted once
+/// per **transition**, never per tick, so the whole `503 loading` reset — the signal that
+/// actually carries a quiet mmap of a 30 GB file — never reaches the bus at all. Re-arming
+/// from it would leave the park strictly less patient than the gate it is waiting on, which is
+/// this defect again with a smaller constant.
+///
+/// A window that is closed, or superseded by a later swap of the same alias, refuses the
+/// re-arm ([`WarmWindow::rearm`]), so a leaked pacemaker cannot hold requests indefinitely.
+///
+/// # Errors
+/// Whatever the supervisor's launch returned; the caller rolls back on it.
+async fn start_while_parked(
+    state: &Arc<AppState>,
+    plan: apexrouter_providers::LaunchPlan,
+    warm: Option<&WarmWindow>,
+) -> Result<apexrouter_protocol::Backend, CoreError> {
+    let launching = state.supervisor.up(plan, None);
+    // Hot swaps park nothing, so there is nothing to keep armed.
+    let Some(window) = warm else {
+        return launching.await;
+    };
+
+    let period = Duration::from_millis(state.cfg.load().supervisor.health_interval_ms.max(50));
+    // `interval_at`, not `interval`: the first tick of a plain `interval` fires immediately
+    // and would count a re-arm before the launch had done anything at all.
+    let mut probe = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    tokio::pin!(launching);
+    let outcome = loop {
+        tokio::select! {
+            // Biased so a launch that finished in the same breath as a tick is seen as
+            // finished. The window is about to be closed either way.
+            biased;
+            done = &mut launching => break done,
+            _ = probe.tick() => {
+                window.rearm();
+            }
+        }
+    };
+
+    if window.rearms() > 0 {
+        tracing::debug!(
+            rearms = window.rearms(),
+            parked = window.parked(),
+            "the warm window outlasted its budget because the launch kept making progress"
+        );
+    }
+    outcome
 }
 
 // ----------------------------------------------------------------------------------------

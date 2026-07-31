@@ -45,14 +45,105 @@ const LOG_BUFFER: usize = 4000;
 // Where the daemon is
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The control-plane URL: `$APEXROUTER_URL`, else the documented loopback default.
+/// The control-plane URL: `$APEXROUTER_URL`, else `[server] control_bind` from the config
+/// file the daemon itself reads, else the documented loopback default.
 ///
-/// This crate cannot link `apexrouter-core`, so it does not read the lock file's owner
-/// record the way the CLI does — the env var is the documented override for exactly this
-/// case, and the default is the constant every surface shares.
+/// Reading the configured bind is not a nicety. Moving the control port in `config.toml`
+/// used to leave this app pointed at `127.0.0.1:2739` with nothing behind it, and the only
+/// symptom was "not connected" — a debugging cycle spent on a value that was written down
+/// the whole time.
+///
+/// This crate is GPL and cannot link `apexrouter-core`, so it does not read the lock file's
+/// owner record the way the CLI does and it parses the one key it needs by hand
+/// ([`control_bind_in`]) rather than taking a TOML dependency. The env var stays the
+/// override, and it still wins.
 pub fn control_url() -> String {
-    env_nonempty("APEXROUTER_URL")
-        .unwrap_or_else(|| format!("http://{}", apexrouter_protocol::DEFAULT_CONTROL_BIND))
+    if let Some(url) = env_nonempty("APEXROUTER_URL") {
+        return url;
+    }
+    let bind = configured_control_bind()
+        .unwrap_or_else(|| apexrouter_protocol::DEFAULT_CONTROL_BIND.to_string());
+    format!("http://{}", dialable(&bind))
+}
+
+/// `[server] control_bind` as written in the resolved config file, when there is one.
+fn configured_control_bind() -> Option<String> {
+    let text = std::fs::read_to_string(config_path()?).ok()?;
+    control_bind_in(&text)
+}
+
+/// The config file `apexrouter` itself would load, by the resolution order `ARCHITECTURE.md`
+/// §5.1 fixes: `$APEXROUTER_CONFIG` → `$APEXROUTER_HOME/config.toml` →
+/// `$XDG_CONFIG_HOME/apexrouter/config.toml` → `~/.config/apexrouter/config.toml`.
+///
+/// Mirrored rather than shared, for the licensing reason above. `core::paths` additionally
+/// falls back to the passwd database when `$HOME` is unset; a GUI always has one, and
+/// answering `None` here simply falls back to the documented default rather than guessing.
+fn config_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = env_nonempty("APEXROUTER_CONFIG") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    if let Some(h) = env_nonempty("APEXROUTER_HOME") {
+        return Some(std::path::PathBuf::from(h).join("config.toml"));
+    }
+    let cfg_home = env_nonempty("XDG_CONFIG_HOME")
+        .filter(|p| p.starts_with('/'))
+        .map(std::path::PathBuf::from)
+        .or_else(|| env_nonempty("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+    Some(cfg_home.join("apexrouter").join("config.toml"))
+}
+
+/// `control_bind` from the `[server]` table of a config document.
+///
+/// A deliberately small reader: it tracks the current table header, ignores comment lines,
+/// and takes the first double-quoted value on the `control_bind` line — which is every form
+/// `config.example.toml` and `apexrouter config init` can produce. Anything it does not
+/// understand yields `None`, and `None` means "use the default", never a wrong URL.
+fn control_bind_in(text: &str) -> Option<String> {
+    let mut in_server = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            // `[server]` only — `[server.something]` is a different table, and so is
+            // `[[server]]`, whose header starts with a second `[`.
+            in_server = rest.strip_suffix(']').map(str::trim) == Some("server");
+            continue;
+        }
+        if !in_server {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("control_bind") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        if !rest.starts_with('=') {
+            continue;
+        }
+        let value = rest[1..].trim();
+        let inner = value.strip_prefix('"')?;
+        let end = inner.find('"')?;
+        let bind = inner[..end].trim();
+        return (!bind.is_empty()).then(|| bind.to_string());
+    }
+    None
+}
+
+/// A *bind* address turned into an address a client can actually dial.
+///
+/// `0.0.0.0:2739` means "every interface" to a listener and nothing at all to `connect()`;
+/// the interface this app is on is loopback, so a wildcard bind is dialled there. Any other
+/// host is passed through untouched — someone who bound the control plane to a LAN address
+/// meant that address.
+fn dialable(bind: &str) -> String {
+    let bind = bind.trim();
+    match bind.rsplit_once(':') {
+        Some(("0.0.0.0", port)) => format!("127.0.0.1:{port}"),
+        Some(("[::]", port)) | Some(("*", port)) => format!("[::1]:{port}"),
+        _ => bind.to_string(),
+    }
 }
 
 /// The bearer, when one is configured. `None` on a loopback control plane with no auth.
@@ -2374,13 +2465,58 @@ mod tests {
     }
 
     #[test]
-    fn the_control_url_falls_back_to_the_documented_loopback_default() {
-        // Never a remote host by default: §9.1 binds everything to loopback.
+    fn the_control_url_is_a_url_and_never_a_bare_bind() {
+        // Whatever it resolves from — env var, config file or the constant — the app hands
+        // this to `NodeClient`, so it must always carry a scheme.
         let url = control_url();
         assert!(
-            url.contains("127.0.0.1") || std::env::var("APEXROUTER_URL").is_ok(),
+            url.starts_with("http://") || url.starts_with("https://"),
             "{url}"
         );
+    }
+
+    #[test]
+    fn moving_the_control_port_in_config_moves_this_client_with_it() {
+        // D10: the GUI used to read `$APEXROUTER_URL` and nothing else, so an operator who
+        // moved the port in config.toml got a silent "not connected" against 2739.
+        let doc = "\
+[server]\n\
+proxy_bind = \"127.0.0.1:8888\"\n\
+control_bind = \"127.0.0.1:3000\"   # moved\n\
+token_env = \"APEXROUTER_TOKEN\"\n";
+        assert_eq!(control_bind_in(doc).as_deref(), Some("127.0.0.1:3000"));
+    }
+
+    #[test]
+    fn control_bind_is_only_read_from_the_server_table() {
+        // A `control_bind` under another table is not the one the daemon binds.
+        let doc = "\
+[router]\n\
+control_bind = \"127.0.0.1:9999\"\n\
+[server]\n\
+control_bind = \"127.0.0.1:2739\"\n";
+        assert_eq!(control_bind_in(doc).as_deref(), Some("127.0.0.1:2739"));
+        assert_eq!(
+            control_bind_in("[server.tls]\ncontrol_bind = \"x:1\"\n"),
+            None
+        );
+        // Commented out is unset, not a value.
+        assert_eq!(
+            control_bind_in("[server]\n# control_bind = \"1.2.3.4:1\"\n"),
+            None
+        );
+        // A document without the key at all leaves the default in place.
+        assert_eq!(control_bind_in("[server]\nautostart = true\n"), None);
+    }
+
+    #[test]
+    fn a_wildcard_bind_is_dialled_on_loopback() {
+        // `0.0.0.0` is a listener's answer to "which interfaces"; it is not connectable.
+        assert_eq!(dialable("0.0.0.0:2739"), "127.0.0.1:2739");
+        assert_eq!(dialable("[::]:2739"), "[::1]:2739");
+        // A deliberate LAN bind is left exactly as written.
+        assert_eq!(dialable("192.168.1.9:2739"), "192.168.1.9:2739");
+        assert_eq!(dialable(" 127.0.0.1:2739 "), "127.0.0.1:2739");
     }
 
     #[test]

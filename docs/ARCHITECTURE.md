@@ -1264,12 +1264,40 @@ router's **own** counter, not the upstream's `/slots`, which 501s on `--no-slots
 In-flight requests keep the upstream captured at dispatch and finish against A;
 `X-ApexRouter-Backend` tells the client which one served it.
 
-**Sequential** — the alias enters `Health::Starting`; A is drained and stopped; B starts; arriving
-requests **park** on a `tokio::sync::Notify` behind a bounded queue (`warm_queue_max`, default 32).
-`warm_timeout` is **not an independent number**: it is `max(start_timeout, health_deadline)` for the
-endpoint being started, because a 90 s park against a 180 s load is an arithmetic guarantee of
-failure. On overflow or timeout the client gets an OpenAI-shaped `503` with `Retry-After`. Parked
-count is broadcast so both GUIs show "warming, N parked".
+**Sequential** — a **warm window** is opened on the alias *before A is touched*; A is drained and
+stopped; B starts; arriving requests **park** on a `tokio::sync::Notify` behind a bounded queue
+(`warm_queue_max`, default 32); the window is closed *after* the alias points at B, which wakes
+everything parked to re-resolve onto B. The window is an RAII guard, so every failure path —
+including a rollback and including a panic — releases the parked requests onto the restored A
+instead of leaving them to wait out the timeout. Parked depth is broadcast so both GUIs show
+"warming, N parked", and `SwapReport::parked` is the peak the queue reached.
+
+`warm_timeout` is **not an independent number and not a total budget.**
+
+* *Not independent*: it is the budget of the thing being waited on —
+  `[supervisor] health_deadline_ms + [server] drain_timeout_secs`, floored at
+  `[router] queue_timeout_ms`, because a sequential swap spends the drain before the start budget
+  even begins. A 90 s park against a 180 s load is an arithmetic guarantee of failure.
+* *Not a total budget*: it measures wall clock **since the last sign of life**, and is re-armed for
+  as long as the launch is alive (`api/routes.rs::start_while_parked` →
+  `WarmWindow::rearm`). This mirrors the health gate, whose deadline has always reset on observed
+  progress — the gate and the park wait on the same event, so they share one liveness signal.
+  Read as a stopwatch it was an outage with a delay on it: measured, a 3000 ms window against a
+  12,038 ms swap `503`'d its 4 parked requests at 2977 ms and the alias then answered 74,550
+  requests with `no_healthy_backend` over the remaining nine seconds. The re-armed window costs
+  **zero 5xx** across the same swap. A bound on patience is kept for the case where progress
+  genuinely stops, and that is what the deadline now measures.
+
+On overflow the client gets an OpenAI-shaped `503 warm_queue_full` with `Retry-After` immediately,
+rather than deepening a queue that is already the wrong answer; on expiry, `503 warm_timeout` with
+`Retry-After`. A client that hangs up mid-park gives its slot back from `Drop`.
+
+`[router] warm_queue_max` is a real configuration key on `core::config::RouterCfg` (default 32).
+The bound is an argument at every level — `WarmRegistry::open(alias, timeout, max)` — and
+`api/routes.rs::warm_queue_max` is the single function that reads it, so nothing else in the
+daemon or the router knows the number. Measured against one 12 s sequential swap with twelve
+concurrent clients: at `warm_queue_max = 4` the peak parked depth is 4 and the rest get
+`503 warm_queue_full` immediately; at `16`, all twelve park and the swap costs **zero** 5xx.
 
 Swap is a **daemon operation**. The CLI verb is an RPC to `POST /v1/routes/{alias}/swap`; it is not
 a file write plus a hope that the watcher noticed. (This is the one place the library-first proposal
@@ -1331,7 +1359,12 @@ Local ports come from a pool starting at 8800 — multiple rentals is the normal
 
 One `trait Check` in `core::checks`, backing `doctor`, `diagnose` and the four native smoke probes.
 Checks run **concurrently** with per-check timeouts and stream as each lands, so
-`diagnose --only rate-limits` is instant instead of waiting through four sequential SSH probes.
+`--only rate-limits` is instant instead of waiting through four sequential SSH probes.
+
+The registry is reached three ways, and *`diagnose` is not a CLI verb*: `apexrouter doctor [--only]`
+renders the whole registry once; `GET /v1/diagnose?only=` streams it as SSE, one event per check
+plus a terminal `done`; and the `apexrouter_diagnose` MCP tool is what an agent calls. `doctor` and
+`diagnose` are the same checks with different transports, not two registries.
 
 ```rust
 #[async_trait]
@@ -1408,9 +1441,12 @@ request_usage        = "off"             # off | passthrough (injects stream_opt
 capture_bodies       = false             # prompts are NEVER stored unless this is on
 log_usage            = true
 anthropic_ingress    = true              # serve POST /v1/messages on the proxy listener (§6.1)
-anthropic_tools      = false             # translate tool_use/tool_result <-> tool_calls. OFF by
-                                         # default: it is the imperfect part (§12). With it off, a
-                                         # /v1/messages body carrying `tools` is REFUSED, loudly.
+anthropic_tools      = true              # translate tool_use/tool_result <-> tool_calls. ON by
+                                         # default since 2026-07-31 (CHARTER amendment): Claude
+                                         # Code sends 92 tool definitions on EVERY request, so off
+                                         # meant the ingress did not work at all for the client it
+                                         # exists to serve. Still best-effort (§12). Set to false
+                                         # and a body carrying `tools` is REFUSED, loudly.
 
 [supervisor]
 health_deadline_ms   = 600000            # REAL deadline, reset on observed progress
@@ -2111,13 +2147,16 @@ Each with the reason, so a future reader knows it was a decision and not an over
   (`agentd/crates/agent/src/anthropic.rs`) and calls `api.anthropic.com` directly with a real key;
   nothing in the ecosystem wants a proxy that fakes an Anthropic upstream out of an OpenAI one.
   Building it would mean maintaining a second, unexercised translator.
-- **Perfect Anthropic tool-use translation.** `[router] anthropic_tools` is **off by default** and
-  when on it is *allowed to be imperfect*, which is the honest statement rather than a promise we
-  would quietly break. `input_schema`/`parameters` and `tool_use`/`tool_calls` map cleanly; parallel
-  tool calls, `tool_choice` variants, and a `tool_result` whose content is a block array rather than
-  a string do not map cleanly in every case. With the flag **off**, a `/v1/messages` body carrying
-  `tools` is **refused with a clear error** — never silently stripped and answered wrongly, which is
-  the failure mode that actually costs an agent an hour.
+- **Perfect Anthropic tool-use translation.** `[router] anthropic_tools` is **on by default** (since
+  2026-07-31 — see the CHARTER amendments log) and is *allowed to be imperfect*, which is the honest
+  statement rather than a promise we would quietly break. `input_schema`/`parameters` and
+  `tool_use`/`tool_calls` map cleanly; parallel tool calls, `tool_choice` variants, and a
+  `tool_result` whose content is a block array rather than a string do not map cleanly in every
+  case. It is on because the alternative to imperfect tool translation is not "no tools" but "the
+  feature does not work at all": real Claude Code sends **92 tool definitions on every request**.
+  Set **explicitly to `false`** and a `/v1/messages` body carrying `tools` is still **refused with a
+  clear error naming the key** — never silently stripped and answered wrongly, which is the failure
+  mode that actually costs an agent an hour.
 - **`thinking` blocks, and `/v1/messages/count_tokens`.** There is no OpenAI-side equivalent of an
   Anthropic `thinking` content block, so mk1 neither synthesises one on the way out nor accepts one
   on the way in. The closest thing that exists is llama.cpp b9199's `--reasoning-format`, which can

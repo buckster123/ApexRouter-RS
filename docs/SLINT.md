@@ -193,11 +193,21 @@ apexrouter-ui                      # discovers the control plane from
                                    # $APEXROUTER_URL, else 127.0.0.1:2739
 ```
 
-`control_url()` reads `$APEXROUTER_URL` and falls back to `http://127.0.0.1:2739`;
-`control_token()` reads `$APEXROUTER_TOKEN`. Note it does **not** read the lock file's owner
-record the way the CLI does — that would need `apexrouter-core`, which this crate may not link,
-so the env var is the override for a non-default bind. With no daemon the window still opens,
-the connection dot is red, and a toast says why — it never blocks on a socket.
+`control_url()` resolves in three steps: `$APEXROUTER_URL`, else **`[server] control_bind` read
+from the config file the daemon itself would load**, else `http://127.0.0.1:2739`.
+`control_token()` reads `$APEXROUTER_TOKEN`.
+
+Reading the configured bind is not a nicety. Moving the control port in `config.toml` used to
+leave this app pointed at `127.0.0.1:2739` with nothing behind it, and the only symptom was "not
+connected" — a debugging cycle spent on a value that was written down the whole time. The config
+path is resolved by mirroring `ARCHITECTURE.md` §5.1 (`$APEXROUTER_CONFIG` → `$APEXROUTER_HOME/
+config.toml` → `$XDG_CONFIG_HOME/apexrouter/config.toml` → `~/.config/apexrouter/config.toml`),
+and the one key is parsed by hand rather than by taking a TOML dependency.
+
+It still does **not** read the lock file's owner record the way the CLI does — that would need
+`apexrouter-core`, which this GPL crate may not link. `$APEXROUTER_URL` remains the override and
+still wins. With no daemon the window still opens, the connection dot is red, and a toast says
+why — it never blocks on a socket.
 
 ---
 

@@ -46,7 +46,10 @@ pub mod table;
 pub mod telemetry;
 
 pub use handler::{proxy_handler, proxy_router};
-pub use registry::{BackendRegistry, LiveBackend};
+pub use registry::{
+    BackendRegistry, LiveBackend, Parked, WarmRegistry, WarmSlot, WarmWindow,
+    DEFAULT_WARM_QUEUE_MAX,
+};
 pub use resolve::{Candidate, Plan, RequestClass, RouteError, UnknownModelPolicy};
 pub use table::{RoutingTable, TableBuilder};
 
@@ -72,6 +75,15 @@ pub struct RouterInner {
     table: arc_swap::ArcSwap<RoutingTable>,
     /// Live per-backend state, which **survives** a table recompile.
     registry: BackendRegistry,
+    /// **The warm queue** (`ARCHITECTURE.md` §4.7). Pure in-memory state — a `Notify`, an
+    /// `AtomicU32` depth and a deadline per alias — so a **Sequential** swap, which is the
+    /// common path on a box where two 7 GB models cannot coexist, parks arriving requests
+    /// instead of `503`ing them for the whole of the replacement's model load.
+    ///
+    /// Read on the request path only after a dispatch has already failed, and then only
+    /// through [`WarmRegistry::any_open`], one relaxed atomic load. The happy path never
+    /// touches it.
+    warm: WarmRegistry,
     /// ONE pooled client, with `no_gzip`/`no_brotli`/`no_deflate` so bytes relay verbatim.
     http: reqwest::Client,
     /// GLOBAL byte budget, not just a request count.
@@ -118,6 +130,7 @@ impl RouterInner {
         Arc::new(RouterInner {
             table: arc_swap::ArcSwap::from_pointee(table),
             registry,
+            warm: WarmRegistry::new(tx.clone()),
             http,
             inflight_bytes: Arc::new(Semaphore::new(byte_permits)),
             ring: Mutex::new(VecDeque::with_capacity(RING_CAPACITY)),
@@ -177,6 +190,17 @@ impl RouterInner {
     /// The live backend registry.
     pub fn registry(&self) -> &BackendRegistry {
         &self.registry
+    }
+
+    /// **The parking primitive `ARCHITECTURE.md` §4.7 specifies.**
+    ///
+    /// A sequential swap calls [`WarmRegistry::open`] before it drains anything and holds the
+    /// returned window until the alias points at the replacement; the request path calls
+    /// [`WarmRegistry::parking_for`] only once a dispatch has already failed. Nothing else
+    /// may open a window: parking a request is a promise that something is coming back, and
+    /// a promise nobody is keeping is just a slower `503`.
+    pub fn warm(&self) -> &WarmRegistry {
+        &self.warm
     }
 }
 

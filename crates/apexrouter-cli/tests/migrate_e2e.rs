@@ -1057,10 +1057,11 @@ fn applying_twice_is_idempotent() {
         "the second --apply rewrote the ledger"
     );
 
-    // From here the whole tree must be byte-stable. It is not stable across the *first*
-    // re-read, and that is a consequence of the duplicate-id defect recorded below: a
-    // `catalog.toml` carrying two entries under one id does not survive its own
-    // `toml_edit` round-trip unchanged. With the collision removed, run 1 is already stable.
+    // From here the whole tree must be byte-stable. This used to be true only from the
+    // *second* re-read, because a `catalog.toml` carrying two entries under one id does not
+    // survive its own `toml_edit` round-trip unchanged — a measurable second symptom of the
+    // duplicate-id defect guarded by `apply_never_writes_two_recipes_under_the_same_id`.
+    // With the collision merged away it is stable from run 1.
     let settled = hash_tree(&w.state);
     w.run(&["migrate", "--apply", "--json"]).json();
     assert_eq!(
@@ -1193,25 +1194,27 @@ fn a_machine_with_no_legacy_state_yields_an_empty_plan() {
 }
 
 // =======================================================================================
-// 5. known defects, written down rather than remembered
+// 5. defects that were found here, and are now guarded here
 // =======================================================================================
 
-/// **Known defect, reported to the owner of `core/src/migrate.rs` (unit C-16).**
+/// **Regression guard for the duplicate-legacy-id defect, fixed 2026-07-31.**
 ///
-/// `apply` de-duplicates recipe ids against the catalog it is writing into, but not against
-/// the batch it is writing. On the real machine both `~/.vastai-gguf/local_instances/
+/// `apply` used to de-duplicate recipe ids against the catalog it was writing into, but not
+/// against the batch it was writing. On the real machine both `~/.vastai-gguf/local_instances/
 /// local-qwen35-9b.json` and `<LocalRouter>/recipes.toml#recipes.local-qwen35-9b` mint the id
-/// `local-qwen35-9b`, so `catalog.toml` ends up with two recipes under one id. The second is
-/// then unreachable (`recipe show` finds the first) and `recipe rm` deletes both — the exact
-/// silent-shadowing failure `catalog::upsert_recipe` exists to prevent. A second symptom is
-/// measurable: a `catalog.toml` holding the collision does not survive its own `toml_edit`
-/// round-trip byte-for-byte, so the first re-read rewrites the file. Delete the colliding
-/// source and `--apply` is byte-idempotent from run 1 — which is how the cause was pinned.
+/// `local-qwen35-9b`, so `catalog.toml` ended up with two recipes under one id. The second was
+/// then unreachable (`recipe show` found the first) and `recipe rm` deleted both — the exact
+/// silent-shadowing failure `catalog::upsert_recipe` exists to prevent. A second symptom was
+/// measurable: a `catalog.toml` holding the collision did not survive its own `toml_edit`
+/// round-trip byte-for-byte, so the first re-read rewrote the file.
 ///
-/// Ignored so the suite stays green while the fix belongs to somebody else; delete the
-/// attribute the moment `apply` dedupes within its own batch.
+/// The fix is a **field-wise merge** rather than a pick (`migrate::apply`, `RecipeAuthority`):
+/// a field only one source sets is always taken, a field both set differently goes to the
+/// higher-ranked source and is named with *both* values in the warning, and two sources
+/// meaning different `RecipeKind`s are both kept with the second renamed `<id>-2`. So the
+/// assertion below is not merely "no duplicates" — it is "no duplicates *and* nothing was
+/// silently dropped to get there".
 #[test]
-#[ignore = "known defect: migrate::apply can write two recipes under one id — see docs/MIGRATION.md"]
 fn apply_never_writes_two_recipes_under_the_same_id() {
     let w = World::new();
     w.run(&["migrate", "--apply", "--json"]).json();

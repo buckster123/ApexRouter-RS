@@ -31,12 +31,13 @@ use crate::breaker::BreakerDecision;
 use crate::errors::{map_status, openai_error};
 use crate::limits::{InFlightGuard, LimitError};
 use crate::models::{aggregate_models, one_model};
+use crate::registry::Parked;
 use crate::relay::stream::is_event_stream;
 use crate::relay::{
     normalize_path, outbound_headers, peek, plan_body, response_headers, sse_response, RequestPeek,
     StreamOutcome,
 };
-use crate::resolve::{RequestClass, UnknownModelPolicy};
+use crate::resolve::{RequestClass, RouteError, UnknownModelPolicy};
 use crate::{Router, COLLAPSE_LOG_CAPACITY, RING_CAPACITY};
 
 use apexrouter_core::secret::Secret;
@@ -55,6 +56,7 @@ use futures_util::StreamExt;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 
 /// The `Via` token this proxy stamps, and refuses to see twice.
 const VIA_TOKEN: &str = "apexrouter";
@@ -202,129 +204,189 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
     // ---- peek, then resolve ---------------------------------------------------------------------
     let pk: RequestPeek = peek(&bytes);
     let unknown = unknown_policy(&cfg.router.unknown_model);
-    let plan = {
-        let table = r.table();
-        table.resolve(pk.model.as_deref(), class, unknown)
-    };
-    let plan = match plan {
-        Ok(p) => p,
-        Err(e) => {
-            let (status, kind) = map_status(&e);
-            return stamp(
-                error_response(ingress, status, kind, &e.to_string()),
-                Stamp::pre(&id, ingress),
-            );
-        }
-    };
+    let started_unix = chrono::Utc::now().timestamp();
 
-    let mut draft = RecordDraft {
+    // **The warm queue, `ARCHITECTURE.md` §4.7.** A *Sequential* swap stops A before B
+    // exists, and on a box where two 7 GB models cannot coexist that is the common mode, not
+    // the rare one. Everything arriving in that window used to get a `503` for the whole of
+    // the replacement's model load. It now parks instead, on `RouterInner::warm()`.
+    //
+    // Everything a park needs is borrowed rather than cloned, and the only thing the happy
+    // path pays is one relaxed atomic load inside `WarmRegistry::any_open` — and only after a
+    // dispatch has *already* failed.
+    let park = ParkCtx {
         id,
         started,
-        started_unix: chrono::Utc::now().timestamp(),
-        alias: plan.alias.clone(),
-        backend: None,
-        upstream_model: None,
-        route_reason: plan.reason,
+        started_unix,
         ingress,
-        method: method.to_string(),
-        path: path.clone(),
-        attempts: 0,
-        fallback: false,
+        method: &method,
+        path: &path,
     };
+    // **At most one park per request.** When the window closes the alias points somewhere
+    // new, so one re-resolve is the whole answer; a second park would let a swap that failed
+    // hold a client for two `warm_timeout`s and still answer `503`.
+    let mut parked_once = false;
+    // `(depth, waited_ms)` for `X-ApexRouter-Warm`, so a request that was served *through* a
+    // swap says so. `None` on every request that never parked, which is nearly all of them.
+    let mut warmed: Option<(u32, u32)> = None;
 
-    // ---- the retry loop ---------------------------------------------------------------------------
-    // **The route's own `[retry]` block**, carried here by `Plan::retry` (R-02). A route that
-    // declared none was compiled with `RetryPolicy::default()`, so the config-wide default is
-    // what a per-route override overrides — the key is never silently ignored.
-    let policy = plan.retry;
-    // `headers_timeout_ms` is what ONE attempt gets to produce response headers, and it is
-    // long by design: a non-streaming completion on a 100B model sends none until generation
-    // finishes. The wall-clock budget therefore has to span every attempt the policy allows.
-    // Setting it to a single `headers_timeout_ms` would mean the first wedged candidate eats
-    // the whole budget and `Instant::now() >= deadline` breaks the loop before the healthy
-    // backend beside it is ever tried — a 504 next to an idle GPU.
-    let deadline = started
-        + Duration::from_millis(cfg.router.headers_timeout_ms)
-            .saturating_mul(u32::from(policy.attempts.max(1)));
-    let queue_timeout = Duration::from_millis(cfg.router.queue_timeout_ms);
-    let mut last: Option<Retryable> = None;
-    // R-10's rewritten request body, translated at most once. The translation depends only on
-    // the client's bytes and on `[router] anthropic_tools`, never on which candidate is being
-    // tried, so a failover reuses it instead of paying for it again.
-    let mut translated: Option<Bytes> = None;
-
-    for (index, cand) in plan.candidates.iter().enumerate() {
-        if draft.attempts >= policy.attempts || Instant::now() >= deadline {
-            break;
-        }
-        if draft.attempts > 0 && !policy.failover {
-            break;
-        }
-        let meta = cand.backend.meta.load_full();
-        if !meta.enabled || !cand.backend.accepting.load(Ordering::Relaxed) {
-            continue;
-        }
-
-        // ---- the (ingress, upstream) matrix cell, ARCHITECTURE §3.4 --------------------------
-        let cell = match (ingress, meta.protocol) {
-            (Protocol::OpenAi, Protocol::Anthropic) => {
-                // Permanently out of scope (§12). The body is **OpenAI**-shaped, because the
-                // client is an OpenAI SDK and will parse it as one.
+    // A parked request re-enters here: while it waited the alias was re-pointed, so the plan
+    // it could not be served under is not the plan it should be served under.
+    'dispatch: loop {
+        let plan = {
+            let table = r.table();
+            table.resolve(pk.model.as_deref(), class, unknown)
+        };
+        let plan = match plan {
+            Ok(p) => p,
+            Err(e) => {
+                // The alias resolved and nothing behind it is dispatchable. During a sequential
+                // swap that is not a failure — it is the gap §4.7 says to park across.
+                if let RouteError::NoHealthy { alias } = &e {
+                    match park_on(
+                        &r,
+                        alias,
+                        &park,
+                        park_reason(pk.model.as_deref(), alias),
+                        &mut parked_once,
+                    )
+                    .await
+                    {
+                        Parking::Retry { depth, waited_ms } => {
+                            warmed = Some((depth, waited_ms));
+                            continue 'dispatch;
+                        }
+                        Parking::Refused(resp) => {
+                            return stamp(resp, park.stamp(alias));
+                        }
+                        Parking::NotWarming => {}
+                    }
+                }
+                let (status, kind) = map_status(&e);
                 return stamp(
-                    openai_error(
-                        StatusCode::NOT_IMPLEMENTED,
-                        "protocol_not_supported",
-                        "open_ai -> anthropic translation is out of scope",
-                    ),
-                    draft.stamp_cell(&meta.id, meta.protocol),
+                    error_response(ingress, status, kind, &e.to_string()),
+                    Stamp::pre(&id, ingress),
                 );
             }
-            // The one translating cell (R-10). The upstream model id travels with it because
-            // it is what `SseTranslator` echoes in `message_start`.
-            //
-            // Gated on `/v1/messages` because that is the only body R-10 translates and the
-            // only path it rewrites — `upstream_path` says so in its own doc. Without the
-            // gate, an `anthropic-version` header on some other path would hand
-            // `request_to_openai` a body that is not a `MessagesRequest` and turn a relayable
-            // request into a `400`. Anything else this ingress can name stays a byte relay and
-            // lets the upstream judge it, which is `05-proxy.md` §15 item 11.
-            (Protocol::Anthropic, Protocol::OpenAi) if path == "/v1/messages" => {
-                Cell::Translate(cand.upstream_model.clone())
-            }
-            // OpenAi -> OpenAi and Anthropic -> Anthropic are both the byte relay below.
-            _ => Cell::Relay,
         };
 
-        // R-10's request contract, in the order its module doc states it — and **before** the
-        // breaker, the permit and any upstream hop, because every failure it can produce is a
-        // `400` the client caused: a missing `max_tokens`, a `thinking` block, or `tools` with
-        // `[router] anthropic_tools = false`. None of those may cost a slot, a token or a
-        // dollar, and none of them may be answered by silently dropping what was asked for.
-        if matches!(cell, Cell::Translate(_)) && translated.is_none() {
-            if let Some(res) = check_version_header(&headers) {
-                return stamp(res, draft.stamp_cell(&meta.id, meta.protocol));
+        let mut draft = RecordDraft {
+            id,
+            started,
+            started_unix,
+            alias: plan.alias.clone(),
+            backend: None,
+            upstream_model: None,
+            route_reason: plan.reason,
+            ingress,
+            method: method.to_string(),
+            path: path.clone(),
+            attempts: 0,
+            fallback: false,
+        };
+
+        // ---- the retry loop ---------------------------------------------------------------------------
+        // **The route's own `[retry]` block**, carried here by `Plan::retry` (R-02). A route that
+        // declared none was compiled with `RetryPolicy::default()`, so the config-wide default is
+        // what a per-route override overrides — the key is never silently ignored.
+        let policy = plan.retry;
+        // `headers_timeout_ms` is what ONE attempt gets to produce response headers, and it is
+        // long by design: a non-streaming completion on a 100B model sends none until generation
+        // finishes. The wall-clock budget therefore has to span every attempt the policy allows.
+        // Setting it to a single `headers_timeout_ms` would mean the first wedged candidate eats
+        // the whole budget and `Instant::now() >= deadline` breaks the loop before the healthy
+        // backend beside it is ever tried — a 504 next to an idle GPU.
+        //
+        // Measured from **this** pass rather than from the request's arrival, because a request
+        // that parked behind a sequential swap has already spent minutes doing nothing. Charging
+        // the park to the upstream's header budget would mean every parked request woke up and
+        // immediately answered `504` — the parking primitive would have made things worse.
+        let deadline = Instant::now()
+            + Duration::from_millis(cfg.router.headers_timeout_ms)
+                .saturating_mul(u32::from(policy.attempts.max(1)));
+        let queue_timeout = Duration::from_millis(cfg.router.queue_timeout_ms);
+        let mut last: Option<Retryable> = None;
+        // R-10's rewritten request body, translated at most once. The translation depends only on
+        // the client's bytes and on `[router] anthropic_tools`, never on which candidate is being
+        // tried, so a failover reuses it instead of paying for it again.
+        let mut translated: Option<Bytes> = None;
+
+        for (index, cand) in plan.candidates.iter().enumerate() {
+            if draft.attempts >= policy.attempts || Instant::now() >= deadline {
+                break;
             }
-            let acfg = AnthropicCfg {
-                tools: cfg.router.anthropic_tools,
-            };
-            match request_to_openai(&bytes, &acfg) {
-                Ok(v) => translated = Some(Bytes::from(v)),
-                Err(e) => {
+            if draft.attempts > 0 && !policy.failover {
+                break;
+            }
+            let meta = cand.backend.meta.load_full();
+            if !meta.enabled || !cand.backend.accepting.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            // ---- the (ingress, upstream) matrix cell, ARCHITECTURE §3.4 --------------------------
+            let cell = match (ingress, meta.protocol) {
+                (Protocol::OpenAi, Protocol::Anthropic) => {
+                    // Permanently out of scope (§12). The body is **OpenAI**-shaped, because the
+                    // client is an OpenAI SDK and will parse it as one.
                     return stamp(
-                        translate_error(&e),
+                        openai_error(
+                            StatusCode::NOT_IMPLEMENTED,
+                            "protocol_not_supported",
+                            "open_ai -> anthropic translation is out of scope",
+                        ),
                         draft.stamp_cell(&meta.id, meta.protocol),
-                    )
+                    );
+                }
+                // The one translating cell (R-10). The upstream model id travels with it because
+                // it is what `SseTranslator` echoes in `message_start`.
+                //
+                // Gated on `/v1/messages` because that is the only body R-10 translates and the
+                // only path it rewrites — `upstream_path` says so in its own doc. Without the
+                // gate, an `anthropic-version` header on some other path would hand
+                // `request_to_openai` a body that is not a `MessagesRequest` and turn a relayable
+                // request into a `400`. Anything else this ingress can name stays a byte relay and
+                // lets the upstream judge it, which is `05-proxy.md` §15 item 11.
+                (Protocol::Anthropic, Protocol::OpenAi) if path == "/v1/messages" => {
+                    Cell::Translate(cand.upstream_model.clone())
+                }
+                // OpenAi -> OpenAi and Anthropic -> Anthropic are both the byte relay below.
+                _ => Cell::Relay,
+            };
+
+            // R-10's request contract, in the order its module doc states it — and **before** the
+            // breaker, the permit and any upstream hop, because every failure it can produce is a
+            // `400` the client caused: a missing `max_tokens`, a `thinking` block, or `tools` with
+            // `[router] anthropic_tools = false`. None of those may cost a slot, a token or a
+            // dollar, and none of them may be answered by silently dropping what was asked for.
+            if matches!(cell, Cell::Translate(_)) && translated.is_none() {
+                if let Some(res) = check_version_header(&headers) {
+                    return stamp(res, draft.stamp_cell(&meta.id, meta.protocol));
+                }
+                let acfg = AnthropicCfg {
+                    tools: cfg.router.anthropic_tools,
+                };
+                match request_to_openai(&bytes, &acfg) {
+                    Ok(v) => translated = Some(Bytes::from(v)),
+                    Err(e) => {
+                        return stamp(
+                            translate_error(&e),
+                            draft.stamp_cell(&meta.id, meta.protocol),
+                        )
+                    }
                 }
             }
-        }
 
-        if let BreakerDecision::Deny { .. } = cand.backend.breaker.check() {
-            continue;
-        }
+            if let BreakerDecision::Deny { .. } = cand.backend.breaker.check() {
+                continue;
+            }
 
-        let mut guard =
-            match InFlightGuard::acquire(&cand.backend, pk.bytes, &r.inflight_bytes, queue_timeout)
-                .await
+            let mut guard = match InFlightGuard::acquire(
+                &cand.backend,
+                pk.bytes,
+                &r.inflight_bytes,
+                queue_timeout,
+            )
+            .await
             {
                 Ok(g) => g,
                 Err(LimitError::NotAccepting) => continue,
@@ -351,139 +413,396 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
                 }
             };
 
-        // The guard is what emits `RequestFinished` — on `finish()`, or as
-        // `{ aborted: true }` from its `Drop` when the client vanished. Handing it the
-        // broadcast here is what makes a client Ctrl-C visible instead of a zombie UI row.
-        guard.events = Some(r.events.clone());
+            // The guard is what emits `RequestFinished` — on `finish()`, or as
+            // `{ aborted: true }` from its `Drop` when the client vanished. Handing it the
+            // broadcast here is what makes a client Ctrl-C visible instead of a zombie UI row.
+            guard.events = Some(r.events.clone());
 
-        draft.attempts = draft.attempts.saturating_add(1);
-        draft.fallback = index > 0;
-        draft.backend = Some(meta.id.clone());
-        draft.upstream_model = Some(cand.upstream_model.clone());
+            draft.attempts = draft.attempts.saturating_add(1);
+            draft.fallback = index > 0;
+            draft.backend = Some(meta.id.clone());
+            draft.upstream_model = Some(cand.upstream_model.clone());
 
-        // …and the record that `Drop` broadcasts. `InFlightGuard::drop` returns silently
-        // when `record` is `None`, so leaving it unset made the whole abort path a no-op:
-        // a client that hung up produced no event, no ring row and no usage line, which is
-        // precisely the zombie row `ARCHITECTURE.md` §4.3 says cannot happen. `relay` seals
-        // a real record on every outcome it sees, so this only ever ships when the request
-        // task itself is cancelled mid-flight.
-        guard.record = Some(draft.seal(Outcome::abandoned()));
+            // …and the record that `Drop` broadcasts. `InFlightGuard::drop` returns silently
+            // when `record` is `None`, so leaving it unset made the whole abort path a no-op:
+            // a client that hung up produced no event, no ring row and no usage line, which is
+            // precisely the zombie row `ARCHITECTURE.md` §4.3 says cannot happen. `relay` seals
+            // a real record on every outcome it sees, so this only ever ships when the request
+            // task itself is cancelled mid-flight.
+            guard.record = Some(draft.seal(Outcome::abandoned()));
 
-        if r.events.receiver_count() > 0 {
-            let _ = r.events.send(Event::RequestStarted {
-                id,
-                alias: draft.alias.clone(),
-                backend: draft.backend.clone(),
-            });
+            if r.events.receiver_count() > 0 {
+                let _ = r.events.send(Event::RequestStarted {
+                    id,
+                    alias: draft.alias.clone(),
+                    backend: draft.backend.clone(),
+                });
+            }
+
+            // What actually goes on the wire. The translating cell sends R-10's rewritten body to
+            // `/v1/chat/completions`; every other cell sends the client's own bytes to the path it
+            // asked for. `resolve()`'s model rewrite is applied to whichever body that is, so an
+            // alias still becomes the upstream's own model id on the Anthropic path too.
+            //
+            // The translating cell also sends **no query string**. Claude Code asks for
+            // `POST /v1/messages?beta=true`; relaying that verbatim would hand a strict OpenAI
+            // upstream `/v1/chat/completions?beta=true`, a parameter that means nothing on the
+            // endpoint it is now attached to. llama.cpp ignores it, but it is an Anthropic-side
+            // concern and does not survive the rewrite. Every other cell is a byte relay and keeps
+            // the client's query untouched.
+            let (out_bytes, out_path, out_query) = match &cell {
+                Cell::Translate(_) => (
+                    translated.as_ref().unwrap_or(&bytes),
+                    upstream_path(&path),
+                    None,
+                ),
+                Cell::Relay => (&bytes, path.as_str(), query.as_deref()),
+            };
+
+            // A body that is not a JSON object has no `model` to rewrite — a multipart
+            // `/v1/audio/transcriptions` upload, an empty `POST /health`, a llama.cpp-native
+            // `POST /tokenize`. LocalRouter forwarded those verbatim and let the upstream judge
+            // them, and `05-proxy.md` §15 item 11 ("pass upstream status codes and bodies
+            // through unchanged") means we must not invent a 400 the upstream would not have
+            // sent. So a failed rewrite degrades to a byte-verbatim relay, never to an error.
+            let body_plan =
+                plan_body(out_bytes, plan.rewrite_model_to.as_deref()).unwrap_or_else(|_| {
+                    tracing::debug!(
+                        path = %path,
+                        "body is not a JSON object; relaying verbatim without a model rewrite"
+                    );
+                    crate::relay::BodyPlan::Passthrough(out_bytes.clone())
+                });
+
+            // Outbound headers are CONSTRUCTED: the inbound map is never cloned, so a client's
+            // `Authorization` — or an Anthropic client's `x-api-key` — cannot reach a third party.
+            let cred = credential_for(&meta.credential).await;
+            let mut out_headers = outbound_headers(&headers, cred.as_ref(), &[]);
+            if !out_headers.contains_key("x-request-id") {
+                set(&mut out_headers, "x-request-id", &id.to_string());
+            }
+
+            // `attempt` CONSUMES this `PreFlight`, and a retry has to build a new one against
+            // the next candidate. "Never retry after the first byte" is therefore unrepresentable
+            // here rather than merely documented — and the breaker bookkeeping lives inside
+            // `attempt`, so this loop never double-counts an outcome.
+            let pre = PreFlight {
+                candidate: cand,
+                http: &r.http,
+                method: method.clone(),
+                url: upstream_url(&meta.base_url, out_path, out_query),
+                headers: out_headers,
+                body: body_plan,
+                deadline,
+                cfg: &cfg.router,
+                retry: policy,
+                guard,
+            };
+
+            match attempt(pre).await {
+                Ok(committed) => {
+                    let protocol = meta.protocol;
+                    let mut answered = relay(
+                        r.clone(),
+                        committed,
+                        draft,
+                        pk.stream,
+                        cfg.router.log_usage,
+                        protocol,
+                        cell,
+                    )
+                    .await;
+                    mark_warm(&mut answered, warmed);
+                    return answered;
+                }
+                Err(why) => {
+                    // The guard moved into the `PreFlight` and was dropped there: its permits are
+                    // back, and because it was never armed no `aborted` record was emitted for an
+                    // attempt the client never saw.
+                    last = Some(why);
+                    continue;
+                }
+            }
         }
 
-        // What actually goes on the wire. The translating cell sends R-10's rewritten body to
-        // `/v1/chat/completions`; every other cell sends the client's own bytes to the path it
-        // asked for. `resolve()`'s model rewrite is applied to whichever body that is, so an
-        // alias still becomes the upstream's own model id on the Anthropic path too.
-        //
-        // The translating cell also sends **no query string**. Claude Code asks for
-        // `POST /v1/messages?beta=true`; relaying that verbatim would hand a strict OpenAI
-        // upstream `/v1/chat/completions?beta=true`, a parameter that means nothing on the
-        // endpoint it is now attached to. llama.cpp ignores it, but it is an Anthropic-side
-        // concern and does not survive the rewrite. Every other cell is a byte relay and keeps
-        // the client's query untouched.
-        let (out_bytes, out_path, out_query) = match &cell {
-            Cell::Translate(_) => (
-                translated.as_ref().unwrap_or(&bytes),
-                upstream_path(&path),
-                None,
+        // ---- nothing worked -----------------------------------------------------------------------------
+        // `last == None` means every candidate was **skipped** — nothing was even attempted. On a
+        // warming alias that is the sequential-swap gap arriving a few nanoseconds later than
+        // `resolve()`'s own health read: the drain flipped `accepting` between the two loads.
+        // Rare, but "zero 5xx" is the acceptance bar, and this is the only hole left in it.
+        if last.is_none() {
+            if let Some(alias) = plan.alias.clone() {
+                match park_on(&r, &alias, &park, plan.reason, &mut parked_once).await {
+                    Parking::Retry { depth, waited_ms } => {
+                        warmed = Some((depth, waited_ms));
+                        continue 'dispatch;
+                    }
+                    Parking::Refused(resp) => return stamp(resp, draft.stamp_failed()),
+                    Parking::NotWarming => {}
+                }
+            }
+        }
+
+        let (status, kind, msg) = match &last {
+            Some(Retryable::Timeout) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                "no upstream produced response headers in time".to_owned(),
             ),
-            Cell::Relay => (&bytes, path.as_str(), query.as_deref()),
-        };
-
-        // A body that is not a JSON object has no `model` to rewrite — a multipart
-        // `/v1/audio/transcriptions` upload, an empty `POST /health`, a llama.cpp-native
-        // `POST /tokenize`. LocalRouter forwarded those verbatim and let the upstream judge
-        // them, and `05-proxy.md` §15 item 11 ("pass upstream status codes and bodies
-        // through unchanged") means we must not invent a 400 the upstream would not have
-        // sent. So a failed rewrite degrades to a byte-verbatim relay, never to an error.
-        let body_plan =
-            plan_body(out_bytes, plan.rewrite_model_to.as_deref()).unwrap_or_else(|_| {
-                tracing::debug!(
-                    path = %path,
-                    "body is not a JSON object; relaying verbatim without a model rewrite"
-                );
-                crate::relay::BodyPlan::Passthrough(out_bytes.clone())
-            });
-
-        // Outbound headers are CONSTRUCTED: the inbound map is never cloned, so a client's
-        // `Authorization` — or an Anthropic client's `x-api-key` — cannot reach a third party.
-        let cred = credential_for(&meta.credential).await;
-        let mut out_headers = outbound_headers(&headers, cred.as_ref(), &[]);
-        if !out_headers.contains_key("x-request-id") {
-            set(&mut out_headers, "x-request-id", &id.to_string());
-        }
-
-        // `attempt` CONSUMES this `PreFlight`, and a retry has to build a new one against
-        // the next candidate. "Never retry after the first byte" is therefore unrepresentable
-        // here rather than merely documented — and the breaker bookkeeping lives inside
-        // `attempt`, so this loop never double-counts an outcome.
-        let pre = PreFlight {
-            candidate: cand,
-            http: &r.http,
-            method: method.clone(),
-            url: upstream_url(&meta.base_url, out_path, out_query),
-            headers: out_headers,
-            body: body_plan,
-            deadline,
-            cfg: &cfg.router,
-            retry: policy,
-            guard,
-        };
-
-        match attempt(pre).await {
-            Ok(committed) => {
-                let protocol = meta.protocol;
-                return relay(
-                    r.clone(),
-                    committed,
-                    draft,
-                    pk.stream,
-                    cfg.router.log_usage,
-                    protocol,
-                    cell,
-                )
-                .await;
+            Some(Retryable::Connect(e)) => {
+                (StatusCode::BAD_GATEWAY, "upstream_unavailable", e.clone())
             }
-            Err(why) => {
-                // The guard moved into the `PreFlight` and was dropped there: its permits are
-                // back, and because it was never armed no `aborted` record was emitted for an
-                // attempt the client never saw.
-                last = Some(why);
-                continue;
-            }
+            Some(Retryable::Status { code, .. }) => (
+                StatusCode::BAD_GATEWAY,
+                "upstream_unavailable",
+                format!("every upstream attempt failed; the last returned {code}"),
+            ),
+            None => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_healthy_backend",
+                "every candidate was skipped: breaker open, draining or disabled".to_owned(),
+            ),
+        };
+        return stamp(
+            error_response(ingress, status, kind, &msg),
+            draft.stamp_failed(),
+        );
+    }
+}
+
+// ==========================================================================================
+// the warm queue — ARCHITECTURE.md §4.7
+// ==========================================================================================
+
+/// What parking behind a sequential swap decided.
+enum Parking {
+    /// The alias is armed again. Re-resolve and dispatch — it points somewhere new.
+    Retry {
+        /// The queue depth this request saw, for `X-ApexRouter-Warm`.
+        depth: u32,
+        /// How long it waited.
+        waited_ms: u32,
+    },
+    /// The client gets this `503` instead. It already carries `Retry-After`.
+    Refused(Response),
+    /// Nothing is warming on this alias, or this request has already parked once. The
+    /// caller's own failure stands, unchanged.
+    NotWarming,
+}
+
+/// The scalars a parked request needs to leave an honest record behind.
+///
+/// Borrowed from the handler's own locals rather than cloned: a request that never parks —
+/// which is nearly all of them — must not pay two `String` clones for a queue it never
+/// touched.
+struct ParkCtx<'a> {
+    id: RequestId,
+    started: Instant,
+    started_unix: i64,
+    ingress: Protocol,
+    method: &'a Method,
+    path: &'a str,
+}
+
+impl ParkCtx<'_> {
+    /// The header set for a `503` raised while parked: the alias is known, no backend is.
+    fn stamp<'b>(&'b self, alias: &'b Alias) -> Stamp<'b> {
+        Stamp {
+            id: &self.id,
+            alias: Some(alias),
+            reason: None,
+            backend: None,
+            attempts: 0,
+            fallback: false,
+            ingress: self.ingress,
+            upstream: None,
         }
     }
 
-    // ---- nothing worked -----------------------------------------------------------------------------
-    let (status, kind, msg) = match &last {
-        Some(Retryable::Timeout) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            "upstream_timeout",
-            "no upstream produced response headers in time".to_owned(),
-        ),
-        Some(Retryable::Connect(e)) => (StatusCode::BAD_GATEWAY, "upstream_unavailable", e.clone()),
-        Some(Retryable::Status { code, .. }) => (
-            StatusCode::BAD_GATEWAY,
-            "upstream_unavailable",
-            format!("every upstream attempt failed; the last returned {code}"),
-        ),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no_healthy_backend",
-            "every candidate was skipped: breaker open, draining or disabled".to_owned(),
-        ),
+    /// The record a client that hangs up **while parked** leaves behind.
+    ///
+    /// `ARCHITECTURE.md` §4.3 is unconditional: a request the client abandoned produces a
+    /// `RequestFinished { aborted: true }`. A parked request holds no permit and no
+    /// `InFlightGuard` — it never reached a backend — so without this it would be the one
+    /// abandonment in the product that vanished silently.
+    fn abandoned(&self, alias: &Alias, reason: RouteReason) -> RequestRecord {
+        RequestRecord {
+            id: self.id,
+            started_unix: self.started_unix,
+            alias: Some(alias.clone()),
+            backend: None,
+            upstream_model: None,
+            route_reason: reason,
+            ingress: self.ingress,
+            method: self.method.to_string(),
+            path: self.path.to_owned(),
+            // nginx's "client closed request", exactly as `Outcome::abandoned` uses it.
+            status: 499,
+            attempts: 0,
+            streamed: false,
+            aborted: true,
+            ttft_ms: None,
+            // Filled in by `ParkedAbort::drop`, which is the only thing that knows how long
+            // the client actually waited before it gave up.
+            total_ms: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_tokens: None,
+            tok_per_s: None,
+            cost: CostEstimate::Unknown,
+            error: Some("client disconnected while parked behind a swap".to_owned()),
+        }
+    }
+}
+
+/// Broadcasts `RequestFinished { aborted: true }` if this future is dropped while parked.
+///
+/// The same shape as [`crate::limits::InFlightGuard`]'s abort path and for the same reason: a
+/// client Ctrl-C must not leave a zombie row in either GUI. `disarm` is how a park that ended
+/// on its own terms says nothing happened.
+struct ParkedAbort {
+    events: broadcast::Sender<Event>,
+    started: Instant,
+    record: Option<RequestRecord>,
+}
+
+impl ParkedAbort {
+    /// The park ended normally; there is nothing to report.
+    fn disarm(mut self) {
+        self.record = None;
+    }
+}
+
+impl Drop for ParkedAbort {
+    fn drop(&mut self) {
+        let Some(mut rec) = self.record.take() else {
+            return;
+        };
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        rec.total_ms = millis(self.started.elapsed());
+        let _ = self.events.send(Event::RequestFinished {
+            record: Box::new(rec),
+        });
+    }
+}
+
+/// Which rule sent this request at `alias`, for the record a park may have to seal.
+///
+/// The resolver's error does not carry it, and inventing `Alias` for a client that named
+/// nothing would be a small lie in a row an operator reads. The client either spelled the
+/// alias out — rule 1 — or landed there through the default, which is rule 5.
+fn park_reason(model: Option<&str>, alias: &Alias) -> RouteReason {
+    match model {
+        Some(m) if m == alias.as_str() => RouteReason::Alias,
+        _ => RouteReason::LegacyModelName,
+    }
+}
+
+/// Park this request behind a sequential swap, per `ARCHITECTURE.md` §4.7.
+///
+/// Returns [`Parking::NotWarming`] — instantly, and having touched nothing — unless a swap
+/// has an open [`crate::WarmWindow`] on this exact alias. Parking is a promise that something
+/// is coming back, and a promise nobody is keeping is just a slower `503`.
+///
+/// The three exits §4.7 names:
+///
+/// * the window closes → [`Parking::Retry`], and the caller re-resolves against the
+///   replacement;
+/// * `warm_queue_max` is already parked → `503` + `Retry-After`, **immediately**, because
+///   deepening a queue that is already the wrong answer only moves the failure later;
+/// * `warm_timeout` expires → `503` + `Retry-After`.
+///
+/// And the fourth exit, which is the client's: dropping this future decrements the queue
+/// depth and emits the `aborted` record, both from `Drop`.
+async fn park_on(
+    r: &Router,
+    alias: &Alias,
+    ctx: &ParkCtx<'_>,
+    reason: RouteReason,
+    once: &mut bool,
+) -> Parking {
+    if *once {
+        return Parking::NotWarming;
+    }
+    let Some(slot) = r.warm().parking_for(alias) else {
+        return Parking::NotWarming;
     };
-    stamp(
-        error_response(ingress, status, kind, &msg),
-        draft.stamp_failed(),
-    )
+    *once = true;
+
+    // The row both GUIs show while this request waits. Re-sent on the dispatch that follows,
+    // which is a Map upsert on the other end, not a duplicate.
+    if r.events.receiver_count() > 0 {
+        let _ = r.events.send(Event::RequestStarted {
+            id: ctx.id,
+            alias: Some(alias.clone()),
+            backend: None,
+        });
+    }
+
+    let abort = ParkedAbort {
+        events: r.events.clone(),
+        started: ctx.started,
+        record: Some(ctx.abandoned(alias, reason)),
+    };
+    let outcome = slot.park().await;
+    abort.disarm();
+
+    match outcome {
+        Parked::Rearmed { waited_ms, depth } => {
+            tracing::debug!(alias = %alias, waited_ms, depth, "parked request released by a swap");
+            Parking::Retry { depth, waited_ms }
+        }
+        Parked::Overflow {
+            depth,
+            max,
+            retry_after_secs,
+        } => Parking::Refused(warm_refusal(
+            ctx.ingress,
+            "warm_queue_full",
+            &format!(
+                "{alias} is warming and its parking queue is full ({depth} of {max} parked); \
+                 retry in {retry_after_secs}s"
+            ),
+            retry_after_secs,
+        )),
+        Parked::TimedOut {
+            waited_ms,
+            retry_after_secs,
+        } => Parking::Refused(warm_refusal(
+            ctx.ingress,
+            "warm_timeout",
+            &format!(
+                "{alias} was still warming after {waited_ms} ms, which is the whole budget the \
+                 replacement had to start in; retry in {retry_after_secs}s"
+            ),
+            retry_after_secs,
+        )),
+    }
+}
+
+/// A `503` in the dialect the client speaks, carrying `Retry-After`.
+fn warm_refusal(ingress: Protocol, kind: &str, msg: &str, retry_after_secs: u32) -> Response {
+    let mut resp = error_response(ingress, StatusCode::SERVICE_UNAVAILABLE, kind, msg);
+    set(
+        resp.headers_mut(),
+        "retry-after",
+        &retry_after_secs.to_string(),
+    );
+    resp
+}
+
+/// Mark a response that was served *through* a swap, so the park is observable rather than
+/// merely invisible. Absent on every request that did not park.
+fn mark_warm(resp: &mut Response, warmed: Option<(u32, u32)>) {
+    if let Some((depth, waited_ms)) = warmed {
+        set(
+            resp.headers_mut(),
+            "x-apexrouter-warm",
+            &format!("parked={depth},waited_ms={waited_ms}"),
+        );
+    }
 }
 
 // ==========================================================================================
@@ -2201,13 +2520,24 @@ mod tests {
     async fn tools_with_the_flag_off_are_refused_loudly_and_never_stripped() {
         // The failure mode this prevents: an agent asks for tools, the proxy quietly drops
         // them, and the model answers in prose as if it had none.
+        //
+        // `anthropic_tools` now defaults to **true** (CHARTER 2026-07-31), so "off" has to
+        // be said out loud here. The refusal itself is unchanged and is still the whole
+        // point: an operator who turns translation off gets a `400` naming the key, never
+        // silence.
         let up = MockServer::start().await;
         Mock::given(m_method("POST"))
             .respond_with(ResponseTemplate::new(500))
             .expect(0)
             .mount(&up)
             .await;
-        let app = proxy_router(openai_upstream_at(&up));
+        let mut cfg = test_config();
+        cfg.router.anthropic_tools = false;
+        let app = proxy_router(router_of(
+            cfg,
+            vec![backend("up-a", &up.uri())],
+            vec![route("auto", vec!["up-a"])],
+        ));
 
         let resp = call(
             &app,
@@ -2229,6 +2559,50 @@ mod tests {
                 .unwrap_or_default()
                 .contains("anthropic_tools"),
             "the message must name the config key: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stock_config_translates_tools_because_claude_code_always_sends_them() {
+        // CHARTER 2026-07-31: `anthropic_tools` defaults to **true**. Real Claude Code sends
+        // 92 tool definitions on every request, so an off-by-default flag made this endpoint
+        // a `400` on request one for the one client the Anthropic ingress exists to serve.
+        // The guard is the *default* config — no knob touched anywhere in this test.
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(OPENAI_REPLY.to_vec(), "application/json"),
+            )
+            .expect(1)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let resp = call(
+            &app,
+            anthropic_post(
+                r#"{"model":"auto","max_tokens":64,
+                    "messages":[{"role":"user","content":"weather?"}],
+                    "tools":[{"name":"get_weather","description":"w",
+                              "input_schema":{"type":"object",
+                                              "properties":{"city":{"type":"string"}}}}]}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK, "a stock config must not 400");
+
+        // …and the tool actually crossed the boundary in OpenAI spelling, rather than being
+        // accepted and quietly dropped — which is the other way this could "pass".
+        let seen = up.received_requests().await.expect("recording");
+        assert_eq!(seen.len(), 1);
+        let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
+        assert_eq!(sent["tools"][0]["type"], "function");
+        assert_eq!(sent["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            sent["tools"][0]["function"]["parameters"]["properties"]["city"]["type"], "string",
+            "input_schema becomes parameters, whole: {sent}"
         );
     }
 
@@ -3468,5 +3842,218 @@ mod tests {
             matches!(be.breaker.check(), BreakerDecision::Allow),
             "a successful probe must close the breaker"
         );
+    }
+
+    // ---- the warm queue, ARCHITECTURE.md §4.7 ---------------------------------------------------
+
+    /// The drain a sequential swap performs, without a swap: `accepting = false` is exactly
+    /// what makes `resolve()` answer `NoHealthy` and the old code answer `503`.
+    fn drain(r: &Router, id: &str) {
+        r.registry()
+            .get(&BackendId::parse(id).expect("id"))
+            .expect("live")
+            .accepting
+            .store(false, Ordering::Release);
+    }
+
+    /// The re-arm a sequential swap performs when B is up and the alias is re-pointed.
+    fn rearm(r: &Router, id: &str) {
+        r.registry()
+            .get(&BackendId::parse(id).expect("id"))
+            .expect("live")
+            .accepting
+            .store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn a_request_that_arrives_mid_swap_parks_instead_of_answering_503() {
+        // THE defect, at the level of the request path: with the alias's only backend drained
+        // and no warm window, this request is a `503`. With one, it waits and is served.
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(b"{}".to_vec(), "application/json"),
+            )
+            .mount(&up)
+            .await;
+        let r = router_with(
+            vec![backend("up-a", &up.uri())],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let auto = Alias::parse("auto").expect("alias");
+
+        // Without a window: the measured failure.
+        drain(&r, "up-a");
+        let bare = call(&proxy_router(r.clone()), post_chat(r#"{"model":"auto"}"#)).await;
+        assert_eq!(
+            bare.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the pre-fix behaviour, so the fix below is measured against something"
+        );
+
+        // With one: the swap opens it before it drains, and closes it once the alias can
+        // serve again.
+        let window = r.warm().open(&auto, Duration::from_secs(10), 32);
+        let swap = tokio::spawn({
+            let r = r.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                rearm(&r, "up-a");
+                window.close()
+            }
+        });
+
+        let resp = call(&proxy_router(r.clone()), post_chat(r#"{"model":"auto"}"#)).await;
+        let peak = swap.await.expect("swap task");
+
+        assert_eq!(resp.status(), StatusCode::OK, "parked, then served");
+        assert_eq!(header(&resp, "x-apexrouter-backend"), Some("up-a"));
+        let warm = header(&resp, "x-apexrouter-warm").expect("the park is observable");
+        assert!(warm.starts_with("parked=1,waited_ms="), "{warm}");
+        assert_eq!(peak, 1, "and it is the number SwapReport::parked carries");
+    }
+
+    #[tokio::test]
+    async fn a_full_warm_queue_answers_503_with_a_retry_after() {
+        let r = router_with(
+            vec![backend("up-a", "http://127.0.0.1:1")],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let auto = Alias::parse("auto").expect("alias");
+        drain(&r, "up-a");
+        let window = r.warm().open(&auto, Duration::from_secs(10), 1);
+
+        // One request occupies the whole one-deep queue.
+        let app = proxy_router(r.clone());
+        let held = tokio::spawn({
+            let app = app.clone();
+            async move { call(&app, post_chat(r#"{"model":"auto"}"#)).await.status() }
+        });
+        let slot = r.warm().parking_for(&auto).expect("open");
+        while slot.parked() < 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // The next one overflows, and is refused at once rather than deepening the queue.
+        let resp = call(&app, post_chat(r#"{"model":"auto"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_after = header(&resp, "retry-after").expect("Retry-After is not optional");
+        assert!(
+            retry_after.parse::<u32>().map(|n| n >= 1).unwrap_or(false),
+            "Retry-After must be a usable number of seconds: {retry_after}"
+        );
+        assert_eq!(header(&resp, "x-apexrouter-route"), Some("auto|-"));
+        let body = body_to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("OpenAI-shaped");
+        assert_eq!(json["error"]["code"], "warm_queue_full", "{json}");
+
+        window.close();
+        let _ = held.await;
+    }
+
+    #[tokio::test]
+    async fn a_warm_window_that_expires_answers_503_with_a_retry_after() {
+        let r = router_with(
+            vec![backend("up-a", "http://127.0.0.1:1")],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let auto = Alias::parse("auto").expect("alias");
+        drain(&r, "up-a");
+        // A window narrower than the launch it was opened for: §4.7's "arithmetic guarantee
+        // of failure", which the caller's `warm_timeout` exists to prevent and which the
+        // request path still has to answer honestly when it happens.
+        let _window = r.warm().open(&auto, Duration::from_millis(80), 32);
+
+        let resp = call(&proxy_router(r.clone()), post_chat(r#"{"model":"auto"}"#)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(header(&resp, "retry-after").is_some());
+        let body = body_to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("OpenAI-shaped");
+        assert_eq!(json["error"]["code"], "warm_timeout", "{json}");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_gives_up_while_parked_still_produces_an_aborted_record() {
+        // `ARCHITECTURE.md` §4.3 is unconditional, and a parked request holds no
+        // `InFlightGuard` to carry it — so without `ParkedAbort` this is the one abandonment
+        // in the product that disappears.
+        let r = router_with(
+            vec![backend("up-a", "http://127.0.0.1:1")],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let auto = Alias::parse("auto").expect("alias");
+        drain(&r, "up-a");
+        let _window = r.warm().open(&auto, Duration::from_secs(10), 32);
+        let mut rx = r.events.subscribe();
+
+        let app = proxy_router(r.clone());
+        let client =
+            tokio::spawn(async move { call(&app, post_chat(r#"{"model":"auto"}"#)).await });
+        let slot = r.warm().parking_for(&auto).expect("open");
+        while slot.parked() < 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // Ctrl-C: the handler future is dropped where it stands.
+        client.abort();
+        let _ = client.await;
+        while slot.parked() > 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        let mut aborted = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::RequestFinished { record } = ev {
+                aborted = Some(record);
+            }
+        }
+        let rec = aborted.expect("a parked client that vanished must still land in the ring");
+        assert!(rec.aborted, "{rec:?}");
+        assert_eq!(rec.status, 499);
+        assert_eq!(rec.alias.as_ref().map(Alias::as_str), Some("auto"));
+        assert_eq!(rec.backend, None, "it never reached one");
+        assert!(rec.total_ms > 0, "the wait is recorded, not zeroed");
+        assert_eq!(slot.parked(), 0, "and its place in the queue came back");
+    }
+
+    #[tokio::test]
+    async fn a_request_parks_at_most_once() {
+        // A swap that failed, and a second swap that starts straight after it, must not hold
+        // one client across both `warm_timeout`s and then answer `503` anyway.
+        let r = router_with(
+            vec![backend("up-a", "http://127.0.0.1:1")],
+            vec![route("auto", vec!["up-a"])],
+        );
+        let auto = Alias::parse("auto").expect("alias");
+        drain(&r, "up-a");
+        let first = r.warm().open(&auto, Duration::from_secs(10), 32);
+
+        let app = proxy_router(r.clone());
+        let pending = tokio::spawn({
+            let app = app.clone();
+            async move { call(&app, post_chat(r#"{"model":"auto"}"#)).await.status() }
+        });
+        let slot = r.warm().parking_for(&auto).expect("open");
+        while slot.parked() < 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // The rollback that could not restart A: the window closes with the backend still
+        // drained, and a second swap opens its own window in the same breath. A request
+        // willing to park twice would vanish into this one.
+        first.close();
+        let _second = r.warm().open(&auto, Duration::from_secs(10), 32);
+
+        let status = pending.await.expect("request task");
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "one park, then the honest failure"
+        );
+        assert_eq!(slot.parked(), 0, "and it is not still sitting in the queue");
     }
 }

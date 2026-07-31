@@ -127,9 +127,12 @@ Caveats that will bite, in the order they bite:
 
 - **`max_tokens` is required** (the Anthropic API requires it). Omit it and you get a `400` with
   an **Anthropic-shaped** body, because an Anthropic SDK will parse the error as one.
-- **Tools are refused, loudly, by default.** `[router] anthropic_tools = false` means a
-  `/v1/messages` body carrying `tools` gets a `400` naming the config key rather than a silently
-  tool-less answer. Turn it on knowing it is the imperfect part (`ARCHITECTURE.md` §12).
+- **Tools work out of the box, and are best-effort.** `[router] anthropic_tools` defaults to
+  **`true`**, because Claude Code sends 92 tool definitions on every request and refusing them made
+  the ingress useless for its main client. Translation is the imperfect part
+  (`ARCHITECTURE.md` §12): parallel tool calls, some `tool_choice` variants and a block-array
+  `tool_result` may not survive. Set it **explicitly to `false`** and a `/v1/messages` body carrying
+  `tools` gets a `400` naming the config key, rather than a silently tool-less answer.
 - **`thinking` blocks and `/v1/messages/count_tokens` are `501`.** Deliberate: there is no honest
   OpenAI-side equivalent, and a fabricated token count is worse than an error you can fall back
   from.

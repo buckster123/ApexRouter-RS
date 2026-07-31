@@ -156,6 +156,23 @@ llama-server **8100+**, Vast tunnel **8800+**.
   `Content-Type: text/plain` is a CORS *simple request* — delivered without preflight, and the
   attacker never needs to read the response. Hence the `Host` + `Origin` + `Sec-Fetch-Site`
   mutation gate on **both** listeners, and no `CorsLayer` anywhere.
+- **Never re-plan to describe something that already happened.** `GET /v1/endpoints/{id}/argv`
+  called `supervisor.plan(&spec)` and so re-solved `fit()` against *currently* free VRAM: it served
+  34 tokens where `/proc/<pid>/cmdline` had 36, describing a CPU-only launch for a fully-offloaded
+  child, with `warnings` empty. A preview of a running process is rendered from its **record**
+  (`ResolvedSpec::from_record` — the draft plus the record's `fit`, at the leased port, against the
+  build the record names). And when you test it, compare against `/proc/<pid>/cmdline`, not against
+  the other preview: with a daemon up, both routes are the same code and their agreement proves
+  nothing.
+- **`health_deadline_ms` is not how long a launch may take — it is how long it may make *no
+  progress*.** The gate resets it on every `503 {"status":"loading model"}`, so a 12 s load passes a
+  1 s deadline and the real start budget is unbounded while a load is progressing. Anything that
+  waits *on* the gate must therefore share the gate's liveness signal, or it will be less patient
+  than the thing it is waiting for. A warm window read as a stopwatch `503`'d 4 parked requests at
+  2977 ms of a 12,038 ms swap and the alias then answered **74,550** requests with
+  `no_healthy_backend`. The signal that works is **the launch future still being pending**, sampled
+  on `health_interval_ms`; `Event::BootProgress` does *not* work, because it fires once per
+  transition and never per tick.
 
 ## Workflow
 

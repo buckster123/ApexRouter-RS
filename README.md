@@ -185,7 +185,7 @@ cp -r skills/apexrouter ~/.claude/skills/        # Claude Code (user-level)
 | Surface | For | How |
 |---|---|---|
 | **OpenAI proxy** | every SDK, agent and script | `http://127.0.0.1:8888/v1` — `chat/completions`, `completions`, `embeddings`, `rerank`, aggregated `models` |
-| **Anthropic ingress** | Claude Code and friends | `POST /v1/messages` on the same port; translated both ways against an OpenAI upstream, relayed verbatim against an Anthropic one |
+| **Anthropic ingress** | Claude Code and friends | `POST /v1/messages` on the same port; translated both ways against an OpenAI upstream, relayed verbatim against an Anthropic one. Tool translation is **on by default** and best-effort — Claude Code sends 92 tool definitions on every request, so opt-in would have meant "does not work" |
 | **Control REST + WS** | UIs, automation, ApexOS | `http://127.0.0.1:2739/v1/…` + `/ws` (snapshot on connect, deltas after) |
 | **Web UI** | humans, no install | served from the control port — three files, no npm, no CDN, no build step |
 | **Native app** | desktop & kiosk | `apexrouter-ui` (Slint) — a client of the same API, separate GPL binary |
@@ -237,7 +237,7 @@ with LocalRouter's proxy, so existing scripts keep working unchanged.
 | State (facts, ledger, usage, logs) | `$APEXROUTER_HOME` or `~/.local/state/apexrouter/` |
 | Cache (HF metadata, probes, offers) | `~/.cache/apexrouter/` |
 | Proxy / control ports | `[server] proxy_bind` = `127.0.0.1:8888`, `control_bind` = `127.0.0.1:2739` |
-| Control URL, for clients | the lock file's owner record, or `$APEXROUTER_URL` |
+| Control URL, for clients | the lock file's owner record (CLI, MCP), or `[server] control_bind` (native app), always overridden by `$APEXROUTER_URL` |
 | Bearer token (non-loopback only) | the var named by `[server] token_env`, default `APEXROUTER_TOKEN` |
 | vast.ai key | `~/.config/vastai/vast_api_key` (read, never copied) |
 | HuggingFace token | `~/.cache/huggingface/token` |

@@ -16,6 +16,25 @@
 //! lines a human wrote. A field that has become `None` is removed, an entry that has been
 //! deleted is dropped, a new entry is appended. Everything else on disk is left alone.
 //!
+//! # One entry per id, enforced on both sides of the file
+//!
+//! An id is the handle every other surface uses — `recipe show`, `recipe rm`, a
+//! `RecipeKind::Vast`'s `profile` reference — so two entries sharing one is not a cosmetic
+//! problem: `recipe show` answers with whichever came first and `recipe ls` shows the id
+//! twice. Migration used to be able to produce exactly that, importing `local-qwen35-9b`
+//! from `~/.vastai-gguf/local_instances/` and again from LocalRouter's `recipes.toml`.
+//!
+//! Uniqueness is therefore enforced at both ends of this module, and **nothing is ever
+//! dropped to achieve it**:
+//!
+//! * [`read_file`] renames a repeat id rather than discarding the entry — `local-qwen35-9b`,
+//!   then `local-qwen35-9b-2` — and says so at `warn`. A catalog that a previous build wrote
+//!   with duplicates in it therefore heals on the next read, with both definitions still
+//!   reachable.
+//! * [`write_file`] refuses a `Catalog` that carries a repeat id at all. That can only come
+//!   from a caller that built one in memory, which is a bug in the caller, not a state of
+//!   the world — so it is an [`Error::Invalid`], not a silent repair.
+//!
 //! # Locking
 //!
 //! `catalog.toml` is `$STATE`, so every public function here goes through the same
@@ -94,6 +113,12 @@ pub fn save(paths: &Paths, c: &Catalog) -> Result<()> {
 /// — gets a fresh id derived from the label and made unique against the catalog.
 /// `created_at_unix` survives an update; `updated_at_unix` is stamped on every write.
 ///
+/// **It is an upsert, not an append.** Afterwards there is exactly one entry with the
+/// returned id, and it holds what was passed in. That was not true of a `catalog.toml` a
+/// previous build had already written a repeat id into: [`read_file`] renames the repeat as
+/// it loads, so the second definition survives under a suffixed id instead of shadowing this
+/// one, and [`write_file`] would refuse the write outright if a repeat somehow reached it.
+///
 /// # Errors
 /// Anything the read-modify-write can fail with.
 pub fn upsert_recipe(paths: &Paths, r: Recipe) -> Result<Recipe> {
@@ -109,6 +134,18 @@ pub fn upsert_recipe(paths: &Paths, r: Recipe) -> Result<Recipe> {
                 updated.created_at_unix = first_seen(c.recipes[i].created_at_unix, now);
                 updated.updated_at_unix = now;
                 c.recipes[i] = updated.clone();
+                // Belt and braces: `read_file` cannot hand us a repeat, and a repeat that
+                // reached the file anyway must not survive an explicit upsert of that id.
+                let mut kept = false;
+                c.recipes.retain(|x| {
+                    if x.id == updated.id {
+                        let first = !kept;
+                        kept = true;
+                        first
+                    } else {
+                        true
+                    }
+                });
                 updated
             }
             None => {
@@ -550,14 +587,90 @@ fn read_file(path: &Path) -> Result<Catalog> {
         }
     };
     let file: CatalogFile = toml::from_str(&text)?;
-    Ok(Catalog {
+    let mut c = Catalog {
         recipes: file.recipes,
         profiles: file.profiles,
-    })
+    };
+    heal_duplicate_ids(&mut c, path);
+    Ok(c)
+}
+
+/// Give a repeat id a fresh one, in memory, and say so at `warn`.
+///
+/// **Renaming, not dropping.** A file that already holds `local-qwen35-9b` twice — a real
+/// possibility on a machine migrated by an earlier build — has two *different* definitions in
+/// it, and picking one silently is the defect this exists to end. After this, `recipe show`
+/// is unambiguous, `recipe ls` shows both, and the next write puts the repaired ids on disk.
+fn heal_duplicate_ids(c: &mut Catalog, path: &Path) {
+    let mut taken: Vec<String> = Vec::with_capacity(c.recipes.len());
+    for r in &mut c.recipes {
+        if taken.iter().any(|t| t == r.id.as_str()) {
+            let refs: Vec<&str> = taken.iter().map(String::as_str).collect();
+            let fresh: RecipeId = unique_id(r.id.as_str(), "recipe", &refs, RecipeId::parse);
+            tracing::warn!(
+                file = %path.display(),
+                id = %r.id,
+                renamed_to = %fresh,
+                "catalog.toml holds two recipes with the same id; the second was renamed on \
+                 read so neither definition is lost and `recipe show` is unambiguous"
+            );
+            r.id = fresh;
+        }
+        taken.push(r.id.to_string());
+    }
+
+    let mut taken: Vec<String> = Vec::with_capacity(c.profiles.len());
+    for p in &mut c.profiles {
+        if taken.iter().any(|t| t == p.id.as_str()) {
+            let refs: Vec<&str> = taken.iter().map(String::as_str).collect();
+            let fresh: ProfileId = unique_id(p.id.as_str(), "profile", &refs, ProfileId::parse);
+            tracing::warn!(
+                file = %path.display(),
+                id = %p.id,
+                renamed_to = %fresh,
+                "catalog.toml holds two search profiles with the same id; the second was \
+                 renamed on read. A recipe referencing it still resolves to the first."
+            );
+            p.id = fresh;
+        }
+        taken.push(p.id.to_string());
+    }
+}
+
+/// The first id that appears twice, if any.
+fn first_repeat<'a>(ids: impl Iterator<Item = &'a str>) -> Option<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for id in ids {
+        if seen.contains(&id) {
+            return Some(id.to_owned());
+        }
+        seen.push(id);
+    }
+    None
 }
 
 /// [`save`] without the lock, for callers that already hold it.
 fn write_file(store: &Store, path: &Path, c: &Catalog) -> Result<()> {
+    // Uniqueness is a property of the file, so it is checked before the file is touched.
+    // `merge_list` keys entries on their id: two entries sharing one would render as two
+    // `[[recipes]]` tables that every reader afterwards disagrees about.
+    if let Some(id) = first_repeat(c.recipes.iter().map(|r| r.id.as_str())) {
+        return Err(Error::Invalid {
+            what: format!("catalog file {}", path.display()),
+            why: format!(
+                "two recipes carry the id `{id}`; an id is how every other surface names a \
+                 recipe, so writing both would make `recipe show {id}` a coin toss. Merge \
+                 them or give one a different label."
+            ),
+        });
+    }
+    if let Some(id) = first_repeat(c.profiles.iter().map(|p| p.id.as_str())) {
+        return Err(Error::Invalid {
+            what: format!("catalog file {}", path.display()),
+            why: format!("two search profiles carry the id `{id}`"),
+        });
+    }
+
     let base_text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -1637,6 +1750,111 @@ mod tests {
             remove_profile(&paths, &p.id),
             Err(Error::NotFound(_))
         ));
+    }
+
+    // -- D3: one entry per id -------------------------------------------------------------
+
+    /// `upsert` means upsert. Twice with the same id leaves one entry holding the second
+    /// version — not two entries with `recipe show` picking whichever came first.
+    #[test]
+    fn upsert_replaces_the_entry_rather_than_appending_a_second_one() {
+        let (_dir, paths) = test_paths();
+        let first = upsert_recipe(&paths, recipe("Daily driver", "/models/a.gguf")).expect("one");
+        let mut second = first.clone();
+        second.label = "Daily driver, retuned".to_string();
+        if let RecipeKind::Local(s) = &mut second.kind {
+            s.ctx = Some(65_536);
+        }
+        let saved = upsert_recipe(&paths, second).expect("two");
+
+        assert_eq!(saved.id, first.id, "an existing id is honoured");
+        let c = load(&paths).expect("load");
+        assert_eq!(c.recipes.len(), 1, "{:?}", c.recipes);
+        assert_eq!(c.recipes[0].label, "Daily driver, retuned");
+        assert_eq!(
+            c.recipes[0].created_at_unix, first.created_at_unix,
+            "creation survives an update"
+        );
+    }
+
+    /// A `catalog.toml` a previous build already wrote a repeat id into heals on read —
+    /// **by renaming, never by dropping**. Both definitions stay reachable and
+    /// `recipe show <id>` stops being a coin toss.
+    #[test]
+    fn a_repeat_id_already_on_disk_is_renamed_on_read_not_discarded() {
+        let (_dir, paths) = test_paths();
+        std::fs::create_dir_all(paths.state()).expect("mkdir");
+        // Exactly what the old migration wrote: the same id twice, with different content.
+        // Serialised straight past `write_file`, since that now refuses to produce this.
+        let mut from_toml = recipe("from recipes.toml", "/models/q.gguf");
+        from_toml.id = RecipeId::parse("local-qwen35-9b").expect("id");
+        if let RecipeKind::Local(s) = &mut from_toml.kind {
+            s.ctx = Some(32_768);
+        }
+        let mut from_instances = from_toml.clone();
+        from_instances.label = "from local_instances".to_string();
+        if let RecipeKind::Local(s) = &mut from_instances.kind {
+            s.ctx = None;
+        }
+        let text = toml::to_string_pretty(&CatalogFile {
+            recipes: vec![from_toml, from_instances],
+            profiles: Vec::new(),
+        })
+        .expect("serialise");
+        std::fs::write(paths.catalog_file(), text).expect("write");
+
+        let c = load(&paths).expect("load");
+        assert_eq!(c.recipes.len(), 2, "neither entry is dropped");
+        assert_eq!(c.recipes[0].id.as_str(), "local-qwen35-9b");
+        assert_eq!(
+            c.recipes[1].id.as_str(),
+            "local-qwen35-9b-2",
+            "the repeat is renamed, so every id names exactly one recipe"
+        );
+        assert_eq!(c.recipes[1].label, "from local_instances");
+
+        // And an upsert of that id now touches exactly one of them.
+        let mut update = c.recipes[0].clone();
+        update.label = "retuned".to_string();
+        upsert_recipe(&paths, update).expect("upsert");
+        let after = load(&paths).expect("reload");
+        assert_eq!(after.recipes.len(), 2);
+        assert_eq!(after.recipes[0].label, "retuned");
+        assert_eq!(after.recipes[1].label, "from local_instances");
+        assert_eq!(
+            after
+                .recipes
+                .iter()
+                .filter(|r| r.id.as_str() == "local-qwen35-9b")
+                .count(),
+            1
+        );
+    }
+
+    /// A caller that builds a `Catalog` with a repeat id in memory is a bug in the caller.
+    /// Writing it would make every later reader disagree, so the write is refused.
+    #[test]
+    fn writing_a_catalog_with_a_repeat_id_is_refused() {
+        let (_dir, paths) = test_paths();
+        let mut a = recipe("Daily driver", "/models/a.gguf");
+        a.id = RecipeId::parse("clash").expect("id");
+        let mut b = recipe("Something else", "/models/b.gguf");
+        b.id = RecipeId::parse("clash").expect("id");
+
+        let err = save(
+            &paths,
+            &Catalog {
+                recipes: vec![a, b],
+                profiles: Vec::new(),
+            },
+        )
+        .expect_err("must refuse");
+        assert!(matches!(err, Error::Invalid { .. }), "{err:?}");
+        assert!(err.to_string().contains("clash"), "{err}");
+        assert!(
+            !paths.catalog_file().exists(),
+            "nothing may be written when the write is refused"
+        );
     }
 
     #[test]

@@ -60,7 +60,7 @@ serde-only protocol crate: REST + WebSocket, an embedded no-build web UI, a nati
 | **D6** | **`[router] unknown_model = "reject"` by default.** A model string that matches no alias, no backend model, and no pin returns `404 model_not_found`. | A typo must fail loudly. `fallback` exists for people who want the old behaviour, but silently serving a *different* model than the one asked for is how an agent spends an hour debugging the wrong thing. |
 | **D7** | **`[compat] legacy_proxy_pidfile = false` by default.** | LocalRouter's `_proxy_down()` reads `/tmp/vastai-gguf-proxy.pid` and SIGTERMs whatever it names. Turning it on hands the old TUI's "Proxy → stop" menu item a kill switch for the entire daemon. When on, SIGTERM still drains gracefully and local children survive via `setsid`, but the routing table, tunnels and watchdogs go with it. The reason lives in the config comment, not only here. |
 | **D8** | **`X-Usage` is emitted on buffered responses only.** Streams get `X-ApexRouter-Usage-Deferred: true`; the numbers land in `usage.jsonl`, the WS event and the live-request table. | Response headers flush before the first SSE chunk and usage arrives in the last one. A streaming `X-Usage` would be absent or fabricated. This is a **stated, tested divergence** from LocalRouter, not an oversight. The buffered header keeps LocalRouter's exact `"{prompt}+{completion}"` format. |
-| **D9** | **The three legacy compat routes — `GET/HEAD /health`, `GET/HEAD /providers`, `POST /switch` — are byte-compatible through mk1 and are REMOVED AT 1.0.** | They exist so LocalRouter's own unmodified `smoke.sh` and the old TUI keep working during the transition; they are not a second API. Their replacements are already shipped and documented on the control plane (`GET /v1/snapshot`, `GET /v1/backends`, `PUT /v1/routes/{alias}`, `POST /v1/routes/default`). **Commitment:** before 1.0, a `legacy.traffic` check is added to the registry so `apexrouter diagnose` warns while the old routes are still being used, and the removal is not a surprise. Deprecation is a decision made now, in writing, rather than a compatibility surface that accretes forever. |
+| **D9** | **The three legacy compat routes — `GET/HEAD /health`, `GET/HEAD /providers`, `POST /switch` — are byte-compatible through mk1 and are REMOVED AT 1.0.** | They exist so LocalRouter's own unmodified `smoke.sh` and the old TUI keep working during the transition; they are not a second API. Their replacements are already shipped and documented on the control plane (`GET /v1/snapshot`, `GET /v1/backends`, `PUT /v1/routes/{alias}`, `POST /v1/routes/default`). **Commitment:** before 1.0, a `legacy.traffic` check is added to the registry so `apexrouter doctor` (and `GET /v1/diagnose`, and the `apexrouter_diagnose` MCP tool — the same registry, three transports) warns while the old routes are still being used, and the removal is not a surprise. Deprecation is a decision made now, in writing, rather than a compatibility surface that accretes forever. |
 | **D10** | **Money safety is structural.** The ledger row is written **before** the billing call; `ledger.jsonl` is append-only and "active" is a *query*; a `SpendApproval` cannot be fabricated by any code path; there is a daemon-side hard ceiling; startup reconciles against the live account. **Nothing that costs money is ever auto-destroyed, at any setting.** | The failure it prevents has already happened in this codebase. A crash must not delete a paid box, and a leak must be visible as an alert rather than as a surprise on the invoice. |
 | **D11** | **One XDG state dir; nothing is ever written into a repo. `~/.vastai-gguf/` is another tool's directory and is read-only by default** (`[compat] mirror_usage_log = false`). | Merely starting the daemon must never mutate another tool's state. An acceptance run appended 15 rows to the real `usage.log` and they had to be restored; the mirror is now opt-in, offered by `apexrouter migrate`, which is the case it exists for. Migration must also treat **stale** legacy state (an instance record pointing at a model path that no longer exists) as the normal case, not an error. |
 | **D12** | **`apexrouter-slint` is GPL-3.0-only and is NOT in `default-members`.** The other seven crates are `MIT OR Apache-2.0`. | Slint's GPL option, taken deliberately. Keeping the GUI crate out of the default workspace members means the headless node never links it and never inherits the obligation. See `docs/LICENSING.md`. |
@@ -98,6 +98,8 @@ one for reasoning.
   cleanly in every case. With the flag off, a `/v1/messages` body carrying `tools` is **refused with
   a clear error** — never silently stripped and answered wrongly, which is the failure mode that
   actually costs an agent an hour.
+  **The default was reversed on 2026-07-31 — see the amendments log.** Everything else in this
+  bullet still holds: translation remains best-effort, and an explicit `false` still refuses loudly.
 - **`thinking` blocks and `POST /v1/messages/count_tokens`.** There is no OpenAI-side equivalent of
   an Anthropic `thinking` block, so mk1 neither synthesises one on the way out nor accepts one on
   the way in. llama.cpp b9199's `--reasoning-format` can emit `reasoning_content`; mk1 records that
@@ -155,3 +157,115 @@ one for reasoning.
 - **2026-07-31** — **Charter locked.** D1–D18 recorded. D9 (legacy compat routes removed at 1.0) and
   D3 (`/v1` rather than `/api` on the control plane) are written down here for the first time; both
   describe the code as shipped, but neither had been recorded as a decision before.
+- **2026-07-31** — **`[router] anthropic_tools` defaults to `true`** (reverses the "off by default"
+  half of the "Perfect Anthropic tool-use translation" entry above, which is left in place rather
+  than rewritten). The original reasoning was that tool translation is the imperfect part and should
+  therefore be opt-in. That is wrong in one specific way: **the alternative to imperfect tool
+  translation is not "no tools", it is "the feature does not work at all".** Real Claude Code sends
+  **92 tool definitions on every single request**; tools are not an optional part of that client. So
+  with the flag off, a stock config answered the flagship Anthropic client with
+  `400 tool translation is off: set [router] anthropic_tools = true to enable it` on request one,
+  and "point every agent at it and never change it again" was false for exactly the agent the
+  ingress was built for.
+  What does **not** change: translation is still declared best-effort and is still allowed to be
+  imperfect (parallel tool calls, some `tool_choice` variants, a block-array `tool_result`); and an
+  operator who sets `anthropic_tools = false` explicitly still gets the loud, remediation-naming
+  refusal rather than silently stripped tools. That refusal was always the good part of the
+  decision, and it is untouched.
+  Changed: `RouterCfg::default()`, `config.example.toml`, `docs/API.md` §2.5, `README.md`.
+  `docs/ARCHITECTURE.md` §5.2's config listing, `docs/AGENTS.md` and `skills/apexrouter/SKILL.md`
+  still describe the old default and belong to other units — they must be brought in line.
+- **2026-07-31** — **`warm_timeout` is patience, not a stopwatch** (§4.7). A sequential swap's warm
+  window now **re-arms its deadline for as long as the launch it is waiting on is alive**, instead
+  of expiring a fixed `health_deadline_ms + drain_timeout_secs` after it opened.
+  The measurement that forced it: `warm_timeout` 3000 ms against a swap that ran **12,038 ms**. The
+  4 parked requests were `503`'d at 2977 ms and the alias then produced a plain
+  `no_healthy_backend` storm of **74,550 requests** over the remaining nine seconds — the outage
+  §4.7 exists to prevent, merely delayed, and delayed past the point where every client has already
+  retried. Re-run against the re-armed window (`tests/warm_rearm.rs`, fake `llama-server`,
+  `load_ms=12000`, the same 3000 ms budget): **zero 5xx**, 437/437 × 200, 8 parked at peak, 240
+  re-arms. The same 12 s outage with the re-arm removed, measured in the same run: **10,663 × 5xx**
+  out of 10,887.
+  Why it is not simply a bigger number: `[supervisor] health_deadline_ms` is not how long a launch
+  may take, it is how long it may spend making **no progress** — the health gate resets it on every
+  `503 {"status":"loading model"}` and every recognised log line — so the real start budget is
+  unbounded while a load is progressing, and *any* fixed park is eventually shorter than it. The
+  gate and the warm queue are waiting on the same event, so they must share one liveness signal. A
+  park that gives up while the load is demonstrably progressing converts a survivable wait into the
+  outage.
+  What the signal is, precisely: **the launch future still being pending**, sampled on the gate's
+  own `health_interval_ms` clock. The gate is defined to return within `health_deadline_ms` of the
+  last progress it observed, so "`up()` has not returned" *is* "progress was observed recently",
+  with no second opinion that can drift from the first. `Event::BootProgress` was considered and
+  rejected as the trigger: it is emitted once per **transition**, never per tick, so the per-tick
+  `loading` reset — the signal that carries a quiet mmap of a 30 GB file — never reaches the event
+  bus, and a park re-armed from it would be strictly *less* patient than the gate it waits on.
+  The bound is kept, as the ruling requires: the deadline still fires, it simply now measures wall
+  clock **since the last sign of life** rather than since the swap began. A closed or superseded
+  window refuses to re-arm, so a leaked pacemaker cannot hold requests open.
+  Changed: `router/src/registry.rs` (`WarmWindow::rearm`, `WarmSlot::budget_ms`/`rearms`),
+  `server/src/api/routes.rs` (`start_while_parked`), `docs/ARCHITECTURE.md` §4.7.
+  *Completed at the final gate:* `[router] warm_queue_max` is now a field on
+  `core::config::RouterCfg` (default 32) and `api/routes.rs::warm_queue_max` reads it. It had been
+  named by §4.7 and `docs/API.md` while not existing, so writing it into a config file earned the
+  "key is not one this build knows" warning that the *same day's* unknown-key work had just added —
+  the two defects found each other. Verified by moving the bound under one unchanged 12 s swap with
+  twelve clients: at `4`, peak parked 4 and the rest `503 warm_queue_full`; at `16`, all twelve park
+  and the swap costs zero 5xx.
+- **2026-07-31** — **`GET /v1/endpoints/{id}/argv` describes the launch that happened, not one that
+  might.** The route called `supervisor.plan(&spec)`, which re-scans the rig, re-solves `fit()`
+  against currently-free VRAM and leases a fresh port — a hypothetical *second* launch. Measured
+  after a VRAM budget change, the daemon served **34** argv tokens where `/proc/<pid>/cmdline` had
+  **36**: `-c 4096` for a child running `-c 32768`, and `-ngl 999` gone entirely, i.e. it described
+  a CPU-only launch for a fully-offloaded child — with `warnings` empty, so nothing said the
+  preview and the process disagreed. This is the daemon-served route and therefore the **normal**
+  answer, and an operator debugging a launch is the person least able to afford a plausible lie.
+  It now renders from `ResolvedSpec::from_record`: the record's draft with the record's `fit`
+  folded back in, at the port the record was leased, against the build the record names in the
+  supervisor's own rig snapshot. Nothing is re-solved and nothing is re-leased.
+  `ResolvedSpec::disagreements` folds any residual divergence into `warnings` rather than hiding
+  it. Two new refusals, both naming the remedy: `409` when the record's build has left the machine
+  (rendering against another build's `FlagSupport` would silently emit a different flag set), and
+  `409` for an endpoint this daemon does not launch. A second symptom nobody had recorded is fixed
+  in passing — the route printed a literal `<id>.key` placeholder instead of the real
+  `$STATE/endpoints/<id>.key` path. Acceptance is against `/proc/<pid>/cmdline`, not against the
+  other preview: with a daemon up both routes are the same code, so their agreement was
+  tautological. Changed: `server/src/api/endpoints.rs`, `docs/API.md` §5.5.
+- **2026-07-31** — **Two legacy sources that mint one recipe id MERGE, field by field; neither
+  silently wins** (D11, D16). `migrate::apply` de-duplicated ids against the catalog it was writing
+  into but not against the batch it was writing, and the two sources mint ids from independent
+  sets. On this machine `local_instances/local-qwen35-9b.json` and
+  `recipes.toml#recipes.local-qwen35-9b` collide, so `catalog.toml` held two entries under one id:
+  the second unreachable, and `recipe rm` deleting both — the exact silent shadowing
+  `catalog::upsert_recipe` exists to prevent.
+  The rule is a merge and not a pick, because a pick throws away a fact somebody wrote down.
+  Sources are ranked (`recipes.toml` launch plan > `.pinned_provider` > `local_instances`
+  snapshot), but rank is only a tie-break: a field **one** source sets is always taken whatever its
+  rank — which is what saves `ctx = 32768` — a field **both** set differently goes to the higher
+  rank *and is named with both values in the warning*, `description`/`provenance.source` are
+  concatenated rather than chosen, and two sources meaning different `RecipeKind`s are both kept
+  with the second renamed `<id>-2`. The merge is announced in the `--dry-run` plan *before*
+  anything is written, and again as a report warning afterwards.
+  `catalog.rs` now enforces uniqueness independently at both ends: `read_file` renames a repeat in
+  memory rather than dropping it (so an already-corrupted catalog heals with both definitions
+  reachable) and `write_file` refuses one with `Error::Invalid`.
+  **Operator-visible:** an existing `catalog.toml` holding a duplicate shows the second entry as
+  `<id>-2` from the next read, with a stderr warning. That is the repair, not a regression.
+  Changed: `core/src/migrate.rs`, `core/src/catalog.rs`, `docs/MIGRATION.md` §4.1.
+- **2026-07-31** — **An unknown config key WARNS; it never refuses to start** (D5-adjacent). A
+  mistyped key used to be ignored in total silence: `proxy_port` for `proxy_bind` left the daemon
+  binding the default while `config show` printed the default back, so the operator had no way to
+  tell the file was not doing what it said.
+  `serde(deny_unknown_fields)` was considered and **rejected**: an older binary must survive a
+  newer file, and a section from next month's build must never stop today's daemon from starting.
+  So every unknown key is logged at `warn` on stderr when the file is read, and carried on
+  `Config::unknown_keys`, which `serializable()` passes into `ConfigFile` — so `config show` and
+  `config show --json` surface it with no CLI change. Detection is **schema-free**: the document
+  the user wrote is diffed against `toml::Value::try_from(cfg.serializable())`, so free-form maps
+  (`[providers.<id>]`, `[known_forks.<name>]`) need no special-casing. The suggestion ranks by
+  longest shared prefix first and Levenshtein only as a tie-break, because `proxy_port` →
+  `proxy_bind` is four substitutions and no distance threshold would ever find it.
+  `unknown_keys` is declared first in `ConfigFile` and cleared in `save_to`, so a save can never
+  materialise it as a key — and never deletes the operator's mistyped key either.
+  Changed: `core/src/config.rs`, `config.example.toml`. `Config::validate`/`validate_file` are
+  built and unrendered; `apexrouter config validate` is still owed (`docs/MIGRATION.md` §10.3).

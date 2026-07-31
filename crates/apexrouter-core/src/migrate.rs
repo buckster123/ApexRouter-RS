@@ -22,6 +22,32 @@
 //!    reaches [`MigrationPlan`], the config file, or a log line. That is why
 //!    [`LegacyActiveEndpoint`] records `api_key_present: bool` rather than the key itself:
 //!    the plan is printed, and a struct that can hold key material eventually prints it.
+//!
+//! # Two sources, one recipe
+//!
+//! The same thing is described in two places on a real machine. `local-qwen35-9b` exists as a
+//! saved endpoint in `~/.vastai-gguf/local_instances/` **and** as a row in LocalRouter's
+//! `recipes.toml`, and the two disagree: the row sets `ctx = 32768`, the saved endpoint knows
+//! nothing about context at all. Importing both wrote the id twice, `recipe ls` showed it
+//! twice, and `recipe show` answered with whichever landed first — the one without the
+//! context setting. An operator debugging a context window they never set is the whole cost
+//! of that.
+//!
+//! The rule is [`merge_duplicate_recipes`]: **one entry per id, merged field by field, and
+//! said out loud.** Sources are ranked by [`RecipeAuthority`] — a hand-written launch plan
+//! outranks a snapshot of something that happened to be running — and then
+//!
+//! * a field only one source has is taken from that source, whatever its rank;
+//! * a field both set differently is taken from the higher-ranked source and **named in a
+//!   warning, with both values**;
+//! * free text (`description`, `provenance.source`) is concatenated rather than chosen,
+//!   because there is no reason to throw either away;
+//! * sources that cannot merge at all — the same id describing a local server in one place
+//!   and a managed provider in another — are **both kept**, the second under a suffixed id,
+//!   with a warning that says so.
+//!
+//! Every merge produces a plan row (`what = "duplicate recipe id"`, action `Warn`) so it is
+//! visible in `--dry-run`, and a `MigrationReport` warning so it is visible after the fact.
 
 use crate::config::{Config, DockerCfg, KnownFork, ProviderCfg};
 use crate::error::{Error, Result};
@@ -44,6 +70,11 @@ const DEFAULT_LEGACY_PROVIDER: &str = "vast_gguf";
 /// available to [`import_recipes_toml`], which sees only one file. [`plan`] overrides it
 /// with the configured value, **verbatim** — `api.together.xyz` is never rewritten to `.ai`.
 const LEGACY_TOGETHER_BASE_URL: &str = "https://api.together.ai/v1";
+
+/// `MigrationItem::what` for the row that announces a merge — see
+/// [`survey_duplicate_recipe_ids`]. Named, because [`apply`] has to recognise and re-derive
+/// it rather than echo it.
+const DUPLICATE_ID_ROW: &str = "duplicate recipe id";
 
 // ---------------------------------------------------------------------------------------
 // plan / apply
@@ -92,11 +123,18 @@ pub fn apply(paths: &Paths, cfg: &Config, plan: &MigrationPlan) -> Result<Migrat
 
     let mut next_cfg = cfg.clone();
     let mut cfg_dirty = false;
-    let mut recipes: Vec<Recipe> = Vec::new();
+    let mut recipes: Vec<SourcedRecipe> = Vec::new();
     let mut profiles: Vec<SearchProfile> = Vec::new();
     let mut ledger_rows: Vec<LedgerRow> = Vec::new();
 
     for planned in survey.planned {
+        // A `duplicate recipe id` row is the plan's *preview* of a merge, computed on the
+        // assumption that every row is kept. `apply` performs the merge over the rows
+        // actually kept and reports that, so echoing the preview here would say it twice —
+        // once accurately and once possibly not.
+        if planned.item.what == DUPLICATE_ID_ROW {
+            continue;
+        }
         let selected = allowed.contains(&(planned.item.what.as_str(), planned.item.from.as_str()));
         if !selected || planned.item.action == MigrationAction::Skip {
             report.skipped = report.skipped.saturating_add(1);
@@ -125,7 +163,11 @@ pub fn apply(paths: &Paths, cfg: &Config, plan: &MigrationPlan) -> Result<Migrat
                 next_cfg.known_forks.entry(name).or_insert(fork);
                 cfg_dirty = true;
             }
-            Payload::Recipe(r) => recipes.push(*r),
+            Payload::Recipe { recipe, authority } => recipes.push(SourcedRecipe {
+                authority,
+                from: planned.item.from.clone(),
+                recipe: *recipe,
+            }),
             Payload::Profile(p) => profiles.push(*p),
             Payload::Ledger(row) => ledger_rows.push(*row),
         }
@@ -136,19 +178,40 @@ pub fn apply(paths: &Paths, cfg: &Config, plan: &MigrationPlan) -> Result<Migrat
         next_cfg.save(paths)?;
     }
 
+    // Two legacy sources can describe the same recipe. Merge before writing, so the catalog
+    // gets one entry per id — and warn, because a merge the operator cannot see is the same
+    // failure as the duplicate it replaced.
+    let recipes = merge_duplicate_recipes(recipes, &mut report.warnings);
+
     // The catalog file is only rewritten when there is something to put in it: a migration
     // that found no recipes must not reformat a hand-edited `catalog.toml`.
     if !recipes.is_empty() || !profiles.is_empty() {
         let mut catalog = crate::catalog::load(paths)?;
-        let have_recipes: HashSet<RecipeId> =
-            catalog.recipes.iter().map(|r| r.id.clone()).collect();
         let have_profiles: HashSet<ProfileId> =
             catalog.profiles.iter().map(|p| p.id.clone()).collect();
-        catalog.recipes.extend(
-            recipes
-                .into_iter()
-                .filter(|r| !have_recipes.contains(&r.id)),
-        );
+        for r in recipes {
+            // An entry already in the catalog wins and is never overwritten — re-running a
+            // migration must not undo an edit. Saying nothing about it, though, is how the
+            // operator concludes the import worked when it declined to.
+            match catalog.recipes.iter().find(|x| x.id == r.id) {
+                Some(existing) => {
+                    if !same_definition(existing, &r) {
+                        report.warnings.push(format!(
+                            "recipe `{}` is already in catalog.toml with a DIFFERENT \
+                             definition, so the legacy one was not imported and your entry was \
+                             left exactly as it is. Legacy version: {}. Yours: {}. Remove \
+                             yours with `apexrouter recipe rm {}` first if you wanted the \
+                             legacy one.",
+                            r.id,
+                            effective_summary(&r),
+                            effective_summary(existing),
+                            r.id,
+                        ));
+                    }
+                }
+                None => catalog.recipes.push(r),
+            }
+        }
         catalog.profiles.extend(
             profiles
                 .into_iter()
@@ -172,7 +235,23 @@ pub fn apply(paths: &Paths, cfg: &Config, plan: &MigrationPlan) -> Result<Migrat
         }
     }
 
+    // Warnings are data on the report *and* lines on stderr. A caller that renders the
+    // report shows them; a caller that only checks the exit code still gets told.
+    for w in &report.warnings {
+        tracing::warn!(warning = %w, "migration");
+    }
+
     Ok(report)
+}
+
+/// Are these two the same recipe, ignoring the clocks?
+///
+/// `created_at_unix` and friends are stamped at import, so a second migration run produces
+/// different timestamps for an identical import. Comparing what the recipe *is* — what it
+/// launches, what it is called — is what makes "already imported" distinguishable from
+/// "imported, then edited".
+fn same_definition(a: &Recipe, b: &Recipe) -> bool {
+    a.label == b.label && a.description == b.description && a.kind == b.kind
 }
 
 // ---------------------------------------------------------------------------------------
@@ -735,6 +814,318 @@ fn managed_recipe(
 }
 
 // ---------------------------------------------------------------------------------------
+// two sources, one recipe
+// ---------------------------------------------------------------------------------------
+
+/// Which legacy source a recipe came from, **ordered most authoritative first**.
+///
+/// The order is the whole rule, so it is stated as an order: a file a human wrote to describe
+/// how to launch something outranks a file a program wrote to record that something was
+/// running. The snapshot knows a `pid` and a port; it does not know what context size the
+/// operator meant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RecipeAuthority {
+    /// A `recipes.toml` row: a hand-written launch plan, with `ctx`, `parallel`, `kv_type`,
+    /// `n_gpu_layers` and `mode` in it.
+    LaunchPlan,
+    /// `~/.vastai-gguf/.pinned_provider`: a hand-pinned managed model.
+    Pin,
+    /// `~/.vastai-gguf/local_instances/*.json`: what was once running, recorded by a program.
+    Snapshot,
+}
+
+impl RecipeAuthority {
+    /// How the warning names this source.
+    fn describe(self) -> &'static str {
+        match self {
+            RecipeAuthority::LaunchPlan => "recipes.toml launch plan",
+            RecipeAuthority::Pin => "pinned provider",
+            RecipeAuthority::Snapshot => "saved local instance",
+        }
+    }
+}
+
+/// One imported recipe with the identity of the source that produced it.
+struct SourcedRecipe {
+    /// Rank, for the merge.
+    authority: RecipeAuthority,
+    /// The `MigrationItem::from` string, so a warning can name the file.
+    from: String,
+    /// The recipe as that source described it.
+    recipe: Recipe,
+}
+
+/// Collapse recipes sharing an id into one entry each, losing nothing and saying so.
+///
+/// Returns the merged recipes in first-seen id order, and appends one warning per id that
+/// needed merging. See the module header for the rule; the short version is that a field only
+/// one source knows is always taken, a field two sources disagree about goes to the
+/// higher-ranked source and is named in the warning, and two definitions that cannot be
+/// merged at all are both kept under distinct ids.
+fn merge_duplicate_recipes(rows: Vec<SourcedRecipe>, warnings: &mut Vec<String>) -> Vec<Recipe> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<String, Vec<SourcedRecipe>> = BTreeMap::new();
+    for row in rows {
+        let key = row.recipe.id.to_string();
+        if !groups.contains_key(&key) {
+            order.push(key.clone());
+        }
+        groups.entry(key).or_default().push(row);
+    }
+
+    let mut taken: HashSet<String> = groups.keys().cloned().collect();
+    let mut out: Vec<Recipe> = Vec::new();
+    for key in order {
+        let Some(mut group) = groups.remove(&key) else {
+            continue;
+        };
+        // Stable: equal ranks keep survey order, so the result does not depend on how the
+        // directory happened to be read.
+        group.sort_by_key(|r| r.authority);
+        let mut it = group.into_iter();
+        let Some(first) = it.next() else { continue };
+        let mut base = first.recipe;
+        let mut sources = vec![format!("{} ({})", first.from, first.authority.describe())];
+        let mut conflicts: Vec<String> = Vec::new();
+        let mut unmergeable: Vec<SourcedRecipe> = Vec::new();
+
+        for other in it {
+            if merge_recipe(&mut base, &other.recipe, &mut conflicts) {
+                sources.push(format!("{} ({})", other.from, other.authority.describe()));
+            } else {
+                unmergeable.push(other);
+            }
+        }
+
+        if sources.len() > 1 {
+            warnings.push(format!(
+                "recipe id `{key}` was described by {} legacy sources: {}. They were MERGED \
+                 into one catalog entry — no source silently won and nothing was dropped. \
+                 Effective settings: {}.{} Check it with `apexrouter recipe show {key}`.",
+                sources.len(),
+                sources.join("; "),
+                effective_summary(&base),
+                if conflicts.is_empty() {
+                    " No field disagreed.".to_owned()
+                } else {
+                    format!(
+                        " Fields the sources disagreed about, KEPT value first: {}.",
+                        conflicts.join("; ")
+                    )
+                },
+            ));
+        }
+        let base_kind = kind_name(&base.kind);
+        out.push(base);
+
+        // Different kinds under one id cannot be one entry. Keep both; rename the later.
+        for mut odd in unmergeable {
+            let mut used: HashSet<String> = taken.clone();
+            let fresh = unique_slug(&key, &mut used);
+            let Ok(renamed) = RecipeId::parse(&fresh) else {
+                continue;
+            };
+            warnings.push(format!(
+                "recipe id `{key}` was described by two legacy sources that mean DIFFERENT \
+                 KINDS of thing ({base_kind} vs {}), which cannot be one entry. Both were \
+                 imported; {} was renamed to `{renamed}`. Decide which you meant and remove \
+                 the other.",
+                kind_name(&odd.recipe.kind),
+                odd.from,
+            ));
+            taken.insert(renamed.to_string());
+            odd.recipe.id = renamed;
+            out.push(odd.recipe);
+        }
+    }
+    out
+}
+
+/// Fold `other` into `base`. `false` means the two describe different kinds of thing and
+/// cannot be merged at all.
+fn merge_recipe(base: &mut Recipe, other: &Recipe, c: &mut Vec<String>) -> bool {
+    match (&mut base.kind, &other.kind) {
+        (RecipeKind::Local(b), RecipeKind::Local(o)) => merge_local(b, o, c),
+        (RecipeKind::Managed(b), RecipeKind::Managed(o)) => merge_managed(b, o, c),
+        _ => return false,
+    }
+    pick_or_unset("label", &mut base.label, &other.label, &String::new(), c);
+    // Free text is joined, never chosen: two sentences about one recipe are two facts.
+    base.description = join_text(base.description.as_deref(), other.description.as_deref());
+    base.provenance.source = join_text(
+        Some(&base.provenance.source),
+        Some(&other.provenance.source),
+    )
+    .unwrap_or_default();
+    if base.provenance.size_bytes.is_none() {
+        base.provenance.size_bytes = other.provenance.size_bytes;
+    }
+    if base.provenance.fit.is_none() {
+        base.provenance.fit.clone_from(&other.provenance.fit);
+    }
+    base.provenance.discovered_at_unix = earliest(
+        base.provenance.discovered_at_unix,
+        other.provenance.discovered_at_unix,
+    );
+    base.created_at_unix = earliest(base.created_at_unix, other.created_at_unix);
+    base.updated_at_unix = base.updated_at_unix.max(other.updated_at_unix);
+    true
+}
+
+/// Merge two `llama-server` launch plans.
+fn merge_local(b: &mut LocalLlamaSpec, o: &LocalLlamaSpec, c: &mut Vec<String>) {
+    pick_same("build", &mut b.build, &o.build, c);
+    pick_or_unset(
+        "model_path",
+        &mut b.model_path,
+        &o.model_path,
+        &String::new(),
+        c,
+    );
+    pick_opt("mmproj", &mut b.mmproj, &o.mmproj, c);
+    pick_or_unset(
+        "alias_flag",
+        &mut b.alias_flag,
+        &o.alias_flag,
+        &String::new(),
+        c,
+    );
+    pick_or_unset("host", &mut b.host, &o.host, &String::new(), c);
+    pick_opt("port", &mut b.port, &o.port, c);
+    pick_opt("ctx", &mut b.ctx, &o.ctx, c);
+    pick_opt("parallel", &mut b.parallel, &o.parallel, c);
+    pick_opt("kv_type", &mut b.kv_type, &o.kv_type, c);
+    pick_or_unset("ngl", &mut b.ngl, &o.ngl, &NglPlan::Auto, c);
+    pick_or_unset("split", &mut b.split, &o.split, &SplitPlan::default(), c);
+    pick_same("mode", &mut b.mode, &o.mode, c);
+    pick_opt("flash_attn", &mut b.flash_attn, &o.flash_attn, c);
+    pick_opt("api_key", &mut b.api_key, &o.api_key, c);
+    pick_or_unset(
+        "extra_args",
+        &mut b.extra_args,
+        &o.extra_args,
+        &Vec::new(),
+        c,
+    );
+}
+
+/// Merge two managed-provider specs.
+fn merge_managed(b: &mut ManagedSpec, o: &ManagedSpec, c: &mut Vec<String>) {
+    pick_same("provider", &mut b.provider, &o.provider, c);
+    pick_or_unset("base_url", &mut b.base_url, &o.base_url, &String::new(), c);
+    pick_same("credential", &mut b.credential, &o.credential, c);
+    pick_opt("model_id", &mut b.model_id, &o.model_id, c);
+    pick_same("protocol", &mut b.protocol, &o.protocol, c);
+}
+
+/// Take `other`'s value when `base` has none; report a disagreement when both have one.
+fn pick_opt<T: Clone + PartialEq + std::fmt::Debug>(
+    field: &str,
+    base: &mut Option<T>,
+    other: &Option<T>,
+    conflicts: &mut Vec<String>,
+) {
+    match (base.as_ref(), other.as_ref()) {
+        (None, Some(o)) => *base = Some(o.clone()),
+        (Some(b), Some(o)) if b != o => {
+            conflicts.push(format!("{field}: {b:?} over {o:?}"));
+        }
+        _ => {}
+    }
+}
+
+/// The same, for a field whose "nothing was said" is a value rather than `None`.
+fn pick_or_unset<T: Clone + PartialEq + std::fmt::Debug>(
+    field: &str,
+    base: &mut T,
+    other: &T,
+    unset: &T,
+    conflicts: &mut Vec<String>,
+) {
+    if other == unset {
+        return;
+    }
+    if base == unset {
+        base.clone_from(other);
+    } else if base != other {
+        conflicts.push(format!("{field}: {base:?} over {other:?}"));
+    }
+}
+
+/// The same, for a field with no "unset" at all: disagreement is all there is to report.
+fn pick_same<T: PartialEq + std::fmt::Debug>(
+    field: &str,
+    base: &mut T,
+    other: &T,
+    conflicts: &mut Vec<String>,
+) {
+    if base != other {
+        conflicts.push(format!("{field}: {base:?} over {other:?}"));
+    }
+}
+
+/// Join two pieces of free text, dropping neither and repeating neither.
+fn join_text(a: Option<&str>, b: Option<&str>) -> Option<String> {
+    let a = a.map(str::trim).filter(|s| !s.is_empty());
+    let b = b.map(str::trim).filter(|s| !s.is_empty());
+    match (a, b) {
+        (Some(a), Some(b)) if a == b => Some(a.to_owned()),
+        (Some(a), Some(b)) => Some(format!("{a} | {b}")),
+        (Some(a), None) => Some(a.to_owned()),
+        (None, Some(b)) => Some(b.to_owned()),
+        (None, None) => None,
+    }
+}
+
+/// The earlier of two stamps, ignoring the ones nobody set.
+fn earliest(a: i64, b: i64) -> i64 {
+    match (a > 0, b > 0) {
+        (true, true) => a.min(b),
+        (true, false) => a,
+        (false, true) => b,
+        (false, false) => a,
+    }
+}
+
+/// `local` / `managed` / …, for a warning that has to say what disagreed.
+fn kind_name(k: &RecipeKind) -> &'static str {
+    match k {
+        RecipeKind::Local(_) => "a local llama-server",
+        RecipeKind::LocalVllm(_) => "a local vLLM",
+        RecipeKind::Vast { .. } => "a vast.ai rental",
+        RecipeKind::Managed(_) => "a managed provider",
+    }
+}
+
+/// The launch-critical values of the merged recipe, for the operator reading the warning.
+///
+/// `ctx` is first for a reason: it is the field the two real sources disagreed about, and
+/// "the context window I never set" is the symptom this whole warning exists to prevent.
+fn effective_summary(r: &Recipe) -> String {
+    let show = |v: Option<String>| v.unwrap_or_else(|| "unset".to_owned());
+    match &r.kind {
+        RecipeKind::Local(s) => format!(
+            "ctx={} parallel={} kv_type={} ngl={:?} port={} mode={:?} model={} build={}",
+            show(s.ctx.map(|v| v.to_string())),
+            show(s.parallel.map(|v| v.to_string())),
+            show(s.kv_type.map(|v| format!("{v:?}"))),
+            s.ngl,
+            show(s.port.map(|v| v.to_string())),
+            s.mode,
+            s.model_path,
+            s.build,
+        ),
+        RecipeKind::Managed(s) => format!(
+            "provider={} model_id={} base_url={}",
+            s.provider,
+            s.model_id.as_deref().unwrap_or("unset"),
+            s.base_url,
+        ),
+        other => kind_name(other).to_owned(),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // the survey: one read-only pass over every legacy artefact
 // ---------------------------------------------------------------------------------------
 
@@ -760,8 +1151,14 @@ enum Payload {
         /// The mapping.
         fork: KnownFork,
     },
-    /// A catalog recipe.
-    Recipe(Box<Recipe>),
+    /// A catalog recipe, with the rank of the source that produced it.
+    Recipe {
+        /// The recipe.
+        recipe: Box<Recipe>,
+        /// Who wins when another source describes the same id — see
+        /// [`merge_duplicate_recipes`].
+        authority: RecipeAuthority,
+    },
     /// A catalog search profile.
     Profile(Box<SearchProfile>),
     /// A ledger row.
@@ -816,11 +1213,55 @@ fn survey(paths: &Paths, cfg: &Config) -> Result<Survey> {
         survey_recipes(dir, cfg, &mut planned, &mut warnings)?;
     }
 
+    survey_duplicate_recipe_ids(&mut planned);
+
     Ok(Survey {
         planned,
         source_paths,
         warnings,
     })
+}
+
+/// Announce, **in the plan**, every recipe id that more than one source describes.
+///
+/// `--dry-run` is where an operator decides what to keep, so a merge they will only find out
+/// about afterwards is a merge they cannot object to. The row carries the same sentence
+/// [`apply`] will put in its report, computed the same way, on the assumption that every row
+/// is kept; striking rows out can only reduce a merge to a single source, and then there is
+/// nothing to merge and nothing to say.
+fn survey_duplicate_recipe_ids(planned: &mut Vec<Planned>) {
+    let rows: Vec<SourcedRecipe> = planned
+        .iter()
+        .filter_map(|p| match &p.payload {
+            Payload::Recipe { recipe, authority } => Some(SourcedRecipe {
+                authority: *authority,
+                from: p.item.from.clone(),
+                recipe: (**recipe).clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &rows {
+        *counts.entry(r.recipe.id.to_string()).or_default() += 1;
+    }
+    if counts.values().all(|n| *n < 2) {
+        return;
+    }
+
+    let mut warnings: Vec<String> = Vec::new();
+    let _ = merge_duplicate_recipes(rows, &mut warnings);
+    for (i, detail) in warnings.into_iter().enumerate() {
+        // The id is the first backticked token of the sentence; `from` has to be unique per
+        // row because `apply` keys the kept/struck-out set on `(what, from)`.
+        planned.push(informational(
+            DUPLICATE_ID_ROW,
+            &format!("legacy sources #{}", i + 1),
+            MigrationAction::Warn,
+            detail,
+        ));
+    }
 }
 
 /// `~/.vastai-gguf/config.toml` — `[providers.*]`, imported as credential *references*.
@@ -1065,25 +1506,28 @@ fn survey_instances(vg: &Path, out: &mut Vec<Planned>) -> Result<()> {
                 action,
                 detail,
             },
-            payload: Payload::Recipe(Box::new(Recipe {
-                id,
-                label: inst.name.clone(),
-                description: Some(format!(
-                    "imported from LocalRouter's saved instance (started {}, {})",
-                    inst.started_at.as_deref().unwrap_or("unknown"),
-                    inst.status.as_deref().unwrap_or("unknown status"),
-                )),
-                kind: RecipeKind::Local(spec),
-                provenance: Provenance2 {
-                    discovered_at_unix: parse_legacy_time(inst.started_at.as_deref())
-                        .unwrap_or(now),
-                    size_bytes: None,
-                    source: inst.source_file.clone(),
-                    fit: None,
-                },
-                created_at_unix: now,
-                updated_at_unix: now,
-            })),
+            payload: Payload::Recipe {
+                authority: RecipeAuthority::Snapshot,
+                recipe: Box::new(Recipe {
+                    id,
+                    label: inst.name.clone(),
+                    description: Some(format!(
+                        "imported from LocalRouter's saved instance (started {}, {})",
+                        inst.started_at.as_deref().unwrap_or("unknown"),
+                        inst.status.as_deref().unwrap_or("unknown status"),
+                    )),
+                    kind: RecipeKind::Local(spec),
+                    provenance: Provenance2 {
+                        discovered_at_unix: parse_legacy_time(inst.started_at.as_deref())
+                            .unwrap_or(now),
+                        size_bytes: None,
+                        source: inst.source_file.clone(),
+                        fit: None,
+                    },
+                    created_at_unix: now,
+                    updated_at_unix: now,
+                }),
+            },
         });
     }
     Ok(())
@@ -1148,26 +1592,29 @@ fn survey_pinned_provider(vg: &Path, cfg: &Config, out: &mut Vec<Planned>) -> Re
                 pin.model_id
             ),
         },
-        payload: Payload::Recipe(Box::new(Recipe {
-            id,
-            label: format!("{provider}: {}", pin.model_id),
-            description: Some("imported from ~/.vastai-gguf/.pinned_provider".to_owned()),
-            kind: RecipeKind::Managed(ManagedSpec {
-                provider: provider_id,
-                base_url,
-                credential: credential_for(cfg, &provider),
-                model_id: Some(pin.model_id.clone()),
-                protocol: Protocol::OpenAi,
+        payload: Payload::Recipe {
+            authority: RecipeAuthority::Pin,
+            recipe: Box::new(Recipe {
+                id,
+                label: format!("{provider}: {}", pin.model_id),
+                description: Some("imported from ~/.vastai-gguf/.pinned_provider".to_owned()),
+                kind: RecipeKind::Managed(ManagedSpec {
+                    provider: provider_id,
+                    base_url,
+                    credential: credential_for(cfg, &provider),
+                    model_id: Some(pin.model_id.clone()),
+                    protocol: Protocol::OpenAi,
+                }),
+                provenance: Provenance2 {
+                    discovered_at_unix: now,
+                    size_bytes: None,
+                    source: path.display().to_string(),
+                    fit: None,
+                },
+                created_at_unix: now,
+                updated_at_unix: now,
             }),
-            provenance: Provenance2 {
-                discovered_at_unix: now,
-                size_bytes: None,
-                source: path.display().to_string(),
-                fit: None,
-            },
-            created_at_unix: now,
-            updated_at_unix: now,
-        })),
+        },
     });
     Ok(())
 }
@@ -1503,7 +1950,10 @@ fn survey_recipes(
                 },
                 detail,
             },
-            payload: Payload::Recipe(Box::new(recipe)),
+            payload: Payload::Recipe {
+                authority: RecipeAuthority::LaunchPlan,
+                recipe: Box::new(recipe),
+            },
         });
     }
 
@@ -2907,5 +3357,439 @@ mod tests {
         let plan = super::plan(&paths, &Config::default()).expect("plan");
         assert!(plan.items.is_empty());
         assert!(plan.source_paths.is_empty());
+    }
+
+    // -----------------------------------------------------------------------------------
+    // D3 — one id, two legacy sources
+    // -----------------------------------------------------------------------------------
+
+    /// The exact shape on Andre's machine: `local-qwen35-9b` saved as a running endpoint in
+    /// `~/.vastai-gguf/local_instances/`, and written again as a `recipes.toml` row that
+    /// carries `ctx = 32768`. Only one of the two knows the context size.
+    fn colliding_world(home: &Path) -> PathBuf {
+        let vg = home.join(".vastai-gguf");
+        let model = home.join("models/Qwen3.5-9B-Q4_K_M.gguf");
+        write(&model, "GGUF");
+        let bin = home.join("llama.cpp/build-vulkan/bin/llama-server");
+        write(&bin, "#!/bin/true");
+        write(
+            &vg.join("local_instances/local-qwen35-9b.json"),
+            &format!(
+                r#"{{"name":"local-qwen35-9b","pid":649035,"port":8100,"host":"127.0.0.1",
+                    "binary":"{}","model_path":"{}",
+                    "backend":"vulkan","started_at":"2026-05-03T00:34:36Z","status":"stopped"}}"#,
+                bin.display(),
+                model.display(),
+            ),
+        );
+        let lr = home.join("LocalRouterFixture");
+        write(&lr.join("endpoint_proxy.py"), "# legacy\n");
+        write(
+            &lr.join("recipes.toml"),
+            &format!(
+                "[[recipes]]\n\
+                 name = \"local-qwen35-9b\"\n\
+                 provider = \"local\"\n\
+                 label = \"Qwen3.5-9B  Q4_K_M  (local Vulkan)\"\n\
+                 model_path = \"{}\"\n\
+                 port = 8100\n\
+                 ctx = 32768\n\
+                 parallel = 1\n\
+                 kv_type = \"q8_0\"\n\
+                 n_gpu_layers = 999\n\
+                 backend = \"vulkan\"\n\
+                 mode = \"thinking\"\n\
+                 description = \"Qwen3.5-9B on AMD iGPU via Vulkan backend. ~4 GB VRAM.\"\n",
+                model.display(),
+            ),
+        );
+        lr
+    }
+
+    /// The defect: two sources, one id, `catalog.toml` got both rows and `recipe show`
+    /// answered with the one that had no `ctx`.
+    #[test]
+    fn two_sources_for_one_recipe_id_merge_into_one_entry_that_keeps_the_ctx() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let lr = colliding_world(home.path());
+        let paths = test_paths(home.path(), Some(&lr));
+        let cfg = Config::default();
+
+        // The dry run says so BEFORE anything is written: an operator striking rows out has
+        // to be able to see the merge coming.
+        let plan = super::plan(&paths, &cfg).expect("plan");
+        let dup: Vec<&MigrationItem> = plan
+            .items
+            .iter()
+            .filter(|i| i.what == "duplicate recipe id")
+            .collect();
+        assert_eq!(dup.len(), 1, "one merged id: {:?}", plan.items);
+        assert_eq!(dup[0].action, MigrationAction::Warn);
+        assert!(
+            dup[0].detail.contains("local-qwen35-9b"),
+            "{}",
+            dup[0].detail
+        );
+        assert!(dup[0].detail.contains("ctx=32768"), "{}", dup[0].detail);
+
+        let report = apply(&paths, &cfg, &plan).expect("apply");
+        let catalog = crate::catalog::load(&paths).expect("catalog");
+        let mine: Vec<&Recipe> = catalog
+            .recipes
+            .iter()
+            .filter(|r| r.id.as_str() == "local-qwen35-9b")
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "exactly one entry per id: {:?}",
+            catalog
+                .recipes
+                .iter()
+                .map(|r| r.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        let RecipeKind::Local(spec) = &mine[0].kind else {
+            panic!("expected a local recipe, got {:?}", mine[0].kind);
+        };
+        assert_eq!(
+            spec.ctx,
+            Some(32_768),
+            "the only source that knew the context size must not lose to the one that did not"
+        );
+        assert_eq!(spec.parallel, Some(1));
+        assert_eq!(spec.port, Some(8100));
+        assert_eq!(spec.ngl, NglPlan::All);
+
+        // Both descriptions survive: nothing is thrown away to achieve one entry.
+        let d = mine[0].description.clone().unwrap_or_default();
+        assert!(d.contains("AMD iGPU"), "{d}");
+        assert!(d.contains("saved instance"), "{d}");
+
+        // And the merge is *stated*, naming the id, the sources, the effective ctx and the
+        // one field the two disagreed about.
+        let merged: Vec<&String> = report
+            .warnings
+            .iter()
+            .filter(|w| w.contains("were MERGED"))
+            .collect();
+        assert_eq!(merged.len(), 1, "{:?}", report.warnings);
+        let w = merged[0];
+        assert!(w.contains("`local-qwen35-9b`"), "{w}");
+        assert!(w.contains("recipes.toml launch plan"), "{w}");
+        assert!(w.contains("saved local instance"), "{w}");
+        assert!(w.contains("ctx=32768"), "{w}");
+        assert!(w.contains("label:"), "the conflicting field is named: {w}");
+        assert!(
+            w.contains("Qwen3.5-9B  Q4_K_M  (local Vulkan)"),
+            "the winning value is printed: {w}"
+        );
+
+        // Re-running is still safe, and still silent about a recipe it already imported.
+        let plan2 = super::plan(&paths, &cfg).expect("plan again");
+        let report2 = apply(&paths, &cfg, &plan2).expect("apply again");
+        let catalog2 = crate::catalog::load(&paths).expect("catalog again");
+        assert_eq!(catalog2.recipes.len(), catalog.recipes.len());
+        assert!(
+            !report2.warnings.iter().any(|w| w.contains("DIFFERENT")),
+            "an unchanged re-import must not accuse the operator of editing: {:?}",
+            report2.warnings
+        );
+    }
+
+    /// The merge may not depend on the order the filesystem happened to be read in.
+    #[test]
+    fn the_merge_is_deterministic_whichever_source_is_seen_first() {
+        let local = |ctx: Option<u32>, label: &str, mode: SamplingMode| Recipe {
+            id: RecipeId::parse("local-qwen35-9b").expect("id"),
+            label: label.to_owned(),
+            description: Some(format!("{label} notes")),
+            kind: RecipeKind::Local(LocalLlamaSpec {
+                build: BuildId::parse("build-vulkan").expect("build"),
+                model_path: "/m/q.gguf".to_owned(),
+                mmproj: None,
+                alias_flag: "local-qwen35-9b".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: Some(8100),
+                ctx,
+                parallel: None,
+                kv_type: None,
+                ngl: NglPlan::Auto,
+                split: SplitPlan::default(),
+                mode,
+                flash_attn: None,
+                api_key: None,
+                extra_args: Vec::new(),
+            }),
+            provenance: Provenance2 {
+                discovered_at_unix: 100,
+                size_bytes: None,
+                source: label.to_owned(),
+                fit: None,
+            },
+            created_at_unix: 100,
+            updated_at_unix: 100,
+        };
+        let rows = || {
+            vec![
+                SourcedRecipe {
+                    authority: RecipeAuthority::Snapshot,
+                    from: "snapshot.json".to_owned(),
+                    recipe: local(None, "snapshot", SamplingMode::Thinking),
+                },
+                SourcedRecipe {
+                    authority: RecipeAuthority::LaunchPlan,
+                    from: "recipes.toml".to_owned(),
+                    recipe: local(Some(32_768), "plan", SamplingMode::Coding),
+                },
+            ]
+        };
+
+        let mut w1 = Vec::new();
+        let forwards = merge_duplicate_recipes(rows(), &mut w1);
+        let mut reversed = rows();
+        reversed.reverse();
+        let mut w2 = Vec::new();
+        let backwards = merge_duplicate_recipes(reversed, &mut w2);
+
+        assert_eq!(forwards, backwards, "discovery order must not decide");
+        assert_eq!(w1, w2);
+        assert_eq!(forwards.len(), 1);
+        let RecipeKind::Local(spec) = &forwards[0].kind else {
+            panic!("local");
+        };
+        assert_eq!(spec.ctx, Some(32_768));
+        assert_eq!(
+            spec.mode,
+            SamplingMode::Coding,
+            "the launch plan outranks the snapshot on a field both set"
+        );
+        assert_eq!(forwards[0].label, "plan");
+        assert_eq!(w1.len(), 1);
+        assert!(w1[0].contains("mode: Coding over Thinking"), "{}", w1[0]);
+        assert!(
+            w1[0].contains("label: \"plan\" over \"snapshot\""),
+            "{}",
+            w1[0]
+        );
+    }
+
+    /// Two sources, one id, and they do not even describe the same *kind* of thing. Neither
+    /// may be dropped, so the second is renamed and the operator is told to choose.
+    #[test]
+    fn an_id_claimed_by_two_different_kinds_keeps_both_under_distinct_ids() {
+        let id = RecipeId::parse("clash").expect("id");
+        let managed = Recipe {
+            id: id.clone(),
+            label: "clash".to_owned(),
+            description: None,
+            kind: RecipeKind::Managed(ManagedSpec {
+                provider: ProviderId::parse("together").expect("provider"),
+                base_url: "https://api.together.ai".to_owned(),
+                credential: CredentialSource::Env {
+                    var: "TOGETHER_API_KEY".to_owned(),
+                },
+                model_id: Some("m".to_owned()),
+                protocol: Protocol::OpenAi,
+            }),
+            provenance: Provenance2::default(),
+            created_at_unix: 1,
+            updated_at_unix: 1,
+        };
+        let mut local = managed.clone();
+        local.kind = RecipeKind::Local(LocalLlamaSpec {
+            build: BuildId::parse("build-vulkan").expect("build"),
+            model_path: "/m/q.gguf".to_owned(),
+            mmproj: None,
+            alias_flag: "clash".to_owned(),
+            host: "127.0.0.1".to_owned(),
+            port: None,
+            ctx: None,
+            parallel: None,
+            kv_type: None,
+            ngl: NglPlan::Auto,
+            split: SplitPlan::default(),
+            mode: SamplingMode::Thinking,
+            flash_attn: None,
+            api_key: None,
+            extra_args: Vec::new(),
+        });
+
+        let mut warnings = Vec::new();
+        let out = merge_duplicate_recipes(
+            vec![
+                SourcedRecipe {
+                    authority: RecipeAuthority::LaunchPlan,
+                    from: "recipes.toml".to_owned(),
+                    recipe: local,
+                },
+                SourcedRecipe {
+                    authority: RecipeAuthority::Pin,
+                    from: ".pinned_provider".to_owned(),
+                    recipe: managed,
+                },
+            ],
+            &mut warnings,
+        );
+        assert_eq!(out.len(), 2, "neither definition may be dropped");
+        assert_eq!(out[0].id.as_str(), "clash");
+        assert_eq!(out[1].id.as_str(), "clash-2");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("DIFFERENT KINDS"), "{}", warnings[0]);
+        assert!(warnings[0].contains("`clash-2`"), "{}", warnings[0]);
+    }
+
+    /// A recipe the operator already has under that id is never overwritten — and never
+    /// silently declined either.
+    #[test]
+    fn an_existing_catalog_entry_wins_and_the_decline_is_reported() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let lr = colliding_world(home.path());
+        let paths = test_paths(home.path(), Some(&lr));
+        let cfg = Config::default();
+        paths.ensure_layout().expect("layout");
+
+        // The operator's own entry, under the id the migration is about to want.
+        let mut mine = Recipe {
+            id: RecipeId::parse("local-qwen35-9b").expect("id"),
+            label: "mine, hand made".to_owned(),
+            description: None,
+            kind: RecipeKind::Local(LocalLlamaSpec {
+                build: BuildId::parse("build-vulkan").expect("build"),
+                model_path: "/m/other.gguf".to_owned(),
+                mmproj: None,
+                alias_flag: "mine".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: Some(8199),
+                ctx: Some(4096),
+                parallel: None,
+                kv_type: None,
+                ngl: NglPlan::Auto,
+                split: SplitPlan::default(),
+                mode: SamplingMode::Raw,
+                flash_attn: None,
+                api_key: None,
+                extra_args: Vec::new(),
+            }),
+            provenance: Provenance2::default(),
+            created_at_unix: 1,
+            updated_at_unix: 1,
+        };
+        mine.provenance.source = "hand".to_owned();
+        crate::catalog::save(
+            &paths,
+            &crate::catalog::Catalog {
+                recipes: vec![mine.clone()],
+                profiles: Vec::new(),
+            },
+        )
+        .expect("seed catalog");
+
+        let plan = super::plan(&paths, &cfg).expect("plan");
+        let report = apply(&paths, &cfg, &plan).expect("apply");
+        let catalog = crate::catalog::load(&paths).expect("catalog");
+        assert_eq!(catalog.recipes.len(), 1);
+        assert_eq!(catalog.recipes[0].label, "mine, hand made");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("already in catalog.toml with a DIFFERENT definition")),
+            "declining to import must be said out loud: {:?}",
+            report.warnings
+        );
+    }
+
+    /// The acceptance case, on the real machine: migrate a **copy** of the real
+    /// `~/.vastai-gguf` plus the real LocalRouter checkout, and prove the originals were not
+    /// touched by hashing them either side. Skipped where those directories do not exist,
+    /// which is every machine but this one.
+    #[test]
+    fn the_real_legacy_state_copied_yields_exactly_one_local_qwen35_9b() {
+        let Some(real_home) = dirs::home_dir() else {
+            return;
+        };
+        let real_vg = real_home.join(".vastai-gguf");
+        let real_lr = real_home.join("Projects/Inference/tools/LocalRouter");
+        if !real_vg.is_dir() || !real_lr.join("recipes.toml").is_file() {
+            return;
+        }
+
+        // Hashed BEFORE anything else happens, and again at the end: `~/.vastai-gguf` is
+        // another tool's state directory and this test must be provably read-only on it.
+        let vg_before = tree_hash(&real_vg);
+        let lr_recipes_before = tree_hash(&real_lr.join("recipes.toml"));
+
+        let home = tempfile::tempdir().expect("tempdir");
+        copy_tree(&real_vg, &home.path().join(".vastai-gguf"));
+        let lr = home.path().join("LocalRouterFixture");
+        fs::create_dir_all(&lr).expect("mkdir");
+        fs::copy(real_lr.join("recipes.toml"), lr.join("recipes.toml")).expect("copy recipes");
+        write(&lr.join("endpoint_proxy.py"), "# marker\n");
+
+        let paths = test_paths(home.path(), Some(&lr));
+        let cfg = Config::default();
+        let plan = super::plan(&paths, &cfg).expect("plan");
+        let report = apply(&paths, &cfg, &plan).expect("apply");
+
+        let catalog = crate::catalog::load(&paths).expect("catalog");
+        let ids: Vec<&str> = catalog.recipes.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids.iter().filter(|i| **i == "local-qwen35-9b").count(),
+            1,
+            "the real machine's two sources for this id must import as ONE entry: {ids:?}"
+        );
+        let r = catalog
+            .recipes
+            .iter()
+            .find(|r| r.id.as_str() == "local-qwen35-9b")
+            .expect("the recipe");
+        let RecipeKind::Local(spec) = &r.kind else {
+            panic!("expected a local recipe");
+        };
+        assert_eq!(
+            spec.ctx,
+            Some(32_768),
+            "the context size the operator actually wrote must survive the merge"
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.contains("were MERGED")
+                && w.contains("local-qwen35-9b")
+                && w.contains("ctx=32768")),
+            "the merge must be stated: {:?}",
+            report.warnings
+        );
+        // No id appears twice, for any recipe.
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        let mut deduped = sorted.clone();
+        deduped.dedup();
+        assert_eq!(sorted, deduped, "no id may repeat: {ids:?}");
+
+        assert_eq!(
+            vg_before,
+            tree_hash(&real_vg),
+            "the real ~/.vastai-gguf must be byte-identical afterwards"
+        );
+        assert_eq!(
+            lr_recipes_before,
+            tree_hash(&real_lr.join("recipes.toml")),
+            "the real recipes.toml must be byte-identical afterwards"
+        );
+    }
+
+    /// Recursive copy, so a test can migrate real state without going near it again.
+    fn copy_tree(src: &Path, dst: &Path) {
+        fs::create_dir_all(dst).expect("mkdir");
+        let Ok(rd) = fs::read_dir(src) else { return };
+        for entry in rd.filter_map(std::result::Result::ok) {
+            let from = entry.path();
+            let to = dst.join(entry.file_name());
+            if from.is_dir() {
+                copy_tree(&from, &to);
+            } else {
+                fs::copy(&from, &to).expect("copy");
+            }
+        }
     }
 }

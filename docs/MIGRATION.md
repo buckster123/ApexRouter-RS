@@ -113,6 +113,40 @@ third-party credential files are read where they are and stay there.
 `--apply` is safe to re-run. Providers, forks, recipes and profiles are inserted only when absent,
 and a ledger row already carrying the import marker is not appended twice.
 
+### 4.1 When two legacy sources mint the same recipe id
+
+They **merge, field by field**. They do not race, and neither silently wins.
+
+This case is not hypothetical: on this machine `local_instances/local-qwen35-9b.json` and
+`<LocalRouter>/recipes.toml#recipes.local-qwen35-9b` both mint `local-qwen35-9b`, and the two
+sources mint ids from independent sets, so nothing upstream can notice the collision.
+
+Sources are ranked — `recipes.toml` launch plan > `.pinned_provider` pin > `local_instances/*.json`
+snapshot — and the rank is a **tie-breaker, not a chooser**:
+
+- a field only one source sets is **always taken**, whatever its rank. This is what saves
+  `ctx = 32768`: the launch plan knows the context, the saved instance does not;
+- a field both set **differently** goes to the higher rank and the warning names **both** values,
+  so the discarded one is on the record rather than lost;
+- `description` and `provenance.source` are **concatenated**, not chosen;
+- two sources meaning genuinely different `RecipeKind`s are **both kept**, the second renamed
+  `<id>-2`, loudly. Merging a local endpoint into a managed provider would be a lie.
+
+The merge is announced twice: as a `duplicate recipe id` row with action `Warn` in the plan, so
+`--dry-run` shows it *before* anything is written, and as a `MigrationReport` warning plus a
+`tracing::warn!` afterwards. The row names every source, the effective settings, and every field
+the sources disagreed about.
+
+`catalog.rs` enforces the invariant at both ends independently of migration: `read_file` renames a
+repeated id in memory (never drops it) with a warning, so a `catalog.toml` an earlier build already
+corrupted heals on the next read with both definitions reachable; `write_file` refuses a `Catalog`
+carrying a repeat with `Error::Invalid`, since at that point it can only be a caller bug.
+
+> **Behaviour change for existing installs.** Anyone whose `catalog.toml` already holds a duplicate
+> id will see the second entry appear as `<id>-2` in `recipe ls` from the next read, with a warning
+> on stderr. That is the repair, not a regression — before it, the second entry was unreachable and
+> `recipe rm` deleted both.
+
 ---
 
 ## 5. Credentials: a reference, never a copy
@@ -254,30 +288,34 @@ ledger — a leak must be visible.
 
 ---
 
-## 10. Open items (as of the I-01 gate)
+## 10. Open items (as of the mk1 final gate)
 
 Recorded here rather than remembered, each with the owner it belongs to.
 
-1. **`apply` can write two recipes under one id.** `core::migrate::apply` de-duplicates recipe ids
-   against the catalog it is writing into, but not against the batch it is writing. On the real
-   machine both `local_instances/local-qwen35-9b.json` and `recipes.toml#recipes.local-qwen35-9b`
-   mint `local-qwen35-9b`, so `catalog.toml` ends up holding two recipes under that id: the second
-   is unreachable (`recipe show` finds the first) and `recipe rm` deletes both. A measurable second
-   symptom is that such a `catalog.toml` does not survive its own `toml_edit` round-trip byte-for-
-   byte. Remove the collision and `--apply` is byte-idempotent from the first run.
-   `crates/apexrouter-cli/tests/migrate_e2e.rs::apply_never_writes_two_recipes_under_the_same_id`
-   is written and `#[ignore]`d; delete the attribute with the fix. Owner: unit C-16
-   (`core/src/migrate.rs`) — the fix is to carry one `used ids` set across the whole survey, or to
-   route the batch through `catalog::upsert_recipe`, which already generates unique ids.
-2. **There is no way to strike a row through the CLI.** The plan exists so a human can delete rows
+**Closed 2026-07-31 — two recipes under one id.** `core::migrate::apply` used to de-duplicate
+recipe ids against the catalog it was writing into but not against the batch it was writing. On
+this machine both `local_instances/local-qwen35-9b.json` and
+`recipes.toml#recipes.local-qwen35-9b` mint `local-qwen35-9b`, so `catalog.toml` ended up holding
+two recipes under that id: the second unreachable (`recipe show` found the first) and `recipe rm`
+deleting both. The resolution is a **field-wise merge, not a pick** — see §4.1.
+`apply_never_writes_two_recipes_under_the_same_id` is no longer `#[ignore]`d, and `--apply` is
+byte-idempotent from run 1.
+
+1. **There is no way to strike a row through the CLI.** The plan exists so a human can delete rows
    before `--apply`, and `core::migrate::apply` honours that (a row downgraded to `Skip` is not
    written) — but no surface exposes it. `apexrouter migrate --apply` recomputes the plan and passes
    it whole. This is what makes §6's mirror warning necessary.
-3. **`POST /v1/migrate` is documented and not built.** It is in `ARCHITECTURE.md` §6 and in
+2. **`POST /v1/migrate` is documented and not built.** It is in `ARCHITECTURE.md` §6 and in
    `openapi/apexrouter-v1.yaml`, and `crates/apexrouter-server/tests/openapi_routes.rs` lists it in
    `PENDING` as owed by "I-01/S-08". No unit's file-ownership list in `BUILD-PLAN.md` §5 contains
    `crates/apexrouter-server/src/api/migrate.rs`, so it is documented, unowned and unbuilt. Building
    it needs a new `api` module **and** its one `.merge(…)` line in `server/src/lib.rs::v1_routes()`,
    which only S-01 may edit — see `CLAUDE.md`, "mount it, don't describe it". Its request body
-   (`MigrateRequest { dry_run }`) also cannot express item (2) above, so the two should be designed
+   (`MigrateRequest { dry_run }`) also cannot express item (1) above, so the two should be designed
    together.
+3. **`apexrouter config validate` is not a CLI verb.** `Config::validate(&Paths)` and
+   `Config::validate_file(&Path)` exist in `apexrouter-core` and are infallible, reporting parse
+   error + unknown keys + the addresses actually bound. Rendering them is a two-liner in
+   `cli/src/cmd/config.rs` plus an arm on `ConfigCmd`, class `Pure`. Until then the same
+   information is available from `apexrouter config show --json | jq .unknown_keys`, and every
+   unknown key is already logged at WARN on stderr whenever the config is read. Owner: unit S-06.

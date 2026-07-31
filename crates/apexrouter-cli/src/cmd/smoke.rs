@@ -33,7 +33,13 @@ use apexrouter_protocol::{Backend, ModelRoute, ProviderId, ServedBy, SmokeProbe}
 /// *failing probe* is not an error: it is the answer, and it is on stdout.
 pub async fn run(ctx: &Ctx, args: &SmokeArgs) -> anyhow::Result<()> {
     let target = resolve(ctx, args).await?;
-    render::print_line(&format!("{}  {}", target.label(), target.base_url));
+    // House rule 5: in `--json` mode stdout carries the envelope and nothing else. The
+    // banner is progress feedback for a human watching four probes run, and `| jq` is the
+    // other reader of this stream — it used to see `Self-hosted (tunnel/localhost)  http://…`
+    // on line one and fail.
+    if !args.json {
+        render::print_line(&format!("{}  {}", target.label(), target.base_url));
+    }
 
     // The registry documents a dropped receiver as normal: the probes are rendered from the
     // returned Vec, in run order, which is the order that makes `warmup` before

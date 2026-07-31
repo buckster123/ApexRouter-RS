@@ -19,12 +19,13 @@
 
 use super::{bind_alias, register_backend, ApiError, ApiResult};
 use crate::state::AppState;
+use apexrouter_core::argv;
 use apexrouter_core::error::Error as CoreError;
 use apexrouter_core::proc::Adoption;
 use apexrouter_protocol::{
     Alias, ArgvPreview, BackendId, DesiredState, EndpointRecord, EndpointSpec, Event,
 };
-use apexrouter_providers::local::adopt;
+use apexrouter_providers::local::{adopt, ResolvedSpec};
 use apexrouter_providers::{DownMode, Provisioner};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -255,23 +256,115 @@ pub async fn adopt_one(
     Ok(Json(rec))
 }
 
-/// `GET /v1/endpoints/{id}/argv` — exactly what would be exec'd, including the env.
+/// `GET /v1/endpoints/{id}/argv` — the command line **this** endpoint was exec'd with.
 ///
-/// Comes from the supervisor's own planner, so the preview and the launch cannot drift.
+/// # It describes the launch that happened, not a launch that might
+///
+/// This route used to call `supervisor.plan(&rec.spec)`, which re-runs the *planner*: it
+/// re-scans the rig, re-solves `fit()` against whatever VRAM is free **now**, and leases a
+/// fresh port. For a running child that is a hypothetical *second* launch, and the two
+/// answers diverge the moment anything moves. Measured after a VRAM budget change: the daemon
+/// served 34 tokens where `/proc/<pid>/cmdline` had 36 — `-c 4096` instead of `-c 32768`, and
+/// `-ngl 999` gone entirely, i.e. it described a CPU-only launch for a fully-offloaded child.
+/// `warnings` was empty; nothing said the preview and the process disagreed.
+///
+/// It is the daemon-served route, so it is the **normal** answer — `apexrouter endpoint argv`
+/// asks the daemon whenever one is running, and there is no flag that reaches the other path.
+/// An operator debugging a launch is the person least able to afford a plausible lie.
+///
+/// The fix is [`ResolvedSpec::from_record`], the same line the daemon-less route in
+/// `cli/src/cmd/endpoint.rs` uses: `EndpointRecord::spec` holds the operator's **draft** (that
+/// is what keeps `same_endpoint` matching, so a restart does not leave a second record) and
+/// the solver's numbers live in `EndpointRecord::fit`, so putting them back together
+/// reproduces exactly what the supervisor folded together at launch. Nothing is re-solved and
+/// nothing is re-leased.
+///
+/// [`ResolvedSpec::disagreements`] then checks the rendered argv against the plan the record
+/// says it executes, and any divergence lands in [`ArgvPreview::warnings`] where both
+/// `--json` and `print_argv` show it — rather than being invisible because nothing asked.
+///
 /// **No credential is ever in `argv`**: a key is passed as `--api-key-file`, and the preview
-/// names the file, never its contents.
+/// names the file the supervisor really wrote, never its contents.
+///
+/// # Errors
+/// `404` for an unknown id; `409` when the record's build is no longer on the machine, or
+/// when the endpoint is not one this supervisor launches (a LAN node has no local argv).
 pub async fn argv(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<ArgvPreview> {
     let rec = record(&s, &id)?;
-    let plan = s.supervisor.plan(&rec.spec).await.map_err(ApiError::from)?;
-    Ok(Json(plan.argv))
+    Ok(Json(argv_of_record(&s, &rec).await?))
 }
 
 // ----------------------------------------------------------------------------------------
 // internals
 // ----------------------------------------------------------------------------------------
+
+/// Render the argv of an endpoint **from its record**, never from a fresh plan.
+///
+/// Every input is a fact about the launch that happened:
+///
+/// * the resolved spec is [`ResolvedSpec::from_record`] — the record's draft with the
+///   record's `fit` folded back in, at the port the record was leased;
+/// * the build is the one the record names, looked up in the supervisor's own rig snapshot,
+///   because `FlagSupport` decides which flags were emitted at all and a different build
+///   would drop a different set;
+/// * the key file is the path `LocalProvisioner::materialise_key` writes, which is derived
+///   from the id and so cannot be guessed wrong;
+/// * `cwd` is **this** daemon's state directory, exactly as the supervisor overrides it after
+///   `core::argv` resolves one from the process environment.
+///
+/// The only thing left to disagree about is the rendering itself, and
+/// [`ResolvedSpec::disagreements`] reports that into `warnings`.
+///
+/// # Errors
+/// `409` when the named build is gone, when a local spec cannot be rendered, or when the
+/// endpoint is not locally supervised.
+async fn argv_of_record(s: &Arc<AppState>, rec: &EndpointRecord) -> Result<ArgvPreview, ApiError> {
+    let resolved = ResolvedSpec::from_record(rec);
+    let mut preview = match resolved.spec() {
+        EndpointSpec::LocalLlama(spec) => {
+            // The supervisor's cached snapshot, not a fresh scan: the same rig the launch
+            // chose its build from, and the one `set_rig` installs in tests.
+            let rig = s.supervisor.rig().await.map_err(ApiError::from)?;
+            let build = rig
+                .builds
+                .iter()
+                .find(|b| b.id == spec.build)
+                .ok_or_else(|| {
+                    ApiError::conflict(format!(
+                        "build `{}` is no longer on this machine, so the argv {} was started \
+                         with cannot be re-rendered faithfully; `apexrouter rig` lists what is",
+                        spec.build.as_str(),
+                        rec.id
+                    ))
+                })?;
+            let key_file = spec
+                .api_key
+                .as_ref()
+                .map(|_| s.paths.endpoints_dir().join(format!("{}.key", rec.id)));
+            let mut preview = argv::plan_local(spec, build, key_file.as_deref())
+                .map_err(|e| ApiError::conflict(e.to_string()))?;
+            preview.warnings.extend(resolved.disagreements(&preview));
+            preview
+        }
+        EndpointSpec::LocalVllm(spec) => {
+            argv::plan_local_vllm(spec).map_err(|e| ApiError::conflict(e.to_string()))?
+        }
+        other => {
+            return Err(ApiError::conflict(format!(
+                "{} is a {:?} endpoint, which this daemon does not launch, so it has no argv",
+                rec.id,
+                other.kind()
+            )))
+        }
+    };
+    // `core::argv` resolves a cwd from the process environment; this daemon's own `Paths` is
+    // what the supervisor hands the child, so it is authoritative here too.
+    preview.cwd = s.paths.state().display().to_string();
+    Ok(preview)
+}
 
 /// Parse a path segment into a `BackendId`.
 fn parse_id(id: &str) -> Result<BackendId, ApiError> {
@@ -474,5 +567,48 @@ mod tests {
             let body: apexrouter_protocol::ErrorEnvelope = res.json().await.expect("envelope");
             assert_eq!(body.error.kind, "not_found");
         }
+    }
+
+    /// A backend nobody launches has no command line, and saying so is the whole answer.
+    ///
+    /// Rendering *something* for a LAN node would mean inventing a `llama-server` invocation
+    /// for a URL somebody registered — argv for a process that does not exist and never will,
+    /// which is the same class of plausible lie the record-resolved preview exists to end.
+    #[tokio::test]
+    async fn an_endpoint_this_daemon_does_not_launch_has_no_argv() {
+        let state = app(test_config());
+        let base = serve_api(Arc::clone(&state)).await;
+        state
+            .store
+            .put_endpoint(&EndpointRecord {
+                id: BackendId::parse("lan-box").expect("id"),
+                spec: EndpointSpec::Node(apexrouter_protocol::NodeSpec {
+                    base_url: "http://127.0.0.2:8080".to_owned(),
+                    credential: CredentialSource::None,
+                    label: "the box in the cupboard".to_owned(),
+                    declared_models: vec![],
+                    protocol: Default::default(),
+                }),
+                desired: DesiredState::Running,
+                proc: None,
+                port: None,
+                log_path: None,
+                started_at_unix: 0,
+                fit: None,
+                adopted: false,
+                alias_bindings: vec![],
+            })
+            .expect("write the record");
+
+        let res = reqwest::get(format!("{base}/v1/endpoints/lan-box/argv"))
+            .await
+            .expect("get");
+        assert_eq!(res.status(), 409);
+        let body: apexrouter_protocol::ErrorEnvelope = res.json().await.expect("envelope");
+        assert!(
+            body.error.message.contains("no argv"),
+            "{}",
+            body.error.message
+        );
     }
 }

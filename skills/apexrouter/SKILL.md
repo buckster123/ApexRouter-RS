@@ -131,9 +131,12 @@ Get the live values instead of trusting this file: `apexrouter url`, `apexrouter
   That is the model, not a routing bug. Start it with `--mode nonthinking` if the client insists
   on `content`.
 - **Anthropic ingress**: `POST /v1/messages` requires `max_tokens` (400 otherwise, with an
-  Anthropic-shaped body). `tools` are **refused with a clear error** unless `[router]
-  anthropic_tools = true`. `thinking` blocks and `count_tokens` are `501` — deliberately, because
-  a fabricated token count is worse than an error you can fall back from.
+  Anthropic-shaped body). `tools` are translated by default (`[router] anthropic_tools = true`)
+  and the translation is **best-effort** — parallel tool calls, some `tool_choice` variants and a
+  block-array `tool_result` may not survive. Only if an operator sets the key **explicitly to
+  `false`** are `tools` **refused with a clear error** naming it. `thinking` blocks and
+  `count_tokens` are `501` — deliberately, because a fabricated token count is worse than an error
+  you can fall back from.
 - **Offline is a first-class answer.** Every `--json` envelope and every MCP result carries
   `served_by` (`daemon` | `offline`), `as_of_unix` and `stale`. An offline answer is facts from
   disk with health and throughput left at zero rather than invented.

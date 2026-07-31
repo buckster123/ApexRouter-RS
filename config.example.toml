@@ -13,6 +13,15 @@
 # A missing config file is therefore a fully working zero-config install, and deleting any
 # line from this file changes nothing. Nothing here is required.
 #
+# A key that is NOT one of the ones below does nothing — but it does not do nothing quietly.
+# `proxy_port` is a plausible typo for `proxy_bind`; it used to be ignored in silence while
+# the daemon bound the default and `config show` printed the default back, so the operator
+# had no way to tell. Every unknown key is now logged at WARN on stderr the moment the file
+# is read, and listed under `unknown_keys` by `config show` and `config show --json`, with
+# the key it was probably meant to be. It is deliberately NOT an error: an older binary has
+# to survive a newer file, and a section from next month's build must never stop today's
+# daemon from starting.
+#
 # Credentials are NOT configured here. A key you merely *borrow* from an env var or from a
 # third-party file is never copied into this file — the sections below name *where* a key
 # lives (`api_key_env`, `api_key_file`), never the key itself. A key you type into a GUI or
@@ -76,6 +85,12 @@ headers_timeout_ms = 600000
 idle_timeout_ms = 300000
 # How long to wait for a backend concurrency permit before answering 503 + Retry-After.
 queue_timeout_ms = 30000
+# How many requests may PARK on an alias during a sequential swap before it starts refusing.
+# While a swap is loading the replacement the alias cannot serve, so arriving requests wait
+# instead of getting a 503. Past this depth the honest answer is 503 warm_queue_full with a
+# Retry-After: a deeper queue only moves the failure later. The wait itself is bounded by
+# patience, not by a stopwatch — see [supervisor] health_deadline_ms and ARCHITECTURE 4.7.
+warm_queue_max = 32
 # Per-backend retry token bucket, so a struggling backend is not amplified into a storm.
 retry_budget_per_min = 30
 # How many observations a breaker needs before it is allowed to open.
@@ -91,10 +106,14 @@ log_usage = true
 # Serve POST /v1/messages (the Anthropic dialect) on the proxy listener, so
 # ANTHROPIC_BASE_URL=http://127.0.0.1:8888 drives a local or rented model.
 anthropic_ingress = true
-# Translate tool_use/tool_result <-> tool_calls. OFF by default: it is the imperfect part.
-# With it off, a /v1/messages body carrying `tools` is REFUSED loudly rather than silently
-# stripped and answered wrongly.
-anthropic_tools = false
+# Translate tool_use/tool_result <-> tool_calls. ON by default, and BEST-EFFORT: parallel
+# tool calls, some `tool_choice` variants and a `tool_result` whose content is a block array
+# do not map cleanly in every case. It is on anyway because Claude Code sends 92 tool
+# definitions on EVERY request — tools are not an optional part of that client, so off means
+# the Anthropic ingress does not work at all for the client it exists to serve.
+# Set it to false and a /v1/messages body carrying `tools` is REFUSED loudly, naming this
+# key, rather than silently stripped and answered wrongly.
+anthropic_tools = true
 
 [supervisor]
 # A REAL wall-clock deadline for the health gate, reset whenever observable progress is

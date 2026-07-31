@@ -7,6 +7,26 @@
 //! A **borrowed** credential is never copied into our config: [`ConfigFile`] deliberately
 //! has no field capable of holding one. Only a key the user typed into a GUI or
 //! `--key-stdin` is written, and it goes to `$STATE/credentials.toml` at `0600`.
+//!
+//! # Unknown keys are reported, never obeyed and never fatal
+//!
+//! `[server] proxy_port = 18888` is a plausible typo for `proxy_bind`, and for one build it
+//! did exactly nothing: the daemon bound `8888` while `config show` printed the default, with
+//! no warning anywhere. A hard `#[serde(deny_unknown_fields)]` would have caught it and would
+//! also have made an *older* binary refuse to start on a *newer* file, which is a worse
+//! failure — so the rule here is **warn, loudly, on every surface**:
+//!
+//! * [`parse_config`] diffs the document the user wrote against the document the loaded
+//!   config re-serialises to. Anything present in the first and absent in the second is a key
+//!   this build does not know.
+//! * Each one is logged at `warn` (stderr, per house rule 5) *and* recorded on
+//!   [`Config::unknown_keys`], which [`Config::serializable`] carries — so `config show` and
+//!   `config show --json` both surface it without the CLI having to remember to ask.
+//! * [`Config::validate_file`] is the same check as a report, for a `config validate` verb:
+//!   it prints the unknown keys next to the addresses actually bound, which is the pair that
+//!   makes a typo obvious.
+//! * `save()` never writes `unknown_keys` back, and never deletes the offending key either —
+//!   it is the user's text, in the user's file.
 
 use crate::error::{Error, Result};
 use apexrouter_protocol::{ImageType, ProviderId};
@@ -45,6 +65,12 @@ pub struct Config {
     pub known_forks: BTreeMap<String, KnownFork>,
     /// Interoperability with `~/.vastai-gguf` and the old TUI.
     pub compat: CompatCfg,
+    /// Keys the file carried that this build does not know — a typo, or a section from a
+    /// newer build. **Runtime-only**: `#[serde(skip)]`, so it is never read from or written
+    /// back to `config.toml`; it exists so that every surface that renders a config renders
+    /// the fact that part of the file was ignored.
+    #[serde(skip)]
+    pub unknown_keys: Vec<UnknownKey>,
 }
 
 impl Default for Config {
@@ -64,6 +90,7 @@ impl Default for Config {
             docker: DockerCfg::default(),
             known_forks: default_known_forks(),
             compat: CompatCfg::default(),
+            unknown_keys: Vec::new(),
         }
     }
 }
@@ -169,6 +196,13 @@ pub struct RouterCfg {
     pub idle_timeout_ms: u64,
     /// How long to wait for a backend permit before 503 + `Retry-After`.
     pub queue_timeout_ms: u64,
+    /// How many requests a **warm window** admits before it refuses (`ARCHITECTURE.md`
+    /// §4.7). During a sequential swap the alias cannot serve, so arriving requests park
+    /// rather than `503`; past this depth the honest answer is `503 warm_queue_full` with a
+    /// `Retry-After`, because deepening a queue that is already the wrong answer only moves
+    /// the failure later. `apexrouter_router::DEFAULT_WARM_QUEUE_MAX` is the same number and
+    /// is the fallback for callers that have no `Config`.
+    pub warm_queue_max: u32,
     /// Per-backend retry token bucket, so a struggling backend is not amplified into a storm.
     pub retry_budget_per_min: u32,
     /// Observations required before the breaker may open.
@@ -182,9 +216,13 @@ pub struct RouterCfg {
     pub log_usage: bool,
     /// Serve `POST /v1/messages` on the proxy listener.
     pub anthropic_ingress: bool,
-    /// Translate `tool_use`/`tool_result` <-> `tool_calls`. **Off by default**: it is the
-    /// imperfect part, and with it off a `/v1/messages` body carrying `tools` is REFUSED,
-    /// loudly, rather than silently stripped and answered wrongly.
+    /// Translate `tool_use`/`tool_result` <-> `tool_calls`. **On by default** since
+    /// 2026-07-31 (CHARTER amendment): Claude Code sends 92 tool definitions on every
+    /// request, so with this off the Anthropic ingress is dead on arrival for the one
+    /// client it exists to serve. Translation is best-effort and allowed to be imperfect;
+    /// the alternative was not "no tools", it was "the feature does not work at all".
+    /// Turned off explicitly, a `/v1/messages` body carrying `tools` is still REFUSED
+    /// loudly, naming this key — never silently stripped and answered wrongly.
     pub anthropic_tools: bool,
 }
 
@@ -201,13 +239,14 @@ impl Default for RouterCfg {
             headers_timeout_ms: 600_000,
             idle_timeout_ms: 300_000,
             queue_timeout_ms: 30_000,
+            warm_queue_max: 32,
             retry_budget_per_min: 30,
             breaker_min_volume: 5,
             request_usage: "off".to_owned(),
             capture_bodies: false,
             log_usage: true,
             anthropic_ingress: true,
-            anthropic_tools: false,
+            anthropic_tools: true,
         }
     }
 }
@@ -467,6 +506,15 @@ impl Default for CompatCfg {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConfigFile {
+    /// Keys the file carried that this build does not know.
+    ///
+    /// **Declared first, and cleared before every write.** First, because TOML puts bare
+    /// values before tables and a root key rendered after `[compat]` would be read back as
+    /// part of `[compat]`. Cleared, because this is a *report about* the file, not content
+    /// of it: [`Config::save_to`] blanks it so the round-trip cannot invent a key, while the
+    /// key the user actually mistyped is left exactly where they wrote it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_keys: Vec<UnknownKey>,
     /// `[server]`.
     pub server: ServerCfg,
     /// `[router]`.
@@ -487,6 +535,61 @@ pub struct ConfigFile {
     pub known_forks: BTreeMap<String, KnownFork>,
     /// `[compat]`.
     pub compat: CompatCfg,
+}
+
+/// One key in a `config.toml` that this build does not know.
+///
+/// Not an error and not a refusal: an older binary must survive a newer file. It is a
+/// *statement*, carried on [`Config::unknown_keys`] and rendered by `config show`, because
+/// the alternative — a key that does nothing and says nothing — is how an operator ends up
+/// debugging a port they thought they had set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnknownKey {
+    /// Dotted path as written, e.g. `server.proxy_port`.
+    pub path: String,
+    /// The known key at the same level it is closest to, when one is plausible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub did_you_mean: Option<String>,
+}
+
+impl std::fmt::Display for UnknownKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.did_you_mean {
+            Some(s) => write!(f, "{} (did you mean `{s}`?)", self.path),
+            None => write!(f, "{}", self.path),
+        }
+    }
+}
+
+/// What [`Config::validate_file`] answers: does this file parse, what in it is ignored, and
+/// what would actually be bound.
+///
+/// The last two belong in one report on purpose. The `proxy_port`/`proxy_bind` typo was
+/// invisible precisely because "the key you wrote" and "the port that got bound" were never
+/// printed next to each other.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ConfigValidation {
+    /// The file inspected.
+    pub path: String,
+    /// False means "defaults everywhere", which is a supported install, not a fault.
+    pub exists: bool,
+    /// `None` when the file parses. A parse failure is the one hard error here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<String>,
+    /// Everything in the file this build ignored.
+    #[serde(default)]
+    pub unknown_keys: Vec<UnknownKey>,
+    /// The address the proxy listener would actually take, `$PROXY_PORT` included.
+    pub proxy_bind: String,
+    /// The address the control listener would actually take.
+    pub control_bind: String,
+}
+
+impl ConfigValidation {
+    /// True when nothing at all is worth telling the operator.
+    pub fn is_clean(&self) -> bool {
+        self.parse_error.is_none() && self.unknown_keys.is_empty()
+    }
 }
 
 /// The bundled `config.example.toml`, embedded at build time.
@@ -563,13 +666,162 @@ fn lift_providers_vast(doc: &mut toml::Value) {
     }
 }
 
-/// Parse a whole `config.toml` document. Unknown keys are ignored, by design: we must
-/// survive additive changes and an older binary reading a newer file.
+/// Parse a whole `config.toml` document.
+///
+/// Unknown keys are **obeyed by nobody and hidden from nobody**: they are ignored for the
+/// purpose of building the [`Config`] — we must survive additive changes and an older binary
+/// reading a newer file — and then reported, on `stderr` and on [`Config::unknown_keys`].
 fn parse_config(text: &str) -> Result<Config> {
-    let mut value: toml::Value = toml::from_str(text)?;
+    let written: toml::Value = toml::from_str(text)?;
+    let mut value = written.clone();
     lift_providers_vast(&mut value);
-    let cfg: Config = value.try_into()?;
+    let mut cfg: Config = value.try_into()?;
+    cfg.unknown_keys = unknown_keys(&written, &cfg);
+    for k in &cfg.unknown_keys {
+        match &k.did_you_mean {
+            Some(near) => tracing::warn!(
+                key = %k.path,
+                did_you_mean = %near,
+                "config.toml key is not one this build knows; it has NO effect"
+            ),
+            None => tracing::warn!(
+                key = %k.path,
+                "config.toml key is not one this build knows; it has NO effect"
+            ),
+        }
+    }
     Ok(cfg)
+}
+
+/// Every key the document carries that the loaded config did not keep.
+///
+/// **Schema-free by construction.** A hand-maintained list of legal keys has exactly the
+/// failure mode this function exists to catch — it would go stale, silently — so the
+/// comparison is against the config's *own* re-serialisation: whatever survived a round trip
+/// through the real structs is known, whatever did not is not. Free-form maps
+/// (`[providers.<id>]`, `[known_forks.<name>]`) therefore need no special handling at all:
+/// the user's own key is in both documents.
+fn unknown_keys(written: &toml::Value, cfg: &Config) -> Vec<UnknownKey> {
+    let Ok(toml::Value::Table(mut effective)) = toml::Value::try_from(cfg.serializable()) else {
+        // Unreachable in practice; a config that cannot re-serialise is not a reason to
+        // fail a load that has already succeeded.
+        return Vec::new();
+    };
+    let Some(written) = written.as_table() else {
+        return Vec::new();
+    };
+    // `[providers.vast]` is the spelling ARCHITECTURE §5.2 prints, and `lift_providers_vast`
+    // copies its keys into the canonical `[vast]`. Both spellings are legal in that one
+    // table, so widen it to the union before the walk — otherwise a config pasted straight
+    // out of the documentation warns about every money key in it.
+    if let Some(toml::Value::Table(vast)) = effective.get("vast").cloned() {
+        if let Some(pv) = effective
+            .get_mut("providers")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|p| p.get_mut("vast"))
+            .and_then(toml::Value::as_table_mut)
+        {
+            for (k, v) in vast {
+                pv.entry(k).or_insert(v);
+            }
+        }
+    }
+    // The defaults are consulted for *suggestions only*. An `Option` field left unset
+    // serialises to nothing, so `[providers.<id>] api_key_env` is missing from a config
+    // that does not set it — present in the defaults, though, and that is enough to answer
+    // "did you mean".
+    let defaults = match toml::Value::try_from(Config::default().serializable()) {
+        Ok(toml::Value::Table(t)) => t,
+        _ => toml::Table::new(),
+    };
+    let mut out = Vec::new();
+    diff_table(written, &effective, &defaults, "", &mut out);
+    out
+}
+
+/// Walk `written` against `effective`, recording every path present only in `written`.
+fn diff_table(
+    written: &toml::Table,
+    effective: &toml::Table,
+    defaults: &toml::Table,
+    prefix: &str,
+    out: &mut Vec<UnknownKey>,
+) {
+    for (key, value) in written {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match effective.get(key) {
+            None => out.push(UnknownKey {
+                did_you_mean: nearest_key(key, effective, defaults),
+                path,
+            }),
+            Some(known) => {
+                if let (Some(w), Some(e)) = (value.as_table(), known.as_table()) {
+                    // A free-form map — `[providers.<id>]`, `[known_forks.<name>]` — has no
+                    // entry of the user's name in the defaults. Its *siblings* all have the
+                    // same shape, so the first default entry answers for it. For a fixed
+                    // struct this branch never fires: every non-`Option` field is always
+                    // serialised, so the key is always there.
+                    let d = defaults
+                        .get(key)
+                        .and_then(toml::Value::as_table)
+                        .or_else(|| defaults.values().next().and_then(toml::Value::as_table));
+                    diff_table(w, e, d.unwrap_or(e), &path, out);
+                }
+            }
+        }
+    }
+}
+
+/// The known sibling key an unknown one was most likely meant to be.
+///
+/// A pure edit distance is useless here: `proxy_port` → `proxy_bind` is four substitutions,
+/// well past any sane threshold, yet it is obviously the intended key. Shared prefix decides
+/// first — that is what a typo in a *suffix* looks like — and the distance only breaks ties.
+/// Best-effort by nature: no suggestion at all beats a confidently wrong one, so a candidate
+/// that is neither close nor prefix-sharing is not offered.
+fn nearest_key(key: &str, known: &toml::Table, defaults: &toml::Table) -> Option<String> {
+    let mut best: Option<(usize, usize, &str)> = None;
+    for candidate in known.keys().chain(defaults.keys()) {
+        let shared = key
+            .bytes()
+            .zip(candidate.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let distance = edit_distance(key, candidate);
+        if shared < 3 && distance > 2 {
+            continue;
+        }
+        // Longest shared prefix wins; the closest spelling breaks the tie.
+        let better = match best {
+            None => true,
+            Some((s, d, _)) => shared > s || (shared == s && distance < d),
+        };
+        if better {
+            best = Some((shared, distance, candidate));
+        }
+    }
+    best.map(|(_, _, c)| c.to_owned())
+}
+
+/// Levenshtein distance, two rows at a time. Small inputs — these are TOML key names.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// Parse a bind string, falling back twice so the accessor can stay infallible.
@@ -757,6 +1009,36 @@ impl Config {
         write_private(path, EXAMPLE_CONFIG.as_bytes())
     }
 
+    /// Check one config file without adopting it: does it parse, what does this build
+    /// ignore in it, and what would actually be bound.
+    ///
+    /// Infallible on purpose — it is a *report*, and "the file does not parse" is one of the
+    /// things it reports rather than a reason to have no answer. This is the whole of a
+    /// `config validate` verb; the CLI needs only to render it.
+    pub fn validate_file(path: &Path) -> ConfigValidation {
+        let mut report = ConfigValidation {
+            path: path.display().to_string(),
+            exists: path.exists(),
+            ..ConfigValidation::default()
+        };
+        let cfg = match Config::read_file(path) {
+            Ok(c) => c,
+            Err(e) => {
+                report.parse_error = Some(e.to_string());
+                Config::default()
+            }
+        };
+        report.unknown_keys = cfg.unknown_keys.clone();
+        report.proxy_bind = cfg.proxy_bind().to_string();
+        report.control_bind = cfg.control_bind().to_string();
+        report
+    }
+
+    /// [`validate_file`](Self::validate_file) against the resolved config path.
+    pub fn validate(paths: &crate::paths::Paths) -> ConfigValidation {
+        Config::validate_file(&paths.config_file())
+    }
+
     /// Persist through `toml_edit`, so hand-written comments survive. Mode `0600`.
     ///
     /// # Errors
@@ -789,7 +1071,13 @@ impl Config {
                     why: format!("refusing to overwrite a document that does not parse: {e}"),
                 })?;
 
-        let fresh_text = toml::to_string_pretty(&self.serializable())?;
+        // `unknown_keys` is a report about the file, not a section of it. Blanked here so a
+        // save can never materialise it as a real key — and note that nothing removes the
+        // user's mistyped key either: `merge_table` only ever writes the keys we know, so
+        // whatever they wrote stays exactly where they wrote it, comments and all.
+        let mut on_disk = self.serializable();
+        on_disk.unknown_keys.clear();
+        let fresh_text = toml::to_string_pretty(&on_disk)?;
         let mut fresh: toml_edit::DocumentMut =
             fresh_text
                 .parse()
@@ -815,8 +1103,14 @@ impl Config {
     }
 
     /// The serialisable projection. Runtime-only fields are `#[serde(skip)]`.
+    ///
+    /// [`ConfigFile::unknown_keys`] rides along so that every renderer of a config —
+    /// `config show`, `config show --json` — reports what the file said and this build
+    /// ignored, without each of them having to remember to ask. [`Config::save_to`] clears
+    /// it before writing.
     pub fn serializable(&self) -> ConfigFile {
         ConfigFile {
+            unknown_keys: self.unknown_keys.clone(),
             server: self.server.clone(),
             router: self.router.clone(),
             supervisor: self.supervisor.clone(),
@@ -940,6 +1234,10 @@ mod tests {
         assert_eq!(c.router.headers_timeout_ms, 600_000);
         assert_eq!(c.router.idle_timeout_ms, 300_000);
         assert_eq!(c.router.queue_timeout_ms, 30_000);
+        // The same 32 `apexrouter_router::DEFAULT_WARM_QUEUE_MAX` names. The router crate is
+        // not a dependency of core, so the two cannot be compared by the compiler; this is
+        // the assertion that keeps them from drifting, and `docs/API.md` prints the number.
+        assert_eq!(c.router.warm_queue_max, 32);
         assert_eq!(c.router.retry_budget_per_min, 30);
         assert_eq!(c.router.breaker_min_volume, 5);
         assert_eq!(c.router.request_usage, "off");
@@ -949,7 +1247,10 @@ mod tests {
         );
         assert!(c.router.log_usage);
         assert!(c.router.anthropic_ingress);
-        assert!(!c.router.anthropic_tools, "the imperfect part is opt-in");
+        assert!(
+            c.router.anthropic_tools,
+            "a stock config must drive real Claude Code, which sends tools on every request"
+        );
 
         assert_eq!(c.supervisor.health_deadline_ms, 600_000);
         assert_eq!(c.supervisor.health_interval_ms, 3_000);
@@ -1048,7 +1349,7 @@ mod tests {
     // ---- loading ----------------------------------------------------------------------
 
     #[test]
-    fn a_partial_file_keeps_every_other_default_and_ignores_unknown_keys() {
+    fn a_partial_file_keeps_every_other_default_and_reports_unknown_keys() {
         let d = tmp();
         let p = d.path().join("config.toml");
         std::fs::write(
@@ -1062,6 +1363,185 @@ mod tests {
         assert_eq!(c.router.max_body_bytes, RouterCfg::default().max_body_bytes);
         assert_eq!(c.server, ServerCfg::default());
         assert_eq!(c.vast, VastCfg::default());
+
+        // Unknown is not fatal — an older binary must survive a newer file — but it is not
+        // silent either.
+        assert_eq!(
+            c.unknown_keys
+                .iter()
+                .map(|k| k.path.as_str())
+                .collect::<Vec<_>>(),
+            ["router.something_from_a_newer_build"]
+        );
+    }
+
+    // ---- D5: a typo'd key is surfaced, not swallowed ------------------------------------
+
+    /// The defect, exactly as it was reported: `proxy_port = 18888` bound nothing, warned
+    /// about nothing, and `config show` printed the default as if the file agreed with it.
+    #[test]
+    fn a_typod_key_is_surfaced_with_the_key_it_was_meant_to_be() {
+        let d = tmp();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "[server]\nproxy_port = 18888\n").expect("write");
+
+        let c = Config::load_from(Some(&p), None).expect("an unknown key must not be fatal");
+        assert_eq!(c.unknown_keys.len(), 1, "{:?}", c.unknown_keys);
+        assert_eq!(c.unknown_keys[0].path, "server.proxy_port");
+        assert_eq!(
+            c.unknown_keys[0].did_you_mean.as_deref(),
+            Some("proxy_bind"),
+            "four substitutions apart, and still obviously the intended key"
+        );
+        assert_eq!(
+            c.unknown_keys[0].to_string(),
+            "server.proxy_port (did you mean `proxy_bind`?)"
+        );
+
+        // `config show` renders exactly this projection, so the CLI surfaces it for free.
+        let shown = serde_json::to_value(c.serializable()).expect("json");
+        assert_eq!(shown["unknown_keys"][0]["path"], "server.proxy_port");
+        assert_eq!(shown["unknown_keys"][0]["did_you_mean"], "proxy_bind");
+
+        // …and the report a `config validate` verb renders prints the ignored key next to
+        // the address that is actually bound. That pairing is the whole point.
+        let v = Config::validate_file(&p);
+        assert!(v.exists);
+        assert_eq!(v.parse_error, None);
+        assert!(!v.is_clean());
+        assert_eq!(v.unknown_keys, c.unknown_keys);
+        assert_eq!(
+            v.proxy_bind, "127.0.0.1:8888",
+            "the file did NOT move the listener, whatever the operator thought"
+        );
+    }
+
+    /// Every level of the document, and every shape of unknown: a section nobody knows, a
+    /// key under a known section, a key under a free-form map entry.
+    #[test]
+    fn unknown_keys_are_found_at_every_level_and_free_form_maps_are_not_false_positives() {
+        let d = tmp();
+        let p = d.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "[nonsense]\nwhatever = 1\n\n\
+             [router]\nmax_inflght = 7\n\n\
+             [providers.mycorp]\nbase_url = \"http://127.0.0.1:9/v1\"\napi_kye_env = \"X\"\n\n\
+             [known_forks.mine]\nmatch_repo = \"me/*\"\nllama_cpp_repo = \"me/llama.cpp\"\n\
+             llama_cpp_ref = \"main\"\n",
+        )
+        .expect("write");
+
+        let c = Config::load_from(Some(&p), None).expect("load");
+        let mut paths: Vec<&str> = c.unknown_keys.iter().map(|k| k.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            [
+                "nonsense",
+                "providers.mycorp.api_kye_env",
+                "router.max_inflght",
+            ],
+            "a user's own provider id and fork name are data, not typos"
+        );
+        let near = |p: &str| {
+            c.unknown_keys
+                .iter()
+                .find(|k| k.path == p)
+                .and_then(|k| k.did_you_mean.clone())
+        };
+        assert_eq!(near("router.max_inflght").as_deref(), Some("max_inflight"));
+        assert_eq!(
+            near("providers.mycorp.api_kye_env").as_deref(),
+            Some("api_key_env")
+        );
+        assert_eq!(near("nonsense"), None, "nothing at the root is close to it");
+    }
+
+    /// The documented `[providers.vast]` spelling carries `[vast]` keys. Those are legal in
+    /// that table and must not be reported as typos.
+    #[test]
+    fn the_providers_vast_spelling_is_not_reported_as_unknown() {
+        let c = parse_config(
+            "[providers.vast]\n\
+             base_url = \"https://console.vast.ai/api/v0\"\n\
+             poll_min_ms = 9000\n\
+             max_usd_per_hour_ceiling = 1.25\n",
+        )
+        .expect("parse");
+        assert_eq!(c.vast.poll_min_ms, 9_000);
+        assert!(
+            c.unknown_keys.is_empty(),
+            "the documented spelling must not warn: {:?}",
+            c.unknown_keys
+        );
+    }
+
+    /// A key we do not know is left alone, not deleted, and never written back as data.
+    #[test]
+    fn saving_neither_writes_the_report_nor_destroys_the_key_it_reports() {
+        let d = tmp();
+        let p = d.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "# hand written\n[server]\n# a typo, kept\nproxy_port = 18888\nproxy_bind = \"127.0.0.1:8888\"\n",
+        )
+        .expect("write");
+
+        let c = Config::load_from(Some(&p), None).expect("load");
+        assert_eq!(c.unknown_keys.len(), 1);
+        c.save_to(&p).expect("save");
+
+        let after = std::fs::read_to_string(&p).expect("read");
+        assert!(
+            after.contains("proxy_port = 18888"),
+            "the user's own text is theirs; we report it, we do not delete it:\n{after}"
+        );
+        assert!(after.contains("# a typo, kept"), "decor survives:\n{after}");
+        assert!(
+            !after.contains("unknown_keys"),
+            "the report must never become a key in the file:\n{after}"
+        );
+        // …and it is still reported on the next load.
+        assert_eq!(
+            Config::load_from(Some(&p), None)
+                .expect("reload")
+                .unknown_keys
+                .len(),
+            1
+        );
+    }
+
+    /// A file with nothing wrong with it says nothing.
+    #[test]
+    fn a_clean_file_reports_no_unknown_keys() {
+        let d = tmp();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, EXAMPLE_CONFIG).expect("write");
+        let v = Config::validate_file(&p);
+        assert!(v.is_clean(), "{v:?}");
+        assert!(v.exists);
+        assert_eq!(v.control_bind, "127.0.0.1:2739");
+
+        let missing = d.path().join("nowhere.toml");
+        let v = Config::validate_file(&missing);
+        assert!(!v.exists);
+        assert!(v.is_clean(), "a missing file is a working install");
+    }
+
+    /// A file that does not parse is reported, not panicked over.
+    #[test]
+    fn validate_reports_a_parse_failure_rather_than_refusing_to_answer() {
+        let d = tmp();
+        let p = d.path().join("config.toml");
+        std::fs::write(&p, "[router\nmax_inflight = ").expect("write");
+        let v = Config::validate_file(&p);
+        assert!(v.parse_error.is_some());
+        assert!(!v.is_clean());
+        assert_eq!(
+            v.proxy_bind, "127.0.0.1:8888",
+            "defaults are still answered"
+        );
     }
 
     #[test]

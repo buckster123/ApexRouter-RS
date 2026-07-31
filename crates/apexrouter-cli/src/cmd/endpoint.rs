@@ -22,6 +22,7 @@ use apexrouter_protocol::{
     LlamaBuild, LocalLlamaSpec, LocalVllmSpec, NglPlan, RigSnapshot, SamplingMode, ServedBy,
     SplitMode, SplitPlan,
 };
+use apexrouter_providers::local::ResolvedSpec;
 use std::time::Duration;
 
 /// Run `apexrouter endpoint …`.
@@ -517,10 +518,38 @@ fn read_from(path: &std::path::Path, offset: u64) -> anyhow::Result<String> {
 
 /// The argv an endpoint would be launched with, computed here rather than asked for.
 ///
+/// # The record is a draft, and a draft is not what was exec'd
+///
+/// `EndpointRecord::spec` deliberately stores the **operator's draft** — that is what keeps
+/// `same_endpoint` matching and what stops a restart leaving a second record behind — while
+/// the numbers the solver decided live in `EndpointRecord::fit` and the leased port in
+/// `EndpointRecord::port`. Rendering argv from the raw draft therefore reproduces the
+/// pre-FIX-4 command line: no `-c`, no `-np`, no `-ctk`/`-ctv`, no `-ngl`, no `-dev`,
+/// because every one of those is `None`/`Auto` in a draft that let the solver choose — and
+/// it printed that to the operator as fact, with an empty warnings list. The launch was
+/// always correct; only this display lied, and an operator debugging a launch is the person
+/// least able to afford a plausible lie.
+///
+/// [`ResolvedSpec::from_record`] is the fix: it folds the record's plan back into the
+/// record's draft, exactly as the supervisor folds the fresh plan into the draft at launch,
+/// so both surfaces render argv from a resolved spec and neither can quietly drop a flag.
+/// [`ResolvedSpec::disagreements`] then checks the rendered argv against the plan it claims
+/// to execute — a divergence lands in `warnings`, where `print_argv` and `--json` both show
+/// it, rather than being invisible because nothing ever asked.
+///
+/// The API key is named the way the launch names it — `$STATE/endpoints/<id>.key`, the file
+/// the supervisor really wrote — never its contents.
+///
+/// One assumption, stated because `from_record` falls back to port `0` without it: a
+/// locally-supervised record always carries the port it was leased, because the supervisor
+/// writes the record only after `up` has bound one. A record without a port would print
+/// `--port 0` as fact, so if that ever becomes reachable, this is where it surfaces.
+///
 /// # Errors
 /// When the record's build is no longer on the machine.
 async fn offline_argv(ctx: &Ctx, e: &EndpointRecord) -> anyhow::Result<ArgvPreview> {
-    match &e.spec {
+    let resolved = ResolvedSpec::from_record(e);
+    match resolved.spec() {
         EndpointSpec::LocalLlama(spec) => {
             let rig = apexrouter_providers::local::supervisor::scan_rig(
                 &ctx.cfg.endpoints,
@@ -537,7 +566,13 @@ async fn offline_argv(ctx: &Ctx, e: &EndpointRecord) -> anyhow::Result<ArgvPrevi
                         spec.build.as_str()
                     )
                 })?;
-            Ok(argv::plan_local(spec, build, None)?)
+            let key_file = spec
+                .api_key
+                .as_ref()
+                .map(|_| ctx.paths.endpoints_dir().join(format!("{}.key", e.id)));
+            let mut preview = argv::plan_local(spec, build, key_file.as_deref())?;
+            preview.warnings.extend(resolved.disagreements(&preview));
+            Ok(preview)
         }
         EndpointSpec::LocalVllm(spec) => Ok(argv::plan_local_vllm(spec)?),
         _ => anyhow::bail!(
@@ -943,17 +978,23 @@ mod tests {
 }
 
 #[cfg(test)]
-mod restart_e2e {
-    //! `endpoint restart --ctx N`, proved where it can actually be disproved: in the argv
-    //! the child process was handed.
+mod e2e {
+    //! `endpoint restart --ctx N` and `endpoint argv`, proved where they can actually be
+    //! disproved: in the argv the child process was handed.
     //!
-    //! The defect this guards was invisible from inside the CLI. `--ctx` was composed into
-    //! a JSON body perfectly correctly, sent, and then **discarded** —
+    //! The restart defect was invisible from inside the CLI. `--ctx` was composed into a
+    //! JSON body perfectly correctly, sent, and then **discarded** —
     //! `POST /v1/endpoints/{id}/restart` replays the record's own spec and reads no body —
     //! after which the CLI printed `restarted … on port 8100` and the operator believed it.
     //! Every unit test over the request-building code passed. The only question that
     //! catches it is *"what did the child actually get?"*, so that is the question this
     //! asks, of the fake `llama-server`'s launch record.
+    //!
+    //! The `argv` defect is the same shape one surface along: the daemon-less preview was
+    //! rendered from the record's **draft**, so it printed a command line with no `-c`, no
+    //! `-np`, no `-ctk`, no `-ngl` and no `-dev` — the argv of a launch that never happened
+    //! — with an empty warnings list. The question that catches it is again the same one,
+    //! and [`the_offline_preview_is_the_argv_the_child_was_given`] asks it token for token.
     //!
     //! **No GPU, no GGUF, no weights.** The real supervisor spawns
     //! `apexrouter-tests-support`'s fake, the real health gate passes it, and nothing in
@@ -962,6 +1003,10 @@ mod restart_e2e {
     //! Hermeticity: one tempdir holds `$HOME`, `$STATE`, `$CACHE` and `config.toml`; every
     //! credential variable is cleared; discovery is pointed at the fake build tree alone and
     //! every outbound base URL at a closed loopback port.
+    //!
+    //! **Nothing this module spawns outlives it.** See [`Reaper`] — the fixture used to
+    //! shut the daemon down and call that "drain", which leaked two fake servers per run
+    //! onto the developer's machine.
 
     // The environment lock is a `std::sync::Mutex` held across `.await`, for the reason
     // `daemon::tests` gives: it must exclude the *synchronous* tests that take it too.
@@ -971,9 +1016,10 @@ mod restart_e2e {
     use apexrouter_core::config::Config;
     use apexrouter_core::lockfile::DaemonLock;
     use apexrouter_core::paths::Paths;
+    use apexrouter_core::proc;
     use apexrouter_protocol::{KvType, TriState};
     use apexrouter_server::{build_state, run as serve, shutdown, Shutdown};
-    use apexrouter_tests_support::{FakeBuild, GgufSpec};
+    use apexrouter_tests_support::{FakeBuild, GgufSpec, LaunchRecord, Records};
     use std::sync::MutexGuard;
 
     /// The size it starts at, and the size it is restarted at. Far enough apart that no
@@ -982,6 +1028,13 @@ mod restart_e2e {
     const CTX_AFTER: u32 = 3_072;
     const SLOTS_BEFORE: u32 = 2;
     const SLOTS_AFTER: u32 = 1;
+
+    /// How long a fake child gets to honour `SIGTERM` before the reaper stops asking, and
+    /// how long the `SIGKILL` gets after that. Short: the fake has no state to flush, and
+    /// this budget is spent on the way out of every test.
+    const REAP_TERM: Duration = Duration::from_secs(5);
+    /// See [`REAP_TERM`].
+    const REAP_KILL: Duration = Duration::from_secs(2);
 
     /// The credential variables, cleared: no test may resolve a real one, and the developer
     /// running `cargo test` is exactly the person who has them exported.
@@ -1065,6 +1118,11 @@ mod restart_e2e {
         );
 
         d.stop().await;
+        assert_eq!(
+            live_children(fake.records()),
+            Vec::<u32>::new(),
+            "a fake server outlived the test"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1093,13 +1151,185 @@ mod restart_e2e {
         assert_eq!(record.flag_as::<u32>("-np"), Some(SLOTS_BEFORE));
 
         d.stop().await;
+        assert_eq!(
+            live_children(fake.records()),
+            Vec::<u32>::new(),
+            "a fake server outlived the test"
+        );
+    }
+
+    /// The daemon-less `endpoint argv` must print the command line the child was really
+    /// given — and the daemon-served route must print the same one.
+    ///
+    /// # The defect
+    ///
+    /// `offline_argv` called `argv::plan_local(&record.spec, …)` on the raw record. But
+    /// `EndpointRecord::spec` is the operator's **draft**, and this draft is the interesting
+    /// case: `ctx: None`, `parallel: None`, `kv_type: None`, `ngl: Auto`, no devices — every
+    /// one of them left to the solver, which is what an `apexrouter up <model>` produces.
+    /// Rendered from the draft, the preview carried none of `-c`, `-np`, `-ctk`, `-ctv`,
+    /// `-ngl`, `-dev`, and reported `warnings: []` — a plausible, complete-looking lie told
+    /// to the one person who cannot afford it, an operator debugging a launch. The launch
+    /// itself was always right, which is exactly why nothing else caught it.
+    ///
+    /// So the assertion is not "the preview contains `-c`" — it is the whole argv, token
+    /// for token, against `/proc`'s own copy as the fake recorded it. A preview that omits
+    /// one flag, orders them differently, or invents one fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_offline_preview_is_the_argv_the_child_was_given() {
+        let fake = FakeBuild::new();
+        // A short training context on purpose. The solver is asked for a plan **twice** —
+        // once when the endpoint is created, once when `GET /v1/endpoints/{id}/argv`
+        // re-plans it — and the second call solves against a budget the first endpoint's
+        // own reservation has already been subtracted from. With the answer pinned to the
+        // model's training context, both solves land on 4096 whatever this box's free VRAM
+        // is doing, so a disagreement below is a defect and never the weather.
+        let model = fake.model(
+            "Fake-9b-Q6_K.gguf",
+            &GgufSpec::default().sized_mb(1).ctx_train(4_096),
+        );
+        let d = Daemon::boot(&fake).await;
+
+        // Pinned: the port, and nothing else. `up` honours a pinned port strictly, so the
+        // record, the child and both previews all name the same one — the leased port is
+        // the one thing a fresh plan is entitled to choose differently.
+        let port = d.ports.0;
+        let started: EndpointRecord = d
+            .client
+            .post("/v1/endpoints", &solver_driven_spec(&fake, &model, port))
+            .await
+            .expect("the endpoint started");
+        let id = started.id.as_str().to_owned();
+        assert_eq!(started.port, Some(port));
+
+        let child = fake
+            .records()
+            .for_port(port)
+            .expect("the fake wrote a launch record");
+        let child_argv: Vec<String> = child.argv.clone();
+
+        // The record as any daemon-less surface reads it, and the argv that surface prints.
+        let record: EndpointRecord = d
+            .client
+            .get(&format!("/v1/endpoints/{id}"))
+            .await
+            .expect("the record");
+        let ctx = Ctx {
+            paths: d.paths.clone(),
+            cfg: d.cfg.clone(),
+            autostart: false,
+        };
+        let offline = offline_argv(&ctx, &record).await.expect("the offline argv");
+
+        // ---- the assertion the defect could not survive --------------------------------
+        assert_eq!(
+            offline.program, child.argv0,
+            "the preview names a different binary than the child was exec'd from"
+        );
+        assert_eq!(
+            offline.args,
+            child_argv,
+            "the daemon-less preview is not the command line the child was given.\n  \
+             preview: {}\n  child:   {}",
+            offline.args.join(" "),
+            child.argv_line()
+        );
+
+        // The plan the record carries, checked against the argv just rendered — the report
+        // `offline_argv` now makes for itself, asserted rather than trusted.
+        assert!(
+            ResolvedSpec::from_record(&record)
+                .disagreements(&offline)
+                .is_empty(),
+            "the preview does not execute the plan the record reports: {:?}",
+            ResolvedSpec::from_record(&record).disagreements(&offline)
+        );
+        assert!(
+            offline.warnings.is_empty(),
+            "nothing was dropped, so nothing should be warned about: {:?}",
+            offline.warnings
+        );
+
+        // …and the two routes `endpoint argv` can take answer the same thing. An operator
+        // switching between them must not see two answers.
+        //
+        // Since 2026-07-31 both routes resolve the record — `GET /v1/endpoints/{id}/argv`
+        // used to re-plan, which leased a *fresh* port and re-solved `fit()` against
+        // currently-free VRAM, and that is why the port is pinned in the draft here. The
+        // pin is now belt-and-braces rather than a workaround.
+        //
+        // Note what this assertion is and is not: with the daemon up, both routes run the
+        // same `ResolvedSpec::from_record` code, so their agreement is close to
+        // tautological. The load-bearing check for argv fidelity is against
+        // `/proc/<pid>/cmdline` in `apexrouter-server/tests/argv_fidelity.rs`, which is
+        // what actually caught the 34-tokens-versus-36 defect.
+        let served: ArgvPreview = d
+            .client
+            .get(&format!("/v1/endpoints/{id}/argv"))
+            .await
+            .expect("the daemon's argv");
+        assert_eq!(served.program, offline.program);
+        assert_eq!(
+            served.args,
+            offline.args,
+            "daemon-served and daemon-less argv disagree.\n  daemon:  {}\n  offline: {}",
+            served.args.join(" "),
+            offline.args.join(" ")
+        );
+        assert_eq!(served.env, offline.env);
+        assert_eq!(served.cwd, offline.cwd);
+
+        d.stop().await;
+        assert_eq!(
+            live_children(fake.records()),
+            Vec::<u32>::new(),
+            "a fake server outlived the test"
+        );
+    }
+
+    /// The leak guarantee itself, asserted rather than left to `ps` after the run.
+    ///
+    /// The fixture is dropped **without** `stop()` — which is precisely the shape of a
+    /// panicking assertion or an early `?`, since unwinding is only drops. Before this,
+    /// `Daemon::stop` triggered the daemon's shutdown under a comment claiming no fake child
+    /// outlived the test; a daemon shutdown deliberately does not stop endpoints (charter
+    /// D3 — a restarted daemon re-adopts its children), so two fake servers per full run
+    /// stayed behind holding ports.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_test_that_never_stops_the_daemon_still_reaps_its_children() {
+        let fake = FakeBuild::new();
+        let model = fake.model("Fake-9b-Q6_K.gguf", &GgufSpec::default().sized_mb(1));
+
+        let spawned = {
+            let d = Daemon::boot(&fake).await;
+            let _: EndpointRecord = d
+                .client
+                .post("/v1/endpoints", &spec(&fake, &model))
+                .await
+                .expect("the endpoint started");
+            let spawned = live_children(fake.records());
+            assert_eq!(
+                spawned.len(),
+                1,
+                "the fake server must really be running, or this test proves nothing"
+            );
+            spawned
+            // `d` goes out of scope here, unstopped.
+        };
+
+        assert_eq!(
+            live_children(fake.records()),
+            Vec::<u32>::new(),
+            "{spawned:?} survived the fixture"
+        );
     }
 
     // -------------------------------------------------------------------------------------
     // fixtures
     // -------------------------------------------------------------------------------------
 
-    /// The spec both tests start from.
+    /// The spec the restart tests start from: every dimension pinned by the operator, so a
+    /// changed number can only have come from `--ctx`/`--parallel`.
     fn spec(fake: &FakeBuild, model: &std::path::Path) -> EndpointSpec {
         EndpointSpec::LocalLlama(LocalLlamaSpec {
             build: fake.build_id(),
@@ -1125,8 +1355,41 @@ mod restart_e2e {
         })
     }
 
+    /// The spec `apexrouter up <model>` produces: the sizing left entirely to the solver.
+    ///
+    /// This is the draft the argv defect lived in. Pinned numbers would hide it — a draft
+    /// that already says `-c 8192` renders the same argv whether or not the plan was folded
+    /// back in.
+    fn solver_driven_spec(fake: &FakeBuild, model: &std::path::Path, port: u16) -> EndpointSpec {
+        EndpointSpec::LocalLlama(LocalLlamaSpec {
+            build: fake.build_id(),
+            model_path: model.display().to_string(),
+            mmproj: None,
+            alias_flag: "fake-9b".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: Some(port),
+            ctx: None,
+            parallel: None,
+            kv_type: None,
+            ngl: NglPlan::Auto,
+            split: SplitPlan {
+                devices: Vec::new(),
+                mode: SplitMode::Layer,
+                main_gpu: None,
+                tensor_split: None,
+            },
+            mode: SamplingMode::Coding,
+            flash_attn: Some(TriState::Auto),
+            api_key: None,
+            extra_args: Vec::new(),
+        })
+    }
+
     /// A port nothing is listening on. Bound and released, which is the only portable way
     /// to ask the kernel for one.
+    ///
+    /// Right for a listener **this process binds immediately**; wrong for the range a child
+    /// will sit in — see [`child_port_range`].
     fn free_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
         let p = l.local_addr().expect("local_addr").port();
@@ -1134,16 +1397,175 @@ mod restart_e2e {
         p
     }
 
+    /// A window of ports for this fixture's **children**, above the kernel's ephemeral
+    /// range.
+    ///
+    /// `free_port()` draws from `/proc/sys/net/ipv4/ip_local_port_range` — 32768–60999 on
+    /// this box. That is fine for a socket bound microseconds later, and wrong for a range
+    /// a fake `llama-server` will hold for the length of a test: it is the same pool the
+    /// kernel hands out as outbound source ports, the same pool every *other* test binary's
+    /// `free_port()` draws from, and `cargo test` runs those binaries **concurrently**.
+    /// `apexrouter-providers`' `an_exhausted_range_is_reported_as_such_not_as_a_taken_port`
+    /// hard-codes 39171; this suite must not be able to squat it, whether it leaks or not.
+    ///
+    /// So: start above the ephemeral ceiling, offset the window by the pid so two
+    /// concurrent test binaries do not pick the same one, and bind-probe **every** port in
+    /// it before returning — `proc::port_free` is the same probe the allocator uses.
+    fn child_port_range(width: u16) -> (u16, u16) {
+        // The `min` is arithmetic hygiene, not a real case: a box whose ephemeral range ran
+        // to the top of the port space would otherwise underflow `span` below.
+        let floor = ephemeral_ceiling()
+            .saturating_add(1)
+            .min(u16::MAX - width - 1);
+        let span = u16::MAX - floor - width;
+        let stride = u32::from(width) + 1;
+        let start = u32::from(std::process::id() as u16) % u32::from(span);
+        for attempt in 0..64u32 {
+            let base =
+                floor + u16::try_from((start + attempt * stride) % u32::from(span)).unwrap_or(0);
+            if (base..=base + width).all(proc::port_free) {
+                return (base, base + width);
+            }
+        }
+        panic!("no free window of {width} ports above {floor}");
+    }
+
+    /// The top of `/proc/sys/net/ipv4/ip_local_port_range`, or the Linux default.
+    fn ephemeral_ceiling() -> u16 {
+        std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u16>().ok())
+            .unwrap_or(60_999)
+    }
+
+    /// Every pid this fake build recorded that is **still** running that exact command
+    /// line.
+    ///
+    /// The identity is the whole argv, and `argv[0]` is a path inside this test's own
+    /// `TempDir`, so nothing outside this test can match it and a reused pid would have to
+    /// be re-exec'ing this test's binary with this test's flags to be mistaken for ours.
+    fn live_children(records: &Records) -> Vec<u32> {
+        records
+            .all()
+            .into_iter()
+            .filter(is_ours)
+            .map(|r| r.pid)
+            .collect()
+    }
+
+    /// Is that pid still the child this record describes?
+    fn is_ours(rec: &LaunchRecord) -> bool {
+        matches!(proc::cmdline(rec.pid), Ok(live) if live == full_argv(rec))
+    }
+
+    /// `argv[0]` and the rest, as `/proc/<pid>/cmdline` reports it.
+    fn full_argv(rec: &LaunchRecord) -> Vec<String> {
+        let mut argv = vec![rec.argv0.clone()];
+        argv.extend(rec.argv.iter().cloned());
+        argv
+    }
+
+    /// Every fake child this fixture's daemon spawned, reaped on **every** path out of the
+    /// test — a passing one, an early `?`, and a panicking assertion, because unwinding is
+    /// only drops.
+    ///
+    /// # Why the daemon's shutdown was not enough
+    ///
+    /// `Daemon::stop` triggered the shutdown and nothing else, under a comment reading
+    /// *"Drain, so no fake child outlives the test"*. But a daemon shutdown deliberately
+    /// does **not** stop endpoints — `[supervisor] kill_children_on_exit` defaults to false
+    /// so that a restarted daemon re-adopts its children instead of re-loading 6 GB of
+    /// weights. The product was right and the fixture's assumption was wrong, and the suite
+    /// leaked exactly two fake servers per full run: the two launches of
+    /// `a_restart_with_new_sizing_reaches_the_childs_argv` and one of
+    /// `a_plain_restart_still_replays_the_recorded_spec`. They then sat on ports until the
+    /// developer noticed — which is how a test in another crate, on a box that had run this
+    /// suite before, failed on a port it hard-codes.
+    ///
+    /// Flipping `kill_children_on_exit` would fix the graceful path only. This is a `Drop`,
+    /// so there is no path it does not cover, and it is the fixture's only mechanism —
+    /// a safety net that is not exercised on every run is not a safety net.
+    ///
+    /// # What it is allowed to signal
+    ///
+    /// Only a pid whose live `/proc/<pid>/cmdline` still matches, token for token, the argv
+    /// the fake recorded for itself. The signal then goes through
+    /// `core::proc::stop_graceful`, which re-verifies identity (pid ∧ start ticks ∧
+    /// `boot_id`) before every `kill(2)` — the same gate the supervisor's own stop path
+    /// uses, for the same reason: killing whatever process inherited a pid is worse than
+    /// leaking one.
+    struct Reaper {
+        /// Fired first. On a panic path nobody else has triggered it, and a detached daemon
+        /// task would otherwise outlive the test too.
+        trigger: Shutdown,
+        /// This `FakeBuild`'s launch records — the only children this reaper may touch.
+        records: Records,
+    }
+
+    impl Drop for Reaper {
+        fn drop(&mut self) {
+            self.trigger.trigger();
+            for rec in self.records.all() {
+                if !is_ours(&rec) {
+                    continue;
+                }
+                // Never panics: a panic here, during another panic's unwind, aborts the
+                // process and takes the real failure's message with it.
+                match proc::identify(rec.pid, &full_argv(&rec), &rec.argv0) {
+                    Ok(facts) => {
+                        if let Err(e) = proc::stop_graceful(&facts, REAP_TERM, REAP_KILL) {
+                            eprintln!("reaper: pid {} would not stop: {e}", rec.pid);
+                        }
+                    }
+                    Err(e) => eprintln!("reaper: pid {} could not be identified: {e}", rec.pid),
+                }
+            }
+        }
+    }
+
+    /// `$HOME`, `$APEXROUTER_HOME` and the credential variables, put back on every path out
+    /// of the test.
+    ///
+    /// Also a `Drop`, and for the same reason: a panicking test used to leave
+    /// `$APEXROUTER_HOME` pointing at a tempdir that was about to be deleted, which the
+    /// *next* test in the binary would then resolve.
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        /// Dropped after the variables are back, so nothing may resolve `Paths` in between.
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
     /// The real daemon — `build_state` and `run`, never a router assembled here — rooted in
     /// a tempdir, with discovery pointed at the fake build tree.
+    ///
+    /// The last three fields are the teardown, and their **declaration order is the
+    /// teardown order**: the children die, then the tempdir they were loaded from goes, then
+    /// the environment comes back. No `Drop` impl on `Daemon` itself, so [`Daemon::stop`]
+    /// can still move the join handle out.
     struct Daemon {
         client: NodeClient,
         trigger: Shutdown,
         task: tokio::task::JoinHandle<anyhow::Result<()>>,
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        /// Resolved from the tempdir, for a test that needs a daemon-less [`Ctx`].
+        paths: Paths,
+        /// The daemon's own configuration, likewise.
+        cfg: Config,
+        /// The window `[endpoints] port_range` was set to.
+        ports: (u16, u16),
+        _reaper: Reaper,
         _dir: tempfile::TempDir,
-        /// Dropped last: released only once the environment has been put back.
-        _guard: MutexGuard<'static, ()>,
+        _env: EnvGuard,
     }
 
     impl Daemon {
@@ -1164,6 +1586,13 @@ mod restart_e2e {
                 .map(|k| (*k, std::env::var_os(k)))
                 .collect();
             saved.dedup_by_key(|(k, _)| *k);
+            // Armed before the first `set_var`, so even a panic inside `boot` puts the
+            // environment back. Locals drop in reverse declaration order, so this is the
+            // last thing to run — after the reaper, after the tempdir.
+            let env = EnvGuard {
+                saved,
+                _guard: guard,
+            };
 
             let dir = tempfile::tempdir().expect("tempdir");
             let root = dir.path();
@@ -1190,8 +1619,8 @@ mod restart_e2e {
             // no real GGUF is enumerated.
             cfg.endpoints.build_roots = vec![fake.root().display().to_string()];
             cfg.endpoints.model_roots = vec![fake.root().join("models").display().to_string()];
-            let base = free_port();
-            cfg.endpoints.port_range = (base, base.saturating_add(30));
+            let ports = child_port_range(15);
+            cfg.endpoints.port_range = ports;
             cfg.supervisor.health_deadline_ms = 30_000;
             cfg.supervisor.health_interval_ms = 50;
             // HERMETICITY: every outbound root points at a closed loopback port.
@@ -1202,8 +1631,16 @@ mod restart_e2e {
             let control = format!("http://{}", cfg.control_bind());
 
             let lock = DaemonLock::acquire(&paths).expect("daemon lock");
-            let state = build_state(paths, cfg, lock).await.expect("build_state");
+            let state = build_state(paths.clone(), cfg.clone(), lock)
+                .await
+                .expect("build_state");
             let (trigger, handle) = shutdown::channel();
+            // Armed before the daemon can spawn anything: from here on, every exit from
+            // this function — including a panicking `assert!` below — reaps.
+            let reaper = Reaper {
+                trigger: trigger.clone(),
+                records: Records::at(fake.records().dir()),
+            };
             let mut task = tokio::spawn(serve(state, handle));
 
             let client = NodeClient::new(control, None);
@@ -1228,23 +1665,24 @@ mod restart_e2e {
                 client,
                 trigger,
                 task,
-                saved,
+                paths,
+                cfg,
+                ports,
+                _reaper: reaper,
                 _dir: dir,
-                _guard: guard,
+                _env: env,
             }
         }
 
-        /// Drain, so no fake child outlives the test and the tempdir is not removed from
-        /// under a running daemon, then put the environment back.
+        /// Shut the daemon down and wait for its drain, so the tempdir is not removed from
+        /// under a running daemon.
+        ///
+        /// **Not where the children die.** A daemon shutdown deliberately leaves its
+        /// endpoints running; [`Reaper`] — dropped as this function returns, and on every
+        /// path that never reaches it — is what stops them.
         async fn stop(self) {
             self.trigger.trigger();
             let _ = tokio::time::timeout(Duration::from_secs(20), self.task).await;
-            for (k, v) in &self.saved {
-                match v {
-                    Some(v) => std::env::set_var(k, v),
-                    None => std::env::remove_var(k),
-                }
-            }
         }
     }
 }
