@@ -208,9 +208,13 @@ llama_cpp_ref = "deepseek-dsa"
 # Read ~/.vastai-gguf for usage rows, provider base URLs and saved local instances.
 # Read-only: that directory is never rewritten.
 read_legacy_state = true
-# Also append every usage row to ~/.vastai-gguf/usage.log in the exact legacy field set,
-# so the old cost.py keeps working.
-mirror_usage_log = true
+# DEFAULT OFF: ~/.vastai-gguf is another tool's state directory, and starting this daemon
+# must not append to a file it does not own. Turn it on only to keep the old LocalRouter
+# TUI's usage view (cost.py) alive during a transition period: every usage row is then also
+# appended to ~/.vastai-gguf/usage.log in the exact legacy field set. `apexrouter migrate`
+# offers to switch it on. ApexRouter's own usage log in its state directory is unaffected
+# and is written either way.
+mirror_usage_log = false
 # "" = off. A path mirrors the default alias into a legacy `.active_endpoint` file on every
 # change, atomically, for the old TUI.
 active_endpoint_path = ""

@@ -61,11 +61,16 @@ use tokio::sync::Notify;
 
 /// The control-plane routes unit S-03 owns, ready to be `.merge`d by S-01's `api_router`.
 ///
-/// S-04 (`/v1/rig*`, `/v1/fit`, `/v1/usage`, `/v1/requests*`, `/v1/jobs*`) and S-07
-/// (`/v1/vast*`, `/v1/hf*`, `/v1/providers*`, `/v1/checks`, `/v1/compare`) publish their own
-/// routers from their own modules; `mod.rs` deliberately does not reference them, because
-/// merging a module whose functions do not exist yet would stop this crate compiling for
-/// every other Stage 4 agent.
+/// This is **not** the aggregate of everything in this directory, and never was. Each of
+/// S-04's modules (`/v1/rig*`, `/v1/fit`, `/v1/usage`, `/v1/requests*`, `/v1/jobs*`) and
+/// S-07's (`/v1/vast*`, `/v1/hf*`, `/v1/providers*`, `/v1/checks`, `/v1/compare`) publishes
+/// its own `pub fn router()` and is merged **once, by `crate::v1_routes`** — the single
+/// assembly point, in the single file only S-01 may edit.
+///
+/// A module that is not merged there is compiled, unit-tested and unreachable; that shipped
+/// twice. `tests/mounted_routes.rs` now enumerates this directory and asks the booted
+/// application which paths it actually serves, so a missing merge fails the build rather
+/// than the operator.
 pub fn router() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
         .merge(snapshot::router())

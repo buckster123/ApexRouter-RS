@@ -7,6 +7,13 @@
 >
 > Companion: `docs/BUILD-PLAN.md` (the parallel-agent implementation plan). Between them these two
 > files are the sole input for implementation agents.
+>
+> **Last cross-checked against the code on 2026-07-31** (work unit D-04), with a live daemon and a
+> real request through the proxy. Where the shipped code disagreed with this document, **the code
+> won and this document was corrected**, because the code is what 1411 tests and the MK1-CORE
+> acceptance run exercise. Those corrections are marked **As built:** so the delta is legible
+> rather than silently absorbed. Operational companions written from the same pass:
+> `docs/SLINT.md`, `docs/AGENTS.md`, `skills/apexrouter/SKILL.md`.
 
 ---
 
@@ -58,7 +65,7 @@ Two listeners in one process, because a single listener cannot satisfy both cont
 | Listener | Default bind | Contents | Auth posture |
 |---|---|---|---|
 | **Proxy / data plane** | `127.0.0.1:8888` | `/v1/*`, the catch-all fallback, and the three byte-compatible legacy routes `/health`, `/providers`, `POST /switch` | open on loopback (`OPENAI_API_KEY=not-needed` keeps working); optional bearer; `POST /switch` is treated as a mutation and gets the mutation gate (§9.3) |
-| **Control plane** | `127.0.0.1:2739` (`APEX` on a keypad) | `/v1/*` control REST, `/ws`, `/metrics`, the embedded web UI | bearer + scopes, loopback bypass keyed on `ConnectInfo` peer IP, mandatory `Origin`/`Sec-Fetch-Site` + `Host` validation on every mutation |
+| **Control plane** | `127.0.0.1:2739` (`APEX` on a keypad) | `/v1/*` control REST, `/ws`, the embedded web UI, and `/metrics` (§4.5 — written, not yet mounted) | one configured bearer, loopback bypass keyed on `ConnectInfo` peer IP, mandatory `Origin`/`Sec-Fetch-Site` + `Host` validation on every mutation (§9.4) |
 
 Why not one socket: the proxy is a catch-all by contract (`05` §2 — everything that is not one of
 five (path, method) pairs is proxied, including `POST /health`). A catch-all `any()` route and the
@@ -206,7 +213,7 @@ Acyclic, resolver 2, edition 2021, MSRV `1.75`, version `0.1.0`.
 | `apexrouter-client` | `NodeClient` — the thin HTTP+WS client every non-server surface uses. ~300 lines. No business logic. | protocol | reqwest, tokio-tungstenite, futures-util |
 | `apexrouter-server` | The axum application: proxy listener, control listener, `/ws`, auth, embedded assets, job runner. `pub use api_router()` so ApexOS-RS can mount the control plane. | protocol, core, router, providers | axum `["ws"]`, tower-http, rust-embed |
 | `apexrouter-cli` | `[[bin]] apexrouter` (`default-run`). Every verb, plus `serve` (runs the server in-process) and `mcp` (the stdio JSON-RPC server, in `src/mcp/`). | protocol, core, router, providers, server, client | clap, tracing-subscriber, anyhow |
-| `apexrouter-slint` | `[[bin]] apexrouter-ui`. GPL-3.0-only, `publish = false`, **out of `default-members` and out of the CI `-p` list**. An edge client of the same HTTP API; no second business-logic path. | protocol, client | slint, slint-build, tokio, anyhow |
+| `apexrouter-slint` | `[[bin]] apexrouter-ui`. GPL-3.0-only, `publish = false`, **out of `default-members` and out of the CI `-p` list** — CI never builds it, so its invariants are hand-checked (`docs/SLINT.md` §8.1). An edge client of the same HTTP API; no second business-logic path. | protocol, client | slint, slint-build, tokio, anyhow, serde_json, futures-util |
 
 **Two binaries only.** `apexrouter` (headless, does everything including `serve` and `mcp`) and
 `apexrouter-ui` (Slint). `~/Projects/.mcp.json` registers `target/release/apexrouter` with
@@ -302,6 +309,9 @@ pub struct RigSnapshot {
     pub scanned_at_unix: i64,
 }
 
+/// ONE ENUMERATION, NOT ONE PIECE OF SILICON. The same card is a different `Gpu` in every
+/// backend that can reach it. Never add two `Gpu`s' VRAM together without checking
+/// `physical_key` first — see §3.2.1.
 pub struct Gpu {
     pub device: String,              // "Vulkan0", "CUDA1" — the exact -dev token
     pub index: u32,
@@ -309,12 +319,37 @@ pub struct Gpu {
     pub backend: Backend,
     pub vram_total_mb: u64,
     pub vram_free_mb: u64,           // as llama.cpp --list-devices reports it
+    pub pci_bus_id: Option<String>,  // "0000:04:00.0" when sysfs could be aligned; physical id
     pub driver: Option<String>,
     pub is_software: bool,           // llvmpipe -> true; excluded from default selection
     pub seen_by_builds: Vec<BuildId>,
     pub held_by: Vec<BackendId>,     // endpoints currently using this device
     pub reserved_mb: u64,            // sum of fit estimates of endpoints in `held_by`
 }
+impl Gpu {
+    /// The ONLY sanctioned "used" figure: `None` when free > total (GTT accounting), never
+    /// an underflowed u64.
+    pub fn vram_used_mb(&self) -> Option<u64>;
+    pub fn reports_gtt_overcommit(&self) -> bool;
+    pub fn physical_key(&self, ordinal: usize) -> String;   // "pci:…" or "name:…#n"
+}
+
+/// One piece of silicon, with every backend enumeration that reaches it. DERIVED, never
+/// stored — `gpus` stays the raw per-backend truth, because that is what `-dev` takes.
+/// VRAM is deliberately absent: the backends disagree about it on purpose, so read it
+/// per backend from `views`.
+pub struct PhysicalDevice { pub key: String, pub pci_bus_id: Option<String>, pub name: String,
+                            pub is_software: bool, pub views: Vec<Gpu> }
+impl PhysicalDevice {
+    pub fn backends(&self) -> Vec<Backend>;
+    pub fn device_tokens(&self) -> Vec<String>;
+    pub fn view_for(&self, backend: &Backend) -> Option<&Gpu>;
+    pub fn held_by(&self) -> Vec<BackendId>;
+    pub fn seen_by_builds(&self) -> Vec<BuildId>;
+}
+impl RigSnapshot { pub fn physical_devices(&self) -> Vec<PhysicalDevice>; }
+pub fn physical_devices(gpus: &[Gpu]) -> Vec<PhysicalDevice>;
+pub fn normalise_device_name(name: &str) -> String;
 
 #[serde(rename_all = "snake_case")]
 pub enum Backend { Vulkan, Cuda, Rocm, Hip, Metal, Sycl, Cpu, Other(String) }
@@ -353,13 +388,49 @@ pub struct GgufMeta { pub arch: String, pub n_layer: u32, pub n_head_kv: u32,
                       pub full_attn_layers: Option<u32>, pub n_expert: Option<u32> }
 ```
 
+#### 3.2.1 Physical device identity — one card is one card
+
+`gpus` is a list of **enumerations**. Two llama.cpp builds with different backends enumerate the
+same silicon under different `-dev` tokens, with different names and different VRAM readings. On
+the machine in `00-machine-ground-truth.md` the single Radeon 840M is `ROCm0` (11397 MiB, from
+`~/llama.cpp/build`) and `Vulkan0` (20992 MiB, from `build-vulkan`). Both readings are true.
+Neither may be added to the other, and `rig` must not present them as two GPUs.
+
+Identity is established in two steps, strongest first:
+
+1. **PCI bus id.** `core::discover::physical::scan_pci_gpus` reads `/sys/bus/pci/devices/*/class`
+   for display controllers and `attach_pci_ids` aligns each backend's non-software enumeration
+   with them, bucketed by the vendor inferred from the device name and matched **only when the
+   counts agree exactly**. An ambiguous rig gets no bus ids rather than a guess.
+2. **Documented name heuristic.** `name:<normalised name>#<ordinal within backend>`, where
+   normalisation lowercases and drops parenthesised driver suffixes so
+   `AMD Radeon 840M Graphics (RADV KRACKAN1)` and `AMD Radeon 840M Graphics` agree. The ordinal
+   keeps four identical cards apart inside one backend while pairing card *n* of one backend with
+   card *n* of another. It assumes both backends enumerate identical cards in the same order,
+   which is exactly why rule 1 exists.
+
+`RigSnapshot::physical_devices()` folds enumerations onto silicon with those rules. Consequences
+that are load-bearing elsewhere: VRAM is **never** summed across backends (§3.3), a reservation is
+attributed to the *card* rather than to the token (so an endpoint on `Vulkan0` also weighs on
+`ROCm0`'s budget), and `apexrouter rig` prints one row per card with the set of backends that
+reach it plus a second table of the per-backend readings.
+
+**GTT accounting.** ROCm reports `free` (12821 MiB) greater than `total` (11397 MiB) on this box,
+because a GTT-backed device allocates past its carve-out. `total - free` is therefore not a small
+number, it is an underflowed `u64`. `Gpu::vram_used_mb() -> Option<u64>` is the only sanctioned way
+to ask, and it returns `None` rather than a lie: the type cannot express the underflow.
+
 ### 3.3 Fit — one pure function replacing 54 hand-solved recipe strings
 
 ```rust
 pub struct DeviceBudget { pub device: String, pub free_mb: u64, pub reserved_mb: u64 }
 /// Budget is a VECTOR, never a scalar (00b consequence 1). `usable_mb` = free - reserved - margin.
+/// It is also PER BACKEND: one llama-server process uses one backend, so `devices` are all on
+/// `backend` and a budget is never a sum across backends.
 pub struct VramBudget { pub devices: Vec<DeviceBudget>, pub margin_mb: u64,
-                        pub host_ram_free_mb: u64 }
+                        pub host_ram_free_mb: u64,
+                        pub backend: Option<Backend>,   // None = no device; never "all of them"
+                        pub notes: Vec<String> }        // what was dropped, and why
 impl VramBudget { pub fn total_usable_mb(&self) -> u64; pub fn largest_usable_mb(&self) -> u64; }
 
 pub struct FitInput {
@@ -397,6 +468,16 @@ pub enum SplitMode { None, Layer, Row, Tensor }
 
 // core::fit
 pub fn fit(input: &FitInput) -> FitPlan;   // pure, unit-tested, no I/O, no allocation surprises
+
+/// Which backend's devices a budget may be spent on. One process, one backend.
+pub enum BackendScope<'a> {
+    Build(&'a BuildId),        // the build about to be exec'd — cannot disagree with the spawn
+    Backend(&'a Backend),      // an already-resolved backend
+    Auto,                      // first named device's backend, else choose_build's, else the
+                               // first non-software GPU. NEVER a sum over all of them.
+}
+pub fn budget_from_rig(rig: &RigSnapshot, scope: BackendScope<'_>, devices: &[String],
+                       margin_mb: u64, running: &[EndpointRecord]) -> VramBudget;
 ```
 
 `kv_bytes = kv_layers × ctx × n_head_kv × (n_embd_head_k + n_embd_head_v) × bytes_per_elem(kv_type)`
@@ -407,6 +488,18 @@ the archived run log** in `03`: Qwen3.5-9B Q4_K_M, ctx 32768, kv q8_0, Vulkan �
 
 `fit()` is exposed identically from `apexrouter fit`, `GET /v1/fit`, `apexrouter_fit` (MCP), the
 Launch drawer's live headroom bar in both GUIs, and the Vast rent panel ("what fits on 2× 3090?").
+
+**The budget is per backend.** `budget_from_rig` resolves `scope` to exactly one backend and
+selects only that backend's devices; `devices` narrows within it and can never widen across it.
+Anything dropped — a device of another backend, a name the rig does not have — lands in
+`VramBudget::notes` and is folded into `FitPlan::why`, because a fallback is a visible value.
+Reservations are attributed by `Gpu::physical_key`, so an endpoint holding a card through one
+backend is subtracted from the same card's budget under another. Four cards on one backend still
+sum: a genuine 4× H100 box budgets 4 × 81559 MiB, and the Vulkan enumerations of those same four
+cards are excluded rather than added. `fit()` defends the pure `POST /v1/fit` path too: a
+caller-supplied budget mixing device tokens of two backends is **not** added up — the largest
+single-backend group wins and a `WARNING` line says so. Over-optimism is the direction that OOMs a
+spawn, so an ambiguous budget resolves downwards.
 
 ### 3.4 Endpoint, Backend, Provider
 
@@ -439,8 +532,12 @@ pub struct Backend {
     pub provenance: Provenance,
     pub endpoint: Option<EndpointRef>,   // Some(..) when ApexRouter can start/stop it
     pub enabled: bool,
+    pub devices: Vec<String>,        // as built: the `-dev` tokens this backend holds, so the
+                                     // rig strip can say who owns a card without a join
+    pub last_error: Option<String>,  // as built: the last probe/relay failure, rendered on the card
 }
-pub struct UpstreamModel { pub id: String, pub ctx: Option<u32>, pub vision: bool }
+pub struct UpstreamModel { pub id: String, pub ctx: Option<u32>, pub vision: bool,
+                           pub tools: bool }   // as built: tool-calling, from the probe
 pub struct BackendLimits { pub max_concurrent: u32, pub queue_depth: u32,
                            pub ctx: Option<u32>, pub slots_total: Option<u32> }
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -488,9 +585,14 @@ selected by the pair `(ingress, upstream)`. mk1 implements three of the four cel
 **OpenAI-compatible remains the canonical surface**, and the Anthropic side is a *translating ingress
 only*, one direction. Two facts from the surrounding ecosystem fix that:
 `ApexOS-RS/agentd/crates/gateway/src/compute.rs` sweeps the LAN probing `GET /v1/models` for the
-OpenAI list shape, so being byte-exact there is what makes ApexRouter auto-discoverable as an ApexOS
-compute node; and `ApexOS-RS/agentd/crates/agent/src/provider.rs` is already a provider trait over
-"Anthropic native, OpenAI-compat, OpenRouter" with `anthropic.rs` and `oai.rs` side by side, whose
+OpenAI list shape and counts a candidate **only** when it answers in that shape, so being
+byte-exact there is what makes ApexRouter adoptable as an ApexOS compute node at all — *necessary,
+and, checked on 2026-07-31, not sufficient: that sweep probes only ports 11434, 8000, 1234 and
+8080 (`OAI_PROBE_PORTS`), and 8888 is not among them.* Pasting `http://<host>:8888/v1` into the
+Settings compute field works today because adoption re-verifies by the same shape check; automatic
+discovery additionally needs the proxy bound to a probed port, or mDNS (mk2, §12). `docs/AGENTS.md`
+carries both recipes. And `ApexOS-RS/agentd/crates/agent/src/provider.rs` is already a provider
+trait over "Anthropic native, OpenAI-compat, OpenRouter" with `anthropic.rs` and `oai.rs`, whose
 Anthropic calls go straight to `api.anthropic.com` with a real key. ApexOS does not want a
 translating proxy. Nothing in the ecosystem ever needs OpenAI → Anthropic.
 
@@ -510,6 +612,8 @@ pub struct EndpointRecord {
     pub started_at_unix: i64,
     pub fit: Option<FitPlan>,        // what we planned; used for VRAM reservation accounting
     pub adopted: bool,
+    pub alias_bindings: Vec<Alias>,  // as built: which aliases point here, so `endpoint ls` and
+                                     // the Slint/web cards can show it without recompiling routes
 }
 #[serde(rename_all = "snake_case")]
 pub enum DesiredState { Running, Stopped }
@@ -838,7 +942,8 @@ pub enum Event {
     BootProgress    { backend: BackendId, phase: BootPhase, line: Option<String> },
     LogLine         { source: LogSource, line: String },
     VastFleetChanged{ instances: Vec<VastInstance>, credit: Option<f64> },
-    UsageTick       { window: UsageSummary },          // coalesced to 1 Hz
+    UsageTick       { window: Box<UsageSummary> },     // coalesced to 1 Hz; boxed, as built —
+                                                       // `Event` is cloned per subscriber
     JobChanged      { job: Box<JobRecord> },
     CheckResult     { result: CheckResult },
     Alert           { level: AlertLevel, message: String, action: Option<String>, id: String },
@@ -859,8 +964,13 @@ pub struct Snapshot {
 }
 #[serde(rename_all = "snake_case")]
 pub enum ServedBy { Daemon, Offline }
-pub struct ProxyStatus { pub base_url: String, pub uptime_secs: f64, pub inflight: u32,
-                         pub req_per_min: f32, pub tok_per_s: f32, pub default_alias: Alias }
+/// As built: `control_url` so a client that only knows the proxy can find the control plane,
+/// and `table_valid`/`table_error` so every surface can show the red banner of §4.1 without
+/// asking a second endpoint.
+pub struct ProxyStatus { pub base_url: String, pub control_url: String, pub uptime_secs: f64,
+                         pub inflight: u32, pub req_per_min: f32, pub tok_per_s: f32,
+                         pub default_alias: Alias,
+                         pub table_valid: bool, pub table_error: Option<String> }
 pub struct Totals { pub spend_24h: CostEstimate, pub spend_7d: CostEstimate,
                     pub tokens_24h: u64, pub vast_credit: Option<f64>,
                     pub burn_rate_usd_hr: Money, pub burn_down_hours: Option<f32> }
@@ -925,7 +1035,12 @@ directory containing endpoint logs, which children write to continuously.
 ### 4.2 Resolution — deterministic, observable, I/O-free
 
 ```rust
-pub fn resolve(&self, model: Option<&str>, class: RequestClass) -> Result<Plan, RouteError>;
+// As built, on `RoutingTable`. The unknown-model policy is a PARAMETER, not a field read off a
+// config the table snapshotted: the table is rebuilt rarely and `[router] unknown_model` can be
+// reloaded under it, so rule 6 must consult the live config on the request rather than a copy.
+pub fn resolve(&self, model: Option<&str>, class: RequestClass, unknown: UnknownModelPolicy)
+    -> Result<Plan, RouteError>;
+pub enum UnknownModelPolicy { Reject, Fallback }
 pub struct Plan { pub candidates: SmallVec<[Candidate; 4]>, pub reason: RouteReason,
                   pub alias: Option<Alias>, pub rewrite_model_to: Option<String>,
                   pub retry: RetryPolicy }
@@ -957,6 +1072,13 @@ Order, and what each rule buys:
    `model_not_found` listing known aliases. Set `= "fallback"` to get LocalRouter's old behaviour.
    Rejecting by default is deliberate: a fat-fingered `gpt-4o-mimi` must not silently bill a rented
    H100.
+
+**As built, two classes never route on the model string.** `GET`/`HEAD` on `RequestClass::Models`
+is answered by R-06 straight from the table, **before `resolve()` is called at all** — no upstream
+hop, and the response carries `X-ApexRouter-Route: -|-` (no alias, no reason) precisely because
+nothing was resolved. Inside `resolve()`, `Models` (other methods) and `Opaque` take the default
+alias's **primary target only** (`candidates.truncate(1)`) with `RouteReason::LegacyModelName`,
+because an arbitrary vendor path is not safely failoverable.
 
 `resolve()` is **synchronous and does no I/O**. Rule 3 reads `model_index`, which the health prober
 maintains; a cold index means rule 3 misses and rule 5/6 applies, which is documented and visible in
@@ -1073,6 +1195,16 @@ cap alone permits 64 × 32 MiB of resident bodies. Retry budget is a **per-backe
 a struggling backend cannot be amplified into a storm. The breaker requires `min_volume` (5)
 observations before it can open, so a single 200 ms blip on a 1 rps rig does not create a 30 s
 outage.
+
+**As built, `/metrics` is written but not yet mounted.** `router::telemetry::Telemetry::prometheus
+(&BackendRegistry, Option<&RigSnapshot>) -> String` produces the exposition below and is
+unit-tested against it, but no `.route("/metrics", …)` line exists in
+`server::lib::v1_routes()`, so the control listener currently `404`s it. That gap is *held open
+deliberately rather than forgotten*: `crates/apexrouter-server/tests/openapi_routes.rs` carries it
+on an explicit `PENDING` list naming the owing unit, and **the test fails the moment it is wired**
+so the list cannot rot. `POST /v1/migrate` (§6.2) is in the same position — the `apexrouter
+migrate` CLI verb is fully implemented; only the HTTP route is unmounted. Treat `PENDING` in that
+test as the authority on which of these two is still outstanding.
 
 `GET /metrics` on the control listener (Prometheus text): `apexrouter_requests_total{alias,backend,
 status}`, `apexrouter_ttft_seconds`, `apexrouter_tokens_total{kind}`,
@@ -1250,6 +1382,14 @@ loopback_bypass   = true
 ui_dir            = ""                   # "" = the embedded ui-web; a path = live-reload dev loop
 drain_timeout_secs= 30
 autostart         = true                 # CLI Mutate verbs may start the daemon
+proxy_cors_origins= []                   # as built. PROXY listener only, non-mutating paths
+                                         # only, and an explicit allowlist. Empty (the default)
+                                         # emits no CORS header at all — a deliberate difference
+                                         # from `endpoint_proxy.py`, which set
+                                         # `Access-Control-Allow-Origin: *` on every response.
+                                         # A single "*" entry opts back into that. `POST /switch`
+                                         # is excluded whatever is listed, and the control plane
+                                         # still has no CorsLayer (§9.3, §12).
 
 [router]
 default_alias        = "auto"
@@ -1290,9 +1430,10 @@ default_mode = "thinking"
 vram_margin_mb = 1024
 scan_interval_secs = 300                 # background rescan; plan-time queries are always LIVE
 
-[providers.together]
-base_url    = "https://api.together.ai/v1"
-api_key_env = "TOGETHER_API_KEY"         # a key is NEVER a required plaintext field here
+[providers.together]                      # `[providers.<id>]`: base_url + where the key lives
+base_url     = "https://api.together.ai/v1"
+api_key_env  = "TOGETHER_API_KEY"        # a key is NEVER a required plaintext field here
+# api_key_file = "~/.config/together/key" # as built: the file form, step 3 of the chain (§9.2)
 
 [providers.vast]
 base_url       = "https://console.vast.ai/api/v0"
@@ -1320,7 +1461,8 @@ llama_cpp_ref  = "deepseek-dsa"
 
 [compat]
 read_legacy_state   = true               # read ~/.vastai-gguf for usage/providers/instances
-mirror_usage_log    = true               # append every usage row to ~/.vastai-gguf/usage.log too
+mirror_usage_log    = false              # DEFAULT OFF: opt in to appending every usage row to
+                                         # ~/.vastai-gguf/usage.log — another tool's state file
 active_endpoint_path= ""                 # "" = off. A path mirrors .active_endpoint for the old TUI
 legacy_proxy_pidfile= false              # DEFAULT OFF: the old TUI's Proxy→stop SIGTERMs this pid
 allow_switch_hosts  = ["api.together.ai", "127.0.0.1", "localhost"]
@@ -1389,8 +1531,14 @@ absent on 54 of 71 rows and defaults to `vast_gguf`; `ctx` is the **total** pool
   Turning it on hands the old TUI's "Proxy → stop" menu item a kill switch for the whole daemon.
   When on, the daemon's SIGTERM handler still performs a graceful drain and local children survive
   via `setsid`, but the routing table, tunnels and watchdogs go with it.
-- `[compat] mirror_usage_log` — append every usage row to `~/.vastai-gguf/usage.log` in the exact
-  legacy field set, on by default while that directory exists, so `cost.py` keeps working.
+- `[compat] mirror_usage_log` — **off by default** (MK1-CORE ACCEPTANCE, finding B): append every
+  usage row to `~/.vastai-gguf/usage.log` in the exact legacy field set, so the old LocalRouter
+  TUI's usage view (`cost.py`) keeps working during a transition period. `~/.vastai-gguf` is
+  *another tool's state directory*, so merely starting the daemon must never append to it — an
+  acceptance run added 15 rows to the real file, which had to be restored. `apexrouter migrate`
+  offers to switch it on, which is the case it exists for, so the capability stays discoverable.
+  When on, the mirror is still opened only while that directory already exists. ApexRouter's own
+  `$STATE/usage.jsonl` is unaffected and is written either way.
 
 Provider id spelling is **one enum with serde aliases** for `vast-gguf` / `vast_gguf` /
 `local-gguf` / `local` / `together` / `vllm`. **`vast-gguf` stays on the wire** in `/health`,
@@ -1462,9 +1610,11 @@ are protocol-aware, and each is stated so nobody has to guess:
   the credential: the client's `x-api-key` is dropped and the backend's own is constructed onto the
   outbound request (§4.5). No translation code is on this path at all.
 - **`GET /v1/models` is re-rendered, never translated.** The rows come from the same routing table
-  and the same aggregation function. Without an `anthropic-version` header the OpenAI list shape is
-  returned unchanged — that default is load-bearing, because ApexOS's compute sweep identifies a node
-  by exactly that shape. With the header, the same rows are emitted as
+  and the same aggregation function, and `GET`/`HEAD` on this path is answered **before**
+  `resolve()` runs (§4.2), which is why it carries `X-ApexRouter-Route: -|-`. Without an
+  `anthropic-version` header the OpenAI list shape is returned unchanged — that default is
+  load-bearing, because ApexOS's compute sweep verifies a node by exactly that shape (§3.4).
+  With the header, the same rows are emitted as
   `{"data":[{"type":"model","id":…,"display_name":…,"created_at":…}],"has_more":false,
   "first_id":…,"last_id":…}`; the `apexrouter` extras key is carried through untouched.
 
@@ -1477,10 +1627,10 @@ All under `/v1/` (house convention; the proxy's `/v1` lives on a different socke
 collision). Every response body is a protocol type. Every mutation is `Origin`/`Host`-gated.
 
 ```
-GET    /health                                 {ok, product, version}          (public)
+GET    /health                                 {ok, product, version, uptime}  (public)
 GET    /v1/snapshot                                                   -> Snapshot
 GET    /ws                                     WebSocket, Event stream
-GET    /metrics                                Prometheus text
+GET    /metrics                                Prometheus text     [NOT MOUNTED YET — §4.5]
 POST   /v1/reload                              reparse config + routes, keep old table on failure
 POST   /v1/shutdown                            graceful (admin scope)
 
@@ -1488,9 +1638,14 @@ POST   /v1/shutdown                            graceful (admin scope)
 GET    /v1/rig                                                        -> RigSnapshot
 POST   /v1/rig/rescan                          ?builds=&models=       -> RigSnapshot
 GET    /v1/models/local                        discovered GGUFs       -> Vec<LocalModel>
-GET    /v1/fit?model=&ctx=&parallel=&kv=&devices=&split_mode=&tensor_split=&main_gpu=
+GET    /v1/fit?model=&ctx=&parallel=&kv=&devices=&build=&split_mode=&tensor_split=&main_gpu=
                                                                       -> FitPlan
 POST   /v1/fit                                 body = FitInput        -> FitPlan
+POST   /v1/fit/input                           body = FitQuery        -> FitInput
+                                               as built: resolve a model name + flags into the
+                                               FitInput (GGUF header + LIVE budget) that a GUI
+                                               then edits locally, so a ctx slider re-solves
+                                               through POST /v1/fit without re-reading the rig
 
 --- backends and routes -------------------------------------------------------
 GET    /v1/backends                                                   -> Vec<Backend>
@@ -1559,8 +1714,18 @@ POST   /v1/smoke            {alias|base_url}                          SSE, one e
 GET    /v1/diagnose?only=                                             SSE, one event per check
 GET    /v1/checks                                                     -> the registry
 GET    /v1/jobs   GET /v1/jobs/{id}   POST /v1/jobs/{id}/cancel
-POST   /v1/migrate          {dry_run: bool}                           -> MigrationPlan | MigrationReport
+POST   /v1/migrate          {dry_run: bool}    -> MigrationPlan | MigrationReport
+                                               [NOT MOUNTED YET — the `apexrouter migrate` CLI
+                                                verb is complete; only the route is missing]
 ```
+
+**As built, two of the paths above are not registered** — `/metrics` and `/v1/migrate`. Both are
+on the `PENDING` list in `crates/apexrouter-server/tests/openapi_routes.rs`, which fails the build
+if a documented path is neither registered nor listed there **and** fails if a listed one has
+since been wired. That test, not this table, is the authority on what the daemon serves today.
+Everything else here is registered and is proved reachable in the composed application by
+`crates/apexrouter-server/tests/mounted_routes.rs` — the guard that exists because three separate
+API modules once shipped implemented, tested and unreachable.
 
 **`?no_wait=true`** is the house pattern: return a `JobRecord` immediately and have the spawned task
 flip the row to `Failed` on **every** error path including a `JoinError` from a panic, so nothing
@@ -1601,19 +1766,19 @@ discriminator, satisfying `07` §2.2 without inventing exit codes.
 
 ```
 apexrouter                                   # bare = status
-apexrouter status [--json] [--watch]
-apexrouter serve [--proxy-bind A] [--control-bind A] [--foreground] [--stop] [--no-ui]
+apexrouter status [--json] [--watch] [--interval SECS]
+apexrouter serve [--proxy-bind A] [--control-bind A] [--foreground] [--detach] [--stop] [--no-ui]
                  [--allow-remote --token-env VAR]
 apexrouter open                              # ensure daemon, xdg-open the web UI
 apexrouter url [--json]                      # prints http://127.0.0.1:8888/v1 and nothing else
-apexrouter env                               # export OPENAI_BASE_URL=… ; OPENAI_API_KEY=not-needed
+apexrouter env                               # OPENAI_BASE_URL, OPENAI_API_KEY, ANTHROPIC_BASE_URL
 apexrouter version
-apexrouter completions <bash|zsh|fish>
+apexrouter completions <bash|zsh|fish|elvish|powershell>
 
-apexrouter rig [--json]                      # GPUs (free/total, who holds them), builds, RAM, swap
+apexrouter rig [--json] [--rescan]           # GPUs (free/total, who holds them), builds, RAM, swap
 apexrouter models ls [--json] | show <id> [--json]
 apexrouter fit <model> [--devices Vulkan0,Vulkan1] [--ctx N] [--parallel N] [--kv q8_0]
-                       [--split-mode layer] [--tensor-split 3,1] [--main-gpu 0] [--json]
+                       [--split-mode layer] [--tensor-split 3,1] [--main-gpu 0] [--batch N] [--json]
 
 apexrouter up <model|recipe> [--alias A] [--yes] …            # the one-command happy path
 apexrouter endpoint ls [--json] | show <id> | logs <id> [-f] [-n 200] | argv <id>
@@ -1625,14 +1790,17 @@ apexrouter endpoint vllm start --model-id M [--tp N] [--ctx N] …          # lo
 apexrouter swap <alias> --to <model|recipe|backend-id> [--mode hot|sequential]
 
 apexrouter route ls [--json] | show <alias> | rm <alias> | default <alias> | test <alias>
-apexrouter route set <alias> --target <backend[:model]>... [--strategy first_healthy|round_robin|
-      least_busy|cheapest] [--failover] [--retries N] [--require-tag T] [--max-cost F] [--min-ctx N]
+apexrouter route set <alias> --target <backend[:model]|tag:T[:model]|glob:P[:model]>...
+      [--strategy first-healthy|round-robin|least-busy|cheapest]   # kebab at the CLI; the wire
+      [--failover | --no-failover] [--retries N]                   # enum stays snake_case
+      [--require-tag T] [--max-cost F] [--min-ctx N] [--json]
 apexrouter switch <together|local <name>|vast-gguf|endpoint <id>|alias <a>>   # muscle memory
 apexrouter backend ls | show <id> | add <url> [--label L] [--tag T] [--key-env VAR]
                     | enable|disable|drain|probe|rm <id>
 
-apexrouter recipe ls [--json] | show <id> | new [--from-endpoint <id>] [--edit] | edit <id>
+apexrouter recipe ls [--json] | show <id> | new --from-endpoint <id> [--edit] | edit <id>
                    | rm <id> | validate <id> | run <id> [--alias A]
+      # --from-endpoint is REQUIRED: a recipe is a snapshot of something that ran, never invented
 apexrouter profile ls [--json] | show <id> | new | edit <id> | rm <id>
 
 apexrouter provider ls [--json] | show <id> | set <id> [--base-url U] [--key-env VAR]
@@ -1654,12 +1822,16 @@ apexrouter hf search <query> [--json] | files <repo> [--json]
 
 apexrouter usage [--since 24h|7d|all] [--by provider|model|backend|alias|day] [--json]
 apexrouter compare --alias A --alias B --prompt P [--max-tokens N] [--json]
-apexrouter smoke [--alias A | --base-url URL] [--json]
+apexrouter smoke [--alias A | --base-url URL] [--model M] [--json]
 apexrouter doctor [--only <check>] [--json]
-apexrouter migrate [--dry-run] [--from ~/.vastai-gguf] [--localrouter PATH]
-apexrouter config init | show [--json] | path | edit
+apexrouter migrate [--dry-run] [--apply] [--from ~/.vastai-gguf] [--localrouter PATH] [--json]
+      # --dry-run is the DEFAULT. Without --apply, `migrate` only ever prints.
+apexrouter config init [--force] | show [--json] | path | edit
 apexrouter token create [--scope read|write|admin] | ls | revoke <id>
 apexrouter mcp [--proxy URL]
+      # NOT a clap subcommand: `mcp` is intercepted in main() before Cli::parse(), so it does
+      # not appear in `apexrouter --help` and its own --help prints to STDERR. Deliberate —
+      # one clap diagnostic on stdout is a protocol violation an MCP client reports as a crash.
 ```
 
 Blocking semantics are stated per verb in `docs/API.md`: `endpoint start` and `swap` return when the
@@ -1722,6 +1894,17 @@ are long and operational: an agent should get from `apexrouter_status` to a work
 | `apexrouter_vast_destroy` | `{id, confirm: true}` | Tear down; verifies before forgetting; returns accrued cost. |
 | `apexrouter_compare` | `{aliases[], prompt, max_tokens?}` | Run one prompt across N aliases in parallel; latency, tok/s, cost, first 200 chars each. |
 
+**As built:** 24 tools, exactly this list, **sorted by name** in `tools/list` (the 2026-07-28
+revision asks for it so a client can cache the list and an LLM can hit its prompt cache), each
+carrying a `title` alongside `name`/`description`/`inputSchema`. A test asserts the inventory
+against this table, so a tool cannot be added here in prose and missed in code. Optional
+arguments the table above compresses: `_up` takes `wait`; `_hf_search` and `_vast_offers` take
+`limit`; `_vast_rent` **requires** `launch` and also accepts `auto_tunnel` and `bind_alias`;
+`_endpoint_stop` accepts `id` **or** `alias`. `initialize` also returns an `instructions` string
+that already names the base URL and the `model` string, so a harness that surfaces instructions
+gets the operational fact without a tool call. Registration snippets per harness live in
+`docs/AGENTS.md`; the agent-facing operating manual is `skills/apexrouter/SKILL.md`.
+
 ---
 
 ## 9. Security posture
@@ -1783,8 +1966,25 @@ Together key is a **credential-exfiltration primitive**, not merely SSRF.
 ### 9.4 Tokens and scopes
 
 Bearer accepted three ways: `Authorization: Bearer <t>`, `X-ApexRouter-Token: <t>`, `?token=<t>`.
-Scopes `read|write|admin` derived from (path, method); `/v1/tokens*` is always `admin`. Tokens are
-stored hashed, shown once at mint, hashes never serialised.
+Scopes `read|write|admin` derived from (path, method); `/v1/tokens*` and `/v1/shutdown` are always
+`admin`, and — deliberately — the **data plane is `Read` even though it is `POST`**
+(`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/rerank`, `/v1/messages`):
+inference mutates nothing this server owns, and a read-scoped agent that could not run a
+completion would be a scope system nobody uses. A doubled `/v1` is collapsed before
+classification, so `/v1/v1/chat/completions` classifies identically.
+
+**As built, there is one bearer, not a token store.** `required_scope()` exists and is tested, but
+the *subject* side of it does not: the daemon accepts exactly one token — the value of the
+environment variable named by `[server] token_env`, defaulting to `APEXROUTER_TOKEN` — and grants
+it every scope. `apexrouter token create` mints 256 bits from `/dev/urandom`, hex-encodes them,
+prints the token **once** and prints the two lines that put it to work; it stores nothing, so
+`token ls` reports *where the daemon looks* and whether it finds a value, and `token revoke`
+explains how to take one out of service (rotate the variable, restart) rather than deleting a row.
+The command says so in its own output rather than implying a store that is not there. A per-token
+hashed store, and therefore genuine per-token scopes, is `/v1/tokens*` — reserved in the scope
+table, not implemented in mk1. **The security posture that is real today is loopback + the
+mutation gate (§9.3); the bearer exists so a non-loopback bind is possible at all** (§9.1 refuses
+one without it), not as a multi-tenant authorisation system.
 
 ### 9.5 Rented-endpoint exposure
 
@@ -1849,13 +2049,21 @@ into the event loop, so the app renders the same `Snapshot` as the web UI with z
 **It is an edge client of the same HTTP API. There is no second business-logic path.** It links
 `apexrouter-protocol` and `apexrouter-client` only.
 
-**Layout.** `src/ui/appwindow.slint` root + `palette.slint` + `types.slint` +
-`components/{card,badge,meter,table,logview,drawer}.slint`. `export global Palette` matching the web
-tokens exactly (`#0d0d0d` page, `#1a1a19` surface, `#2c2c2a` hairline, `#ffffff` ink, `#c3c2b7`
-ink-2, `#898781` muted, `#3987e5` accent, `#0ca30c` good, `#fab219` warn, `#ec835a` serious,
-`#d03b3b` critical). **Every component reads from `Palette`; nothing hardcodes a colour or radius.**
-Models are `ModelRc::new(VecModel::from(rows))`; kebab-case Slint names map to snake_case Rust
-(`base-url` → `get_base_url`/`set_base_url`).
+**Layout, as built.** `src/main.rs` (one `wire_*` fn per screen) + `src/api.rs` (`Bridge`, `Store`,
+and the pure `protocol → *Row` mappers) + `src/ui/appwindow.slint` root + `state.slint`
+(`export global State` — the whole Rust↔UI contract in one global, because threading properties
+through eight write-capable screens would be most of the file and all of the bugs) +
+`types.slint` (20 row structs) + `palette.slint` +
+`components/{card,badge,meter,table,logview,drawer,widgets}.slint` +
+`screens/{dashboard,routes,backends,launch,fleet,catalog,providers,doctor}.slint`.
+`export global Palette` matches the web tokens exactly (`#0d0d0d` page, `#1a1a19` surface,
+`#2c2c2a` hairline, `#ffffff` ink, `#c3c2b7` ink-2, `#898781` muted, `#3987e5` accent, `#0ca30c`
+good, `#fab219` warn, `#ec835a` serious, `#d03b3b` critical). **Every component reads from
+`Palette`; no colour literal exists outside it** (a few `border-radius` px literals do — radius is
+shape, not identity). Models are `ModelRc::new(VecModel::from(rows))`, except the route editor's
+target list which is mutated in place because reordering is the operation; kebab-case Slint names
+map to snake_case Rust (`base-url` → `get_base_url`/`set_base_url`). Crate features:
+`default = ["winit"]`, with a commented `linuxkms` line for a compositor-less ApexOS node.
 
 **mk1 screens — full parity with the web UI on everything that matters, including money.** The brief
 says "a nice GUI, in TWO forms", not one GUI and one dashboard.
@@ -1875,6 +2083,15 @@ Honest deferrals, stated in `docs/SLINT.md` as a table: drag-to-reorder (Slint u
 the stacked SVG charts (Slint uses a bar row), and the HF *search* browser (Slint takes repo + quant
 as fields and offers "open the web UI" for browsing). Nothing that spends, destroys, launches,
 routes or authors is missing.
+
+**As built, the eight screens are not one-for-one with the web UI's eight tabs**, and
+`docs/SLINT.md` carries the full port map. The differences worth knowing here: the app gains a
+**Dashboard** (the web keeps those stats in its always-visible router bar) which also hosts the
+**live-request ticker** the web gives a tab of its own; **Launch is a screen rather than a
+drawer** (a drawer over a dense desktop window buys nothing — the *boot* view is still a drawer);
+and **Usage and Doctor share one screen**. `docs/SLINT.md` also records the headless invocation —
+`env -u WAYLAND_DISPLAY WINIT_UNIX_BACKEND=x11` under `Xvfb`, because winit otherwise prefers
+Wayland and silently opens on the real desktop where an X11 capture sees nothing.
 
 ---
 

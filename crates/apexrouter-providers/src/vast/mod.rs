@@ -4,6 +4,12 @@
 //! vast.ai. **Nothing that costs money happens without a `SpendApproval`**, the ledger row
 //! is written before the billing call, and **instances are never auto-destroyed on daemon
 //! shutdown, at any setting.** A crash must not delete a paid box.
+//!
+//! The layering, so nothing reaches around it: [`api`] is the transport and knows nothing
+//! about profiles, relaxation or money; `offers` turns a saved profile into the **one**
+//! [`build_query`] shape; `rent`/`boot`/`stall` own the money path and the watchdog. Every
+//! one of them takes `&dyn VastApi`, so [`FixtureVast`] can stand in for the market and no
+//! test ever spends a cent.
 
 pub mod api;
 pub mod boot;
@@ -12,7 +18,7 @@ pub mod query;
 pub mod rent;
 pub mod stall;
 
-pub use api::{FixtureVast, VastApi, VastApiHttp};
+pub use api::{FixtureCall, FixtureCreate, FixtureVast, VastApi, VastApiHttp};
 pub use boot::watch_boot;
 pub use offers::{gpu_name_vocabulary, profile_to_query, search_unified, QueryOverrides};
 pub use query::build_query;

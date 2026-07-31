@@ -402,7 +402,13 @@ pub struct KnownFork {
 pub struct CompatCfg {
     /// Read `~/.vastai-gguf` for usage, providers and instances.
     pub read_legacy_state: bool,
-    /// Append every usage row to `~/.vastai-gguf/usage.log` too, so `cost.py` keeps working.
+    /// **DEFAULT OFF.** Append every usage row to `~/.vastai-gguf/usage.log` too, so the old
+    /// LocalRouter TUI's usage view keeps working during a transition.
+    ///
+    /// `~/.vastai-gguf` is *another tool's state directory*. Starting our daemon must not
+    /// silently append to a file we do not own, so this is opt-in: `apexrouter migrate`
+    /// offers it, and the config comment explains it. ApexRouter's own usage log under
+    /// `Paths::state()` is unaffected and stays on regardless.
     pub mirror_usage_log: bool,
     /// `""` = off. A path mirrors `.active_endpoint` for the old TUI.
     pub active_endpoint_path: String,
@@ -421,7 +427,7 @@ impl Default for CompatCfg {
     fn default() -> Self {
         CompatCfg {
             read_legacy_state: true,
-            mirror_usage_log: true,
+            mirror_usage_log: false,
             active_endpoint_path: String::new(),
             legacy_proxy_pidfile: false,
             allow_switch_hosts: vec![
@@ -1000,7 +1006,10 @@ mod tests {
         assert_eq!(fork.llama_cpp_ref, "deepseek-dsa");
 
         assert!(c.compat.read_legacy_state);
-        assert!(c.compat.mirror_usage_log);
+        assert!(
+            !c.compat.mirror_usage_log,
+            "starting the daemon must never append to another tool's usage.log"
+        );
         assert_eq!(c.compat.active_endpoint_path, "");
         assert!(
             !c.compat.legacy_proxy_pidfile,

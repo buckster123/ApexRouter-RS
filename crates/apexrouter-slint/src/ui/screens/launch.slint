@@ -1,0 +1,953 @@
+// OWNER: unit U-02. Screen 3 — Launch. Three tabs, one `EndpointSpec`.
+//
+// The summary stays visible while you edit, the fit readout re-runs on every stepper
+// move, and the Rent tab is the money path: nothing here spends without an explicit
+// confirm toggle, and the cost panel always shows $/hr, the estimated total, the current
+// credit and the burn-down before the button is live.
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, KV, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip, CostBadge } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, PaneScroll, Empty } from "../components/table.slint";
+import { Btn, Field, Area, Toggle, Chooser, Stepper, Labeled } from "../components/widgets.slint";
+import { Meter, StackedMeter } from "../components/meter.slint";
+
+component Tab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+    height: Palette.ctl-h;
+    background: root.active ? Palette.accent-dim : (ta.has-hover ? Palette.surface-hi : Palette.clear);
+    border-radius: Palette.radius-sm;
+    border-width: Palette.hair;
+    border-color: root.active ? Palette.accent : Palette.hairline;
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Text {
+            text: root.label;
+            color: root.active ? Palette.accent : Palette.ink-2;
+            font-size: Palette.font;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The live fit readout: stacked budget bar plus the `why[]` strings, verbatim.
+component FitPanel inherits Card {
+    title: "fit";
+    subtitle: State.fit-budget;
+    HorizontalLayout {
+        spacing: Palette.gap;
+        Badge {
+            label: State.fit-verdict;
+            level: State.fit-level;
+        }
+        Rectangle { }
+        Btn {
+            label: "re-fit";
+            compact: true;
+            clicked => {
+                State.fit-refresh();
+            }
+        }
+    }
+    StackedMeter {
+        weights: State.fit-weights-frac;
+        kv: State.fit-kv-frac;
+        compute: State.fit-compute-frac;
+        caption: State.fit-caption;
+    }
+    VerticalLayout {
+        spacing: 1px;
+        for w in State.fit-why: Text {
+            text: "· " + w;
+            color: Palette.muted;
+            font-size: Palette.font-sm;
+            wrap: word-wrap;
+        }
+    }
+}
+
+export component LaunchScreen inherits VerticalLayout {
+    spacing: Palette.gap;
+
+    HorizontalLayout {
+        spacing: Palette.gap;
+        alignment: start;
+        Tab {
+            label: "local · llama.cpp";
+            active: State.launch-tab == 0;
+            clicked => {
+                State.launch-tab = 0;
+            }
+        }
+        Tab {
+            label: "local · vLLM";
+            active: State.launch-tab == 1;
+            clicked => {
+                State.launch-tab = 1;
+            }
+        }
+        Tab {
+            label: "rent · vast.ai";
+            active: State.launch-tab == 2;
+            clicked => {
+                State.launch-tab = 2;
+            }
+        }
+        Rectangle { }
+        if State.boot-active: Btn {
+            label: "watch boot: " + State.boot-backend;
+            kind: 1;
+            icon: "◐";
+            clicked => {
+                State.launch-open = true;
+            }
+        }
+    }
+
+    // ── Tab 0: llama.cpp ──────────────────────────────────────────────────
+    if State.launch-tab == 0: HorizontalLayout {
+        spacing: Palette.gap;
+
+        Card {
+            title: "models";
+            subtitle: "shards grouped, real sizes";
+            horizontal-stretch: 2;
+            HorizontalLayout {
+                vertical-stretch: 0;
+                spacing: Palette.gap;
+                alignment: start;
+                Btn {
+                    label: "rescan";
+                    compact: true;
+                    clicked => {
+                        State.load-local-models();
+                    }
+                }
+                Btn {
+                    label: "download a quant…";
+                    compact: true;
+                    kind: 3;
+                    clicked => {
+                        State.screen = 5;
+                    }
+                }
+            }
+            HeadRow {
+                HeadCell { text: "model"; }
+                HeadCell {
+                    text: "quant";
+                    width: 92px;
+                }
+                HeadCell {
+                    text: "size";
+                    width: 78px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "ctx train";
+                    width: 76px;
+                    numeric: true;
+                }
+            }
+            ListScroll {
+                rows: State.local-models.length;
+                VerticalLayout {
+                    spacing: 0px;
+                    alignment: start;
+                    width: parent.width;
+                    for m[i] in State.local-models: Row {
+                        striped: Math.mod(i, 2) == 1;
+                        selected: i == State.local-model-index;
+                        clicked => {
+                            State.local-model-select(i);
+                        }
+                        HorizontalLayout {
+                            spacing: 5px;
+                            Cell {
+                                text: m.name;
+                                mono: true;
+                            }
+                            if m.vision: Badge {
+                                label: "vision";
+                                level: 5;
+                                icon: "👁";
+                            }
+                            if m.shards > 1: Badge {
+                                label: m.shards + " shards";
+                                level: 0;
+                                icon: "▤";
+                            }
+                        }
+                        Cell {
+                            text: m.quant;
+                            width: 92px;
+                            mono: true;
+                        }
+                        Cell {
+                            text: m.size;
+                            width: 78px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: m.ctx-train;
+                            width: 76px;
+                            numeric: true;
+                            mono: true;
+                        }
+                    }
+                    if State.local-models.length == 0: Empty {
+                        message: "no GGUFs discovered — check [discovery] model_globs, then press rescan";
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 3;
+            spacing: Palette.gap;
+
+            Card {
+                title: "plan";
+                vertical-stretch: 0;
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "build";
+                        Chooser {
+                            options: State.build-names;
+                            current <=> State.build-index;
+                            placeholder: "llama.cpp build";
+                            changed => {
+                                State.fit-refresh();
+                            }
+                        }
+                    }
+                    Labeled {
+                        label: "alias to bind";
+                        Field {
+                            value <=> State.ll-alias;
+                            mono: true;
+                            placeholder: "auto";
+                        }
+                    }
+                    Labeled {
+                        label: "host";
+                        Field {
+                            value <=> State.ll-host;
+                            mono: true;
+                        }
+                    }
+                    Labeled {
+                        label: "port";
+                        Field {
+                            value <=> State.ll-port;
+                            mono: true;
+                            placeholder: "auto";
+                        }
+                    }
+                }
+
+                Text {
+                    text: "devices — the VRAM budget is per backend, so one physical GPU seen twice counts once";
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                }
+                VerticalLayout {
+                    spacing: 2px;
+                    for d[i] in State.devices: HorizontalLayout {
+                        spacing: Palette.gap;
+                        Toggle {
+                            width: 200px;
+                            label: d.device + "  " + d.backend;
+                            checked: d.checked;
+                            toggled(v) => {
+                                State.device-toggle(i, v);
+                            }
+                        }
+                        Text {
+                            text: d.detail;
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { }
+                        if d.software: Badge {
+                            label: "software";
+                            level: 2;
+                            icon: "▲";
+                        }
+                    }
+                    if State.devices.length == 0: Empty {
+                        message: "no GPUs enumerated — the CPU build is still launchable";
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "ctx";
+                        Stepper {
+                            value <=> State.ll-ctx;
+                            minimum: 512;
+                            maximum: 1048576;
+                            multiply: true;
+                            step: 1024;
+                            changed => {
+                                State.fit-refresh();
+                            }
+                        }
+                    }
+                    Labeled {
+                        label: "parallel";
+                        Stepper {
+                            value <=> State.ll-parallel;
+                            minimum: 1;
+                            maximum: 64;
+                            changed => {
+                                State.fit-refresh();
+                            }
+                        }
+                    }
+                    Labeled {
+                        label: "kv type";
+                        Chooser {
+                            options: State.kv-types;
+                            current <=> State.ll-kv;
+                            changed => {
+                                State.fit-refresh();
+                            }
+                        }
+                    }
+                    Labeled {
+                        label: "split mode";
+                        Chooser {
+                            options: State.split-modes;
+                            current <=> State.ll-split-mode;
+                            changed => {
+                                State.fit-refresh();
+                            }
+                        }
+                    }
+                    Labeled {
+                        label: "main gpu";
+                        Field {
+                            value <=> State.ll-main-gpu;
+                            mono: true;
+                            placeholder: "0";
+                        }
+                    }
+                    Labeled {
+                        label: "tensor split";
+                        Field {
+                            value <=> State.ll-tensor-split;
+                            mono: true;
+                            placeholder: "0.6,0.4";
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "sampling mode";
+                        Chooser {
+                            options: State.sampling-modes;
+                            current <=> State.ll-mode;
+                        }
+                    }
+                    Labeled {
+                        label: "flash attention";
+                        Chooser {
+                            options: State.tristates;
+                            current <=> State.ll-flash;
+                        }
+                    }
+                    Labeled {
+                        label: "mmproj";
+                        Field {
+                            value <=> State.ll-mmproj;
+                            mono: true;
+                            placeholder: "auto from the model dir";
+                        }
+                    }
+                    Labeled {
+                        label: "extra args";
+                        Field {
+                            value <=> State.ll-extra;
+                            mono: true;
+                            placeholder: "--no-mmap --threads 8";
+                        }
+                    }
+                }
+            }
+
+            FitPanel {
+                vertical-stretch: 1;
+            }
+
+            HorizontalLayout {
+                spacing: Palette.gap;
+                vertical-stretch: 0;
+                Btn {
+                    label: "start & bind";
+                    kind: 1;
+                    icon: "▶";
+                    clicked => {
+                        State.launch-local();
+                    }
+                }
+                Btn {
+                    label: "save as recipe";
+                    icon: "⌸";
+                    clicked => {
+                        State.launch-local-recipe();
+                    }
+                }
+                Rectangle { }
+            }
+        }
+    }
+
+    // ── Tab 1: vLLM ───────────────────────────────────────────────────────
+    if State.launch-tab == 1: HorizontalLayout {
+        spacing: Palette.gap;
+        Card {
+            title: "vLLM";
+            horizontal-stretch: 3;
+            HorizontalLayout {
+                spacing: Palette.gap;
+                Labeled {
+                    label: "model id";
+                    Field {
+                        value <=> State.vl-model;
+                        mono: true;
+                        placeholder: "Qwen/Qwen3-8B-AWQ";
+                    }
+                }
+                Labeled {
+                    label: "binary";
+                    Field {
+                        value <=> State.vl-bin;
+                        mono: true;
+                    }
+                }
+                Labeled {
+                    label: "alias to bind";
+                    Field {
+                        value <=> State.vl-alias;
+                        mono: true;
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: Palette.gap;
+                Labeled {
+                    label: "tensor parallel";
+                    Stepper {
+                        value <=> State.vl-tp;
+                        minimum: 1;
+                        maximum: 16;
+                    }
+                }
+                Labeled {
+                    label: "ctx";
+                    Stepper {
+                        value <=> State.vl-ctx;
+                        minimum: 512;
+                        maximum: 1048576;
+                        multiply: true;
+                    }
+                }
+                Labeled {
+                    label: "max seqs";
+                    Stepper {
+                        value <=> State.vl-max-seqs;
+                        minimum: 0;
+                        maximum: 4096;
+                        step: 8;
+                    }
+                }
+                Labeled {
+                    label: "quantization";
+                    Field {
+                        value <=> State.vl-quant;
+                        mono: true;
+                        placeholder: "awq | gptq | fp8";
+                    }
+                }
+                Labeled {
+                    label: "kv cache dtype";
+                    Field {
+                        value <=> State.vl-kv-dtype;
+                        mono: true;
+                        placeholder: "auto | fp8";
+                    }
+                }
+                Labeled {
+                    label: "gpu util";
+                    Field {
+                        value <=> State.vl-gpu-util;
+                        mono: true;
+                        placeholder: "0.90";
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: Palette.gap;
+                Labeled {
+                    label: "host";
+                    Field {
+                        value <=> State.vl-host;
+                        mono: true;
+                    }
+                }
+                Labeled {
+                    label: "port";
+                    Field {
+                        value <=> State.vl-port;
+                        mono: true;
+                        placeholder: "auto";
+                    }
+                }
+                Labeled {
+                    label: "extra args";
+                    Field {
+                        value <=> State.vl-extra;
+                        mono: true;
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 18px;
+                alignment: start;
+                Toggle {
+                    label: "enforce eager";
+                    checked <=> State.vl-eager;
+                }
+                Toggle {
+                    label: "trust remote code";
+                    checked <=> State.vl-trust;
+                }
+                Toggle {
+                    label: "chunked prefill";
+                    checked <=> State.vl-chunked;
+                }
+            }
+            Text {
+                text: "devices come from the same checkboxes as the llama.cpp tab";
+                color: Palette.muted;
+                font-size: Palette.font-sm;
+            }
+            VerticalLayout {
+                spacing: 2px;
+                for d[i] in State.devices: Toggle {
+                    label: d.device + "  " + d.backend + "  " + d.detail;
+                    checked: d.checked;
+                    toggled(v) => {
+                        State.device-toggle(i, v);
+                    }
+                }
+            }
+            Rectangle { }
+            HorizontalLayout {
+                spacing: Palette.gap;
+                Btn {
+                    label: "start & bind";
+                    kind: 1;
+                    icon: "▶";
+                    clicked => {
+                        State.launch-vllm();
+                    }
+                }
+                Btn {
+                    label: "save as recipe";
+                    icon: "⌸";
+                    clicked => {
+                        State.launch-vllm-recipe();
+                    }
+                }
+                Rectangle { }
+            }
+        }
+        FitPanel {
+            horizontal-stretch: 2;
+        }
+    }
+
+    // ── Tab 2: rent ───────────────────────────────────────────────────────
+    if State.launch-tab == 2: HorizontalLayout {
+        spacing: Palette.gap;
+
+        VerticalLayout {
+            horizontal-stretch: 3;
+            spacing: Palette.gap;
+
+            Card {
+                title: "offers";
+                subtitle: State.rent-search-note;
+                vertical-stretch: 1;
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    vertical-stretch: 0;
+                    Labeled {
+                        label: "search profile";
+                        hint: "profiles are authored on the Catalog screen";
+                        Chooser {
+                            options: State.profile-names;
+                            current <=> State.rent-profile-index;
+                            placeholder: "saved profile";
+                            changed(i) => {
+                                State.rent-profile-select(i);
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Btn {
+                            label: "search";
+                            icon: "⌕";
+                            clicked => {
+                                State.offers-search();
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Btn {
+                            label: "edit profiles…";
+                            kind: 3;
+                            clicked => {
+                                State.screen = 5;
+                            }
+                        }
+                    }
+                }
+                HeadRow {
+                    HeadCell {
+                        text: "gpu";
+                        width: 150px;
+                    }
+                    HeadCell {
+                        text: "n";
+                        width: 26px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "vram";
+                        width: 78px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "$/hr";
+                        width: 72px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "rel";
+                        width: 56px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "inet";
+                        width: 78px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "disk";
+                        width: 62px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "cuda";
+                        width: 52px;
+                        numeric: true;
+                    }
+                    HeadCell { text: "geo"; }
+                }
+                ListScroll {
+                    rows: State.offers.length;
+                    VerticalLayout {
+                        spacing: 0px;
+                        alignment: start;
+                        width: parent.width;
+                        for o[i] in State.offers: Row {
+                            striped: Math.mod(i, 2) == 1;
+                            selected: i == State.offer-index;
+                            clicked => {
+                                State.offer-select(i);
+                            }
+                            Cell {
+                                text: o.gpu;
+                                width: 150px;
+                                mono: true;
+                                level: o.rentable ? 0 : 2;
+                            }
+                            Cell {
+                                text: o.num-gpus + "";
+                                width: 26px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: o.vram;
+                                width: 78px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: o.dph;
+                                width: 72px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: o.reliability;
+                                width: 56px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: o.inet;
+                                width: 78px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: o.disk;
+                                width: 62px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: o.cuda;
+                                width: 52px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell { text: o.geo; }
+                        }
+                        if State.offers.length == 0: Empty {
+                            message: "no offers — pick a profile and press search";
+                        }
+                    }
+                }
+            }
+
+            Card {
+                title: "container";
+                vertical-stretch: 0;
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "runtime";
+                        Chooser {
+                            options: State.runtimes;
+                            current <=> State.rent-runtime;
+                        }
+                    }
+                    Labeled {
+                        label: "image";
+                        Field {
+                            value <=> State.rent-image;
+                            mono: true;
+                            placeholder: "ghcr.io/ggml-org/llama.cpp:server-cuda";
+                        }
+                    }
+                    Labeled {
+                        label: "disk GB";
+                        Stepper {
+                            value <=> State.rent-disk-gb;
+                            minimum: 10;
+                            maximum: 2000;
+                            step: 10;
+                        }
+                    }
+                    Labeled {
+                        label: "port";
+                        Stepper {
+                            value <=> State.rent-port;
+                            minimum: 1;
+                            maximum: 65535;
+                            step: 1;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "HF repo";
+                        Field {
+                            value <=> State.rent-hf-repo;
+                            mono: true;
+                            placeholder: "unsloth/Qwen3-30B-A3B-GGUF";
+                        }
+                    }
+                    Labeled {
+                        label: "quant";
+                        Field {
+                            value <=> State.rent-hf-quant;
+                            mono: true;
+                            placeholder: "UD-Q4_K_XL";
+                        }
+                    }
+                    Labeled {
+                        label: "alias to bind";
+                        Field {
+                            value <=> State.rent-alias;
+                            mono: true;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Toggle {
+                            label: "expose publicly";
+                            checked <=> State.rent-expose;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Toggle {
+                            label: "ssh tunnel";
+                            checked <=> State.rent-tunnel;
+                        }
+                    }
+                }
+                Labeled {
+                    label: "onstart";
+                    Area {
+                        height: 54px;
+                        value <=> State.rent-onstart;
+                        placeholder: "left empty, the recipe's onstart is used verbatim";
+                    }
+                }
+            }
+        }
+
+        // ── The cost panel. Always four numbers, always before the button. ──
+        VerticalLayout {
+            horizontal-stretch: 2;
+            min-width: 320px;
+            spacing: Palette.gap;
+
+            Card {
+                title: "cost";
+                subtitle: "read this before you press the button";
+                vertical-stretch: 0;
+                KV {
+                    key: "$/hr";
+                    value: State.rent-dph-line;
+                    mono: true;
+                    level: State.rent-cost-level;
+                }
+                KV {
+                    key: "estimated total";
+                    value: State.rent-total-line;
+                    mono: true;
+                }
+                KV {
+                    key: "current credit";
+                    value: State.rent-credit-line;
+                    mono: true;
+                }
+                KV {
+                    key: "burn-down";
+                    value: State.rent-burndown-line;
+                    mono: true;
+                }
+                Hairline { }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "max $/hr you approve";
+                        Field {
+                            value <=> State.rent-max-dph;
+                            mono: true;
+                            placeholder: "1.50";
+                            edited => {
+                                State.rent-cost-refresh();
+                            }
+                        }
+                    }
+                    Labeled {
+                        label: "hours";
+                        Field {
+                            value <=> State.rent-hours;
+                            mono: true;
+                            edited => {
+                                State.rent-cost-refresh();
+                            }
+                        }
+                    }
+                }
+                if State.rent-fit-line != "": Banner {
+                    message: "fit against pooled VRAM";
+                    detail: State.rent-fit-line;
+                    level: State.rent-cost-level;
+                }
+                Hairline { }
+                Toggle {
+                    label: "I confirm this rents a machine and starts billing";
+                    checked <=> State.rent-confirm;
+                }
+                Btn {
+                    label: "rent & bind";
+                    kind: 2;
+                    icon: "$";
+                    enabled: State.rent-confirm && State.offer-index >= 0;
+                    clicked => {
+                        State.rent-go();
+                    }
+                }
+                Text {
+                    text: "without the confirm the daemon answers 409 and returns this same preview";
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                    wrap: word-wrap;
+                }
+            }
+
+            Card {
+                title: "fleet right now";
+                vertical-stretch: 1;
+                KV {
+                    key: "credit";
+                    value: State.credit;
+                    mono: true;
+                }
+                KV {
+                    key: "burn rate";
+                    value: State.burn-rate;
+                    mono: true;
+                }
+                KV {
+                    key: "burn-down";
+                    value: State.burn-down;
+                    mono: true;
+                }
+                KV {
+                    key: "instances";
+                    value: State.instances.length + "";
+                    mono: true;
+                }
+                Btn {
+                    label: "open Fleet";
+                    kind: 3;
+                    clicked => {
+                        State.screen = 4;
+                    }
+                }
+                Rectangle { }
+            }
+        }
+    }
+}

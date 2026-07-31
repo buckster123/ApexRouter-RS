@@ -1,0 +1,102 @@
+// OWNER: unit U-02. Badges pair icon + label — never colour alone (§10).
+
+import { Palette } from "../palette.slint";
+
+// A health dot. Always accompanied by a label somewhere adjacent; on its own it is only
+// ever a redundant cue.
+export component Dot inherits Rectangle {
+    in property <int> level: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: Palette.level-color(root.level);
+}
+
+// Icon + label. The icon carries the meaning for anyone who cannot see the colour.
+export component Badge inherits Rectangle {
+    in property <string> label;
+    in property <int> level: 0;
+    in property <string> icon;
+    in property <bool> mono: false;
+
+    height: 20px;
+    background: Palette.level-tint(root.level);
+    border-radius: Palette.radius-sm;
+    border-width: Palette.hair;
+    border-color: Palette.level-color(root.level);
+
+    HorizontalLayout {
+        padding-left: Palette.pad-sm;
+        padding-right: Palette.pad-sm;
+        spacing: 4px;
+        Text {
+            text: root.icon != "" ? root.icon
+                : root.level == 1 ? "✓"
+                : root.level == 2 ? "!"
+                : root.level == 3 ? "▲"
+                : root.level == 4 ? "✕"
+                : root.level == 5 ? "●"
+                : "·";
+            color: Palette.level-color(root.level);
+            font-size: Palette.font-sm;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            color: Palette.level-color(root.level);
+            font-size: Palette.font-sm;
+            font-family: root.mono ? Palette.mono : Palette.sans;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// A neutral identity chip: a tag, a device token, an upstream model id. Never coloured by
+// status — identity does not get a status colour.
+export component Chip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+    height: 20px;
+    background: root.active ? Palette.accent-dim : Palette.surface-hi;
+    border-radius: Palette.radius-sm;
+    border-width: Palette.hair;
+    border-color: root.active ? Palette.accent : Palette.hairline;
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+    HorizontalLayout {
+        padding-left: Palette.pad-sm;
+        padding-right: Palette.pad-sm;
+        Text {
+            text: root.label;
+            color: root.active ? Palette.accent : (ta.has-hover ? Palette.ink : Palette.ink-2);
+            font-size: Palette.font-sm;
+            font-family: Palette.mono;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
+// The metered-vs-approximate distinction, made visible everywhere money is shown.
+export component CostBadge inherits HorizontalLayout {
+    in property <string> amount;
+    in property <bool> metered: false;
+    spacing: 4px;
+    Text {
+        text: root.amount;
+        color: Palette.ink;
+        font-size: Palette.font;
+        font-family: Palette.mono;
+        vertical-alignment: center;
+    }
+    Badge {
+        label: root.metered ? "metered" : "approx";
+        level: root.metered ? 1 : 2;
+        icon: root.metered ? "=" : "~";
+    }
+}

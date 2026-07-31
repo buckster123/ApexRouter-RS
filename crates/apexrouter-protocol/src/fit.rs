@@ -4,8 +4,15 @@
 //! The budget is a **vector**, never a scalar — a two-GPU rig with 8 GiB free on each does
 //! not have 16 GiB for one tensor. `ctx` is the **total** KV pool shared across `parallel`
 //! slots, not a per-slot number.
+//!
+//! The budget is also **per backend**. One `llama-server` process uses one compute backend,
+//! so a budget is over that backend's devices and is never a sum across backends: the single
+//! Radeon 840M in `docs/port/00-machine-ground-truth.md` is `ROCm0` (11397 MiB) to one build
+//! and `Vulkan0` (20992 MiB) to another, and adding them invents ~31 GiB that does not exist
+//! — over-optimism, which is the direction that OOMs a spawn. [`VramBudget::backend`] is the
+//! type-level statement of that rule.
 
-use crate::rig::GgufMeta;
+use crate::rig::{Backend, GgufMeta};
 use serde::{Deserialize, Serialize};
 
 /// Free and reserved VRAM on one device.
@@ -20,15 +27,31 @@ pub struct DeviceBudget {
 }
 
 /// What the solver is allowed to spend. Computed **live** at plan time, never from a cache.
+///
+/// Every device in `devices` belongs to `backend`. Building one by hand from tokens of two
+/// backends is a bug the solver will notice and refuse to add up.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VramBudget {
-    /// One entry per selected device.
+    /// One entry per selected device, all of them on `backend`.
     #[serde(default)]
     pub devices: Vec<DeviceBudget>,
     /// Safety margin held back across the whole budget, MiB.
     pub margin_mb: u64,
     /// Free host RAM, MiB — what a `NeedsOffload` plan would actually land in.
     pub host_ram_free_mb: u64,
+    /// The compute backend `devices` belongs to, and therefore the backend the endpoint this
+    /// budget was built for must launch with.
+    ///
+    /// `None` means "not stated" — a device-less budget judged against host RAM, or a
+    /// hand-built one from `POST /v1/fit`. It never means "all of them".
+    #[serde(default)]
+    pub backend: Option<Backend>,
+    /// Why this budget is smaller than the machine looks: devices dropped for belonging to
+    /// another backend, names that matched nothing. Folded into `FitPlan::why` by the solver.
+    ///
+    /// A fallback is a **visible value**, never a silent substitution.
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl VramBudget {
@@ -336,6 +359,8 @@ mod tests {
             ],
             margin_mb: 1_024,
             host_ram_free_mb: 2_100,
+            backend: Some(Backend::Vulkan),
+            notes: vec![],
         };
         assert_eq!(b.total_usable_mb(), (2_044 + 8_000) - 1_024);
         assert_eq!(b.largest_usable_mb(), 8_000 - 1_024);
@@ -349,6 +374,7 @@ mod tests {
             }],
             margin_mb: 1_024,
             host_ram_free_mb: 0,
+            ..VramBudget::default()
         };
         assert_eq!(empty.total_usable_mb(), 0);
         assert_eq!(empty.largest_usable_mb(), 0);

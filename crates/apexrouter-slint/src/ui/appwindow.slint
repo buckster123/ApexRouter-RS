@@ -1,15 +1,562 @@
-// OWNER: unit U-02 (crates/apexrouter-slint/src/**, except build.rs).
+// OWNER: unit U-02 (crates/apexrouter-slint/src/**, except build.rs). Do not edit outside
+// that unit.
 //
-// Stage 0 placeholder: an empty AppWindow so `slint_build::compile` and
-// `slint::include_modules!()` have something to chew on.
+// The root. Three always-visible bands — router bar, rig strip, nav — then whichever of
+// the eight screens is selected, then the Launch drawer, which doubles as the live boot
+// view (§10: "there is no separate Watch boot").
 //
-// U-02 builds the real tree: this root plus palette.slint, types.slint and
-// components/{card,badge,meter,table,logview,drawer}.slint. `export global Palette` matches
-// the web tokens exactly, and EVERY component reads from it — a grep asserts no colour
-// literal exists outside palette.slint.
+// `State` and `Palette` are re-exported so `ui.global::<State>()` works from Rust.
+
+import { Palette } from "palette.slint";
+import { State } from "state.slint";
+import {
+    DeviceRow, BuildRow, LocalModelRow, BackendRow, RouteRow, TargetRow, RequestRow,
+    InstanceRow, TunnelRow, OfferRow, RecipeRow, ProfileRow, HfFileRow, ProviderRow,
+    ModelRow, UsageRow, CheckRow, ProbeRow, JobRow, AlertRow
+} from "types.slint";
+import { Card, Banner, KV, Hairline, SectionLabel } from "components/card.slint";
+import { Dot, Badge, Chip, CostBadge } from "components/badge.slint";
+import { Meter, StackedMeter, BarRow } from "components/meter.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, PaneScroll, Empty } from "components/table.slint";
+import { Btn, Field, Area, Toggle, Chooser, Stepper, Labeled } from "components/widgets.slint";
+import { LogView } from "components/logview.slint";
+import { Drawer } from "components/drawer.slint";
+import { DashboardScreen } from "screens/dashboard.slint";
+import { RoutesScreen } from "screens/routes.slint";
+import { BackendsScreen } from "screens/backends.slint";
+import { LaunchScreen } from "screens/launch.slint";
+import { FleetScreen } from "screens/fleet.slint";
+import { CatalogScreen } from "screens/catalog.slint";
+import { ProvidersScreen } from "screens/providers.slint";
+import { DoctorScreen } from "screens/doctor.slint";
+
+export {
+    State, Palette,
+    DeviceRow, BuildRow, LocalModelRow, BackendRow, RouteRow, TargetRow, RequestRow,
+    InstanceRow, TunnelRow, OfferRow, RecipeRow, ProfileRow, HfFileRow, ProviderRow,
+    ModelRow, UsageRow, CheckRow, ProbeRow, JobRow, AlertRow
+}
+
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <string> glyph;
+    in property <bool> active: false;
+    in property <int> badge-count: 0;
+    in property <int> badge-level: 0;
+    callback clicked();
+    height: 34px;
+    border-radius: Palette.radius-sm;
+    background: root.active ? Palette.accent-dim : (ta.has-hover ? Palette.surface-hi : Palette.clear);
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+    HorizontalLayout {
+        padding-left: Palette.pad-sm;
+        padding-right: Palette.pad-sm;
+        spacing: Palette.gap;
+        Text {
+            text: root.glyph;
+            color: root.active ? Palette.accent : Palette.muted;
+            font-size: Palette.font;
+            vertical-alignment: center;
+            width: 16px;
+        }
+        Text {
+            text: root.label;
+            color: root.active ? Palette.accent : Palette.ink-2;
+            font-size: Palette.font;
+            vertical-alignment: center;
+        }
+        Rectangle { }
+        if root.badge-count > 0: Badge {
+            label: root.badge-count + "";
+            level: root.badge-level;
+            icon: "●";
+        }
+    }
+}
 
 export component AppWindow inherits Window {
     title: "ApexRouter";
-    preferred-width: 1100px;
-    preferred-height: 720px;
+    background: Palette.page;
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    min-width: 900px;
+    min-height: 600px;
+
+    VerticalLayout {
+        padding: Palette.pad;
+        spacing: Palette.gap;
+
+        // ── Router bar. Always visible. The one string the user copies. ────
+        Rectangle {
+            height: 52px;
+            background: Palette.surface;
+            border-radius: Palette.radius;
+            border-width: Palette.hair;
+            border-color: Palette.hairline;
+            HorizontalLayout {
+                padding-left: Palette.pad;
+                padding-right: Palette.pad;
+                spacing: Palette.gap;
+
+                HorizontalLayout {
+                    spacing: 6px;
+                    Dot {
+                        y: (parent.height - 8px) / 2;
+                        level: State.connected ? 1 : 4;
+                    }
+                    Text {
+                        text: State.connected ? "live" : "offline";
+                        color: State.connected ? Palette.good : Palette.critical;
+                        font-size: Palette.font-sm;
+                        vertical-alignment: center;
+                        width: 44px;
+                    }
+                }
+
+                url := Field {
+                    width: 260px;
+                    y: (parent.height - self.height) / 2;
+                    value: State.base-url;
+                    mono: true;
+                    read-only: true;
+                }
+                Btn {
+                    y: (parent.height - self.height) / 2;
+                    label: "copy";
+                    icon: "⧉";
+                    clicked => {
+                        url.copy-all();
+                        State.toast = "base URL copied to the clipboard";
+                        State.toast-level = 1;
+                    }
+                }
+                Text {
+                    text: State.api-key-line;
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                    font-family: Palette.mono;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { }
+
+                Text {
+                    text: "default →";
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                }
+                Chooser {
+                    width: 150px;
+                    y: (parent.height - self.height) / 2;
+                    options: State.aliases;
+                    current <=> State.default-alias-index;
+                    placeholder: State.default-alias;
+                    changed(i) => {
+                        State.set-default-alias(
+                            i >= 0 && i < State.aliases.length ? State.aliases[i] : "");
+                    }
+                }
+
+                Text {
+                    text: "in-flight " + State.inflight + "  ·  " + State.req-per-min
+                        + " req/min  ·  " + State.tok-per-s + " tok/s  ·  "
+                        + State.spend-24h + " / 24 h";
+                    color: Palette.ink-2;
+                    font-size: Palette.font-sm;
+                    font-family: Palette.mono;
+                    vertical-alignment: center;
+                }
+                Btn {
+                    y: (parent.height - self.height) / 2;
+                    label: "refresh";
+                    icon: "↻";
+                    kind: 3;
+                    clicked => {
+                        State.refresh-all();
+                    }
+                }
+            }
+        }
+
+        // ── Toast. One line, dismissible, never a modal. ───────────────────
+        if State.toast != "": Rectangle {
+            height: 26px;
+            background: Palette.level-tint(State.toast-level);
+            border-radius: Palette.radius-sm;
+            border-width: Palette.hair;
+            border-color: Palette.level-color(State.toast-level);
+            HorizontalLayout {
+                padding-left: Palette.pad-sm;
+                padding-right: 4px;
+                spacing: Palette.gap;
+                Text {
+                    text: State.toast;
+                    color: Palette.level-color(State.toast-level);
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Rectangle { }
+                Btn {
+                    label: "dismiss";
+                    compact: true;
+                    kind: 3;
+                    y: 2px;
+                    clicked => {
+                        State.dismiss-toast();
+                    }
+                }
+            }
+        }
+
+        // ── Rig strip. Always visible. Click a device to filter Backends. ──
+        Rectangle {
+            height: 62px;
+            background: Palette.surface;
+            border-radius: Palette.radius;
+            border-width: Palette.hair;
+            border-color: Palette.hairline;
+            HorizontalLayout {
+                padding: Palette.pad-sm;
+                spacing: Palette.pad;
+
+                for d in State.devices: Rectangle {
+                    min-width: 190px;
+                    border-radius: Palette.radius-sm;
+                    background: State.device-filter == d.device ? Palette.accent-dim
+                        : (dta.has-hover ? Palette.surface-hi : Palette.clear);
+                    dta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            State.filter-by-device(State.device-filter == d.device ? "" : d.device);
+                        }
+                    }
+                    VerticalLayout {
+                        padding: 4px;
+                        spacing: 2px;
+                        HorizontalLayout {
+                            spacing: 5px;
+                            Text {
+                                text: d.device;
+                                color: Palette.ink;
+                                font-size: Palette.font-sm;
+                                font-family: Palette.mono;
+                                vertical-alignment: center;
+                            }
+                            Badge {
+                                label: d.backend;
+                                level: 0;
+                                icon: "▣";
+                            }
+                            Rectangle { }
+                            if d.holder != "": Badge {
+                                label: d.holder;
+                                level: 5;
+                                icon: "◆";
+                            }
+                        }
+                        Meter {
+                            frac: d.frac;
+                            level: d.level;
+                            label: d.name;
+                            value: d.detail;
+                        }
+                    }
+                }
+
+                if State.devices.length == 0: Text {
+                    text: "no GPUs enumerated";
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                    vertical-alignment: center;
+                }
+
+                Rectangle { }
+
+                VerticalLayout {
+                    width: 220px;
+                    padding: 4px;
+                    spacing: 4px;
+                    Meter {
+                        label: "RAM";
+                        value: State.ram;
+                        frac: State.ram-frac;
+                        level: State.ram-frac > 0.9 ? 3 : 5;
+                    }
+                    Meter {
+                        label: "swap";
+                        value: State.swap;
+                        frac: State.swap-frac;
+                        level: State.swap-frac > 0.5 ? 2 : 0;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Btn {
+                        label: "rescan";
+                        icon: "↻";
+                        compact: true;
+                        clicked => {
+                            State.rescan-rig();
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Nav + screen ──────────────────────────────────────────────────
+        HorizontalLayout {
+            spacing: Palette.gap;
+
+            Rectangle {
+                width: 176px;
+                background: Palette.surface;
+                border-radius: Palette.radius;
+                border-width: Palette.hair;
+                border-color: Palette.hairline;
+                VerticalLayout {
+                    padding: Palette.pad-sm;
+                    spacing: 2px;
+                    alignment: start;
+                    NavItem {
+                        label: "Dashboard";
+                        glyph: "▤";
+                        active: State.screen == 0;
+                        badge-count: State.alerts.length;
+                        badge-level: 4;
+                        clicked => {
+                            State.screen = 0;
+                        }
+                    }
+                    NavItem {
+                        label: "Routes";
+                        glyph: "⇄";
+                        active: State.screen == 1;
+                        badge-count: State.table-valid ? 0 : 1;
+                        badge-level: 3;
+                        clicked => {
+                            State.screen = 1;
+                        }
+                    }
+                    NavItem {
+                        label: "Backends";
+                        glyph: "▣";
+                        active: State.screen == 2;
+                        clicked => {
+                            State.screen = 2;
+                        }
+                    }
+                    NavItem {
+                        label: "Launch";
+                        glyph: "▶";
+                        active: State.screen == 3;
+                        clicked => {
+                            State.screen = 3;
+                        }
+                    }
+                    NavItem {
+                        label: "Fleet";
+                        glyph: "$";
+                        active: State.screen == 4;
+                        badge-count: State.instances.length;
+                        badge-level: 2;
+                        clicked => {
+                            State.screen = 4;
+                        }
+                    }
+                    NavItem {
+                        label: "Catalog";
+                        glyph: "⌸";
+                        active: State.screen == 5;
+                        clicked => {
+                            State.screen = 5;
+                        }
+                    }
+                    NavItem {
+                        label: "Providers";
+                        glyph: "☁";
+                        active: State.screen == 6;
+                        clicked => {
+                            State.screen = 6;
+                        }
+                    }
+                    NavItem {
+                        label: "Usage / Doctor";
+                        glyph: "✚";
+                        active: State.screen == 7;
+                        clicked => {
+                            State.screen = 7;
+                        }
+                    }
+
+                    Rectangle { height: Palette.pad; }
+                    Hairline { }
+                    Rectangle { height: 4px; }
+
+                    KV {
+                        key: "control";
+                        value: State.control-url;
+                        mono: true;
+                        key-width: 52px;
+                    }
+                    KV {
+                        key: "version";
+                        value: State.version;
+                        mono: true;
+                        key-width: 52px;
+                    }
+                    KV {
+                        key: "source";
+                        value: State.served-by;
+                        mono: true;
+                        key-width: 52px;
+                        level: State.served-by == "daemon" ? 1 : 2;
+                    }
+                    Rectangle { height: 4px; }
+                    Btn {
+                        label: "reload config";
+                        kind: 3;
+                        compact: true;
+                        clicked => {
+                            State.reload-config();
+                        }
+                    }
+                    Btn {
+                        label: "open web UI";
+                        kind: 3;
+                        compact: true;
+                        clicked => {
+                            State.open-web-ui();
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                if State.screen == 0: DashboardScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+                if State.screen == 1: RoutesScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+                if State.screen == 2: BackendsScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+                if State.screen == 3: LaunchScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+                if State.screen == 4: FleetScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+                if State.screen == 5: CatalogScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+                if State.screen == 6: ProvidersScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+                if State.screen == 7: DoctorScreen {
+                    width: parent.width;
+                    height: parent.height;
+                }
+            }
+        }
+    }
+
+    // ── The Launch drawer, which becomes the live boot view ───────────────
+    Drawer {
+        width: parent.width;
+        height: parent.height;
+        open: State.launch-open;
+        title: State.boot-active ? "booting " + State.boot-backend : "launch";
+        subtitle: State.boot-active ? State.boot-phase + " · " + State.boot-elapsed : "";
+        closed => {
+            State.launch-open = false;
+        }
+
+        if State.boot-active: VerticalLayout {
+            spacing: Palette.gap;
+            HorizontalLayout {
+                spacing: Palette.gap;
+                Badge {
+                    label: State.boot-phase;
+                    level: State.boot-level;
+                }
+                Text {
+                    text: State.boot-elapsed;
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                    font-family: Palette.mono;
+                    vertical-alignment: center;
+                }
+                Rectangle { }
+                Btn {
+                    label: "destroy";
+                    kind: 2;
+                    icon: "✕";
+                    clicked => {
+                        State.boot-destroy();
+                    }
+                }
+                Btn {
+                    label: "dismiss";
+                    kind: 3;
+                    clicked => {
+                        State.boot-dismiss();
+                    }
+                }
+            }
+            Meter {
+                frac: State.boot-pct;
+                level: State.boot-level;
+                label: "progress";
+                value: State.boot-phase;
+            }
+            LogView {
+                vertical-stretch: 1;
+                title: "boot log";
+                source: State.boot-backend;
+                lines: State.boot-log;
+                follow: true;
+                reload => {
+                    State.log-open(State.boot-backend);
+                }
+                clear => {
+                    State.log-clear();
+                }
+            }
+        }
+
+        if !State.boot-active: VerticalLayout {
+            spacing: Palette.gap;
+            Text {
+                text: "nothing is booting. The Launch screen is where a plan is authored; "
+                    + "this drawer becomes the live boot view the moment one starts.";
+                color: Palette.muted;
+                font-size: Palette.font-sm;
+                wrap: word-wrap;
+            }
+            Btn {
+                label: "go to Launch";
+                kind: 1;
+                clicked => {
+                    State.screen = 3;
+                    State.launch-open = false;
+                }
+            }
+            Rectangle { }
+        }
+    }
 }

@@ -1,0 +1,100 @@
+// OWNER: unit U-02. Table primitives plus the one scroller the app uses.
+//
+// A generic table component cannot exist in Slint — rows are typed — so this file gives
+// screens the pieces they compose: a header cell, a body cell, a selectable row, and a
+// `ListScroll` whose viewport height is computed from a row count rather than guessed.
+
+import { Palette } from "../palette.slint";
+
+export component HeadCell inherits Text {
+    in property <bool> numeric: false;
+    color: Palette.muted;
+    font-size: Palette.font-sm;
+    font-weight: 700;
+    letter-spacing: 0.4px;
+    vertical-alignment: center;
+    horizontal-alignment: root.numeric ? right : left;
+    overflow: elide;
+}
+
+export component Cell inherits Text {
+    in property <bool> mono: false;
+    in property <bool> numeric: false;
+    in property <int> level: 0;
+    color: root.level == 0 ? Palette.ink-2 : Palette.level-color(root.level);
+    font-size: Palette.font-sm;
+    font-family: root.mono ? Palette.mono : Palette.sans;
+    vertical-alignment: center;
+    horizontal-alignment: root.numeric ? right : left;
+    overflow: elide;
+}
+
+export component HeadRow inherits Rectangle {
+    height: 22px;
+    background: Palette.surface-lo;
+    border-radius: Palette.radius-sm;
+    HorizontalLayout {
+        padding-left: Palette.pad-sm;
+        padding-right: Palette.pad-sm;
+        spacing: Palette.gap;
+        @children
+    }
+}
+
+// A body row. Hover and selection are the only two states; nothing else changes colour.
+export component Row inherits Rectangle {
+    in property <bool> selected: false;
+    in property <bool> striped: false;
+    callback clicked();
+    height: Palette.row-h;
+    background: root.selected ? Palette.accent-dim
+        : ta.has-hover ? Palette.surface-hi
+        : root.striped ? Palette.surface-lo
+        : Palette.clear;
+    border-radius: Palette.radius-sm;
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+    HorizontalLayout {
+        padding-left: Palette.pad-sm;
+        padding-right: Palette.pad-sm;
+        spacing: Palette.gap;
+        @children
+    }
+}
+
+// The app's only scroller. `rows` × `row-height` is exact, so the scrollbar never lies
+// about how much is below the fold.
+export component ListScroll inherits Flickable {
+    in property <int> rows: 0;
+    in property <length> row-height: Palette.row-h;
+    in property <length> extra: 0px;
+    viewport-width: self.width;
+    viewport-height: max(self.height, root.rows * root.row-height + root.extra);
+    interactive: true;
+    @children
+}
+
+// Free-height scroller for forms and detail panes.
+export component PaneScroll inherits Flickable {
+    in property <length> content-height: 0px;
+    viewport-width: self.width;
+    viewport-height: max(self.height, root.content-height);
+    interactive: true;
+    @children
+}
+
+// "nothing here yet" — always says *why*, never just goes blank.
+export component Empty inherits Rectangle {
+    in property <string> message;
+    height: 40px;
+    Text {
+        text: root.message;
+        color: Palette.muted;
+        font-size: Palette.font-sm;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+}

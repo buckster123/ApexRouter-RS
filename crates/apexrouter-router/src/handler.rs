@@ -22,6 +22,10 @@
 //! bounded by `RetryPolicy::attempts` **and** a wall-clock deadline. The first upstream byte
 //! commits the request; there is no retry past that point.
 
+use crate::anthropic::{
+    check_version_header, request_to_openai, response_to_anthropic, translate_error, upstream_path,
+    AnthropicCfg, SseTranslator,
+};
 use crate::attempt::{attempt, Committed, PreFlight, Retryable};
 use crate::breaker::BreakerDecision;
 use crate::errors::{map_status, openai_error};
@@ -46,11 +50,17 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
+use bytes::Bytes;
+use futures_util::StreamExt;
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// The `Via` token this proxy stamps, and refuses to see twice.
 const VIA_TOKEN: &str = "apexrouter";
+
+/// How much of an untranslatable upstream error body is quoted back to the client.
+const UPSTREAM_MSG_CHARS: usize = 512;
 
 /// The axum `Router` for the PROXY listener.
 ///
@@ -238,6 +248,10 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
             .saturating_mul(u32::from(policy.attempts.max(1)));
     let queue_timeout = Duration::from_millis(cfg.router.queue_timeout_ms);
     let mut last: Option<Retryable> = None;
+    // R-10's rewritten request body, translated at most once. The translation depends only on
+    // the client's bytes and on `[router] anthropic_tools`, never on which candidate is being
+    // tried, so a failover reuses it instead of paying for it again.
+    let mut translated: Option<Bytes> = None;
 
     for (index, cand) in plan.candidates.iter().enumerate() {
         if draft.attempts >= policy.attempts || Instant::now() >= deadline {
@@ -252,7 +266,7 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
         }
 
         // ---- the (ingress, upstream) matrix cell, ARCHITECTURE §3.4 --------------------------
-        match (ingress, meta.protocol) {
+        let cell = match (ingress, meta.protocol) {
             (Protocol::OpenAi, Protocol::Anthropic) => {
                 // Permanently out of scope (§12). The body is **OpenAI**-shaped, because the
                 // client is an OpenAI SDK and will parse it as one.
@@ -265,21 +279,43 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
                     draft.stamp_cell(&meta.id, meta.protocol),
                 );
             }
-            (Protocol::Anthropic, Protocol::OpenAi) => {
-                // R-10 (Stage 5) fills this cell in. The documented Stage 3 behaviour is a
-                // 501 with an **Anthropic**-shaped body — the client is an Anthropic SDK.
-                return stamp(
-                    error_response(
-                        Protocol::Anthropic,
-                        StatusCode::NOT_IMPLEMENTED,
-                        "not_implemented",
-                        "anthropic -> open_ai translation is not built yet (unit R-10)",
-                    ),
-                    draft.stamp_cell(&meta.id, meta.protocol),
-                );
+            // The one translating cell (R-10). The upstream model id travels with it because
+            // it is what `SseTranslator` echoes in `message_start`.
+            //
+            // Gated on `/v1/messages` because that is the only body R-10 translates and the
+            // only path it rewrites — `upstream_path` says so in its own doc. Without the
+            // gate, an `anthropic-version` header on some other path would hand
+            // `request_to_openai` a body that is not a `MessagesRequest` and turn a relayable
+            // request into a `400`. Anything else this ingress can name stays a byte relay and
+            // lets the upstream judge it, which is `05-proxy.md` §15 item 11.
+            (Protocol::Anthropic, Protocol::OpenAi) if path == "/v1/messages" => {
+                Cell::Translate(cand.upstream_model.clone())
             }
             // OpenAi -> OpenAi and Anthropic -> Anthropic are both the byte relay below.
-            _ => {}
+            _ => Cell::Relay,
+        };
+
+        // R-10's request contract, in the order its module doc states it — and **before** the
+        // breaker, the permit and any upstream hop, because every failure it can produce is a
+        // `400` the client caused: a missing `max_tokens`, a `thinking` block, or `tools` with
+        // `[router] anthropic_tools = false`. None of those may cost a slot, a token or a
+        // dollar, and none of them may be answered by silently dropping what was asked for.
+        if matches!(cell, Cell::Translate(_)) && translated.is_none() {
+            if let Some(res) = check_version_header(&headers) {
+                return stamp(res, draft.stamp_cell(&meta.id, meta.protocol));
+            }
+            let acfg = AnthropicCfg {
+                tools: cfg.router.anthropic_tools,
+            };
+            match request_to_openai(&bytes, &acfg) {
+                Ok(v) => translated = Some(Bytes::from(v)),
+                Err(e) => {
+                    return stamp(
+                        translate_error(&e),
+                        draft.stamp_cell(&meta.id, meta.protocol),
+                    )
+                }
+            }
         }
 
         if let BreakerDecision::Deny { .. } = cand.backend.breaker.check() {
@@ -341,19 +377,29 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
             });
         }
 
+        // What actually goes on the wire. The translating cell sends R-10's rewritten body to
+        // `/v1/chat/completions`; every other cell sends the client's own bytes to the path it
+        // asked for. `resolve()`'s model rewrite is applied to whichever body that is, so an
+        // alias still becomes the upstream's own model id on the Anthropic path too.
+        let (out_bytes, out_path) = match &cell {
+            Cell::Translate(_) => (translated.as_ref().unwrap_or(&bytes), upstream_path(&path)),
+            Cell::Relay => (&bytes, path.as_str()),
+        };
+
         // A body that is not a JSON object has no `model` to rewrite — a multipart
         // `/v1/audio/transcriptions` upload, an empty `POST /health`, a llama.cpp-native
         // `POST /tokenize`. LocalRouter forwarded those verbatim and let the upstream judge
         // them, and `05-proxy.md` §15 item 11 ("pass upstream status codes and bodies
         // through unchanged") means we must not invent a 400 the upstream would not have
         // sent. So a failed rewrite degrades to a byte-verbatim relay, never to an error.
-        let body_plan = plan_body(&bytes, plan.rewrite_model_to.as_deref()).unwrap_or_else(|_| {
-            tracing::debug!(
-                path = %path,
-                "body is not a JSON object; relaying verbatim without a model rewrite"
-            );
-            crate::relay::BodyPlan::Passthrough(bytes.clone())
-        });
+        let body_plan =
+            plan_body(out_bytes, plan.rewrite_model_to.as_deref()).unwrap_or_else(|_| {
+                tracing::debug!(
+                    path = %path,
+                    "body is not a JSON object; relaying verbatim without a model rewrite"
+                );
+                crate::relay::BodyPlan::Passthrough(out_bytes.clone())
+            });
 
         // Outbound headers are CONSTRUCTED: the inbound map is never cloned, so a client's
         // `Authorization` — or an Anthropic client's `x-api-key` — cannot reach a third party.
@@ -371,7 +417,7 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
             candidate: cand,
             http: &r.http,
             method: method.clone(),
-            url: upstream_url(&meta.base_url, &path, query.as_deref()),
+            url: upstream_url(&meta.base_url, out_path, query.as_deref()),
             headers: out_headers,
             body: body_plan,
             deadline,
@@ -390,6 +436,7 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
                     pk.stream,
                     cfg.router.log_usage,
                     protocol,
+                    cell,
                 )
                 .await;
             }
@@ -581,6 +628,30 @@ async fn credential_for(src: &CredentialSource) -> Option<Secret<String>> {
 // relay
 // ==========================================================================================
 
+/// Which `(ingress, upstream)` cell of `ARCHITECTURE.md` §3.4 a candidate is, and therefore
+/// what the response side owes the client.
+///
+/// The two cells that answer without an upstream hop are not here: they `return` from the
+/// dispatch itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Cell {
+    /// `OpenAi → OpenAi` and `Anthropic → Anthropic`: the byte relay, verbatim both ways.
+    Relay,
+    /// `Anthropic → OpenAi`: R-10's translating cell. Carries the upstream model id, which is
+    /// what [`SseTranslator`] echoes in `message_start` when a chunk names none.
+    Translate(String),
+}
+
+/// An upstream reply the `Anthropic → OpenAi` cell cannot hand over as it stands.
+struct Refused {
+    /// What the client is told.
+    status: StatusCode,
+    /// The Anthropic `error.type` token.
+    kind: &'static str,
+    /// Why, in one sentence.
+    msg: String,
+}
+
 /// Everything known about a request before its outcome.
 struct RecordDraft {
     id: RequestId,
@@ -660,6 +731,10 @@ impl RecordDraft {
 /// implementation, which owns the frame rules, the idle timeout and the usage tee — and
 /// everything else is buffered here, because `X-Usage` can only carry real numbers on a body
 /// that has fully arrived.
+///
+/// `cell` decides what happens to the bytes on their way out, and nothing else: the retry
+/// chain, the breaker, the limits, the tee, the telemetry and the `InFlightGuard` are the same
+/// code on every cell, so the Anthropic ingress cannot be a bypass that quietly loses them.
 async fn relay(
     r: Router,
     mut c: Committed,
@@ -667,6 +742,7 @@ async fn relay(
     client_asked_to_stream: bool,
     log_usage: bool,
     upstream: Protocol,
+    cell: Cell,
 ) -> Response {
     let Some(g) = c.guard.as_mut() else {
         return stamp(
@@ -728,6 +804,14 @@ async fn relay(
                 );
             }),
         );
+        // The streaming half of the one translating cell, wrapped **around** R-05 rather than
+        // spliced into it: the relay above still owns the guard, the idle timeout, the tee and
+        // the single `Drop` that seals the record, and the Anthropic frames are rebuilt from
+        // the OpenAI bytes on their way past.
+        if let Cell::Translate(model) = cell {
+            let inner = std::mem::replace(resp.body_mut(), Body::empty());
+            *resp.body_mut() = anthropic_stream(inner, model);
+        }
         stamp_with(&mut resp, &marks);
         return resp;
     }
@@ -811,6 +895,40 @@ async fn relay(
         );
     }
 
+    // ---- the buffered half of the one translating cell (R-10) --------------------------------
+    // Before `finalize`, so the ring row, the WebSocket event and the usage line carry the
+    // status the client actually received. The token counts were already read off the
+    // upstream's own body above, so the telemetry is upstream's numbers on either branch.
+    let (status, body) = match &cell {
+        Cell::Relay => (status, body),
+        Cell::Translate(_) => match anthropic_buffered(status, &body) {
+            Ok(b) => (status, b),
+            Err(refused) => {
+                finalize(
+                    &r,
+                    &draft,
+                    guard,
+                    Outcome::buffered(
+                        refused.status.as_u16(),
+                        ttft_ms,
+                        usage,
+                        timings,
+                        Some(refused.msg.clone()),
+                    ),
+                    log_usage,
+                );
+                let mut resp = error_response(
+                    Protocol::Anthropic,
+                    refused.status,
+                    refused.kind,
+                    &refused.msg,
+                );
+                stamp_with(&mut resp, &marks);
+                return resp;
+            }
+        },
+    };
+
     finalize(
         &r,
         &draft,
@@ -824,6 +942,125 @@ async fn relay(
     *resp.headers_mut() = head;
     stamp_with(&mut resp, &marks);
     resp
+}
+
+// ==========================================================================================
+// the response half of the `Anthropic -> OpenAi` cell
+// ==========================================================================================
+
+/// A buffered OpenAI reply, as the Anthropic Messages API would have written it.
+///
+/// A 2xx goes through R-10's [`response_to_anthropic`]. Anything else is an upstream error
+/// written in the OpenAI dialect, and an Anthropic SDK cannot read one — so it is re-rendered
+/// in the Anthropic shape carrying the upstream's own status and message, rather than handed
+/// over as a body the client will fail to parse and report as "unknown error". A 2xx that will
+/// not translate is a `502`: the request did reach a model, and the failure is this proxy's.
+fn anthropic_buffered(status: StatusCode, body: &Bytes) -> Result<Bytes, Refused> {
+    if !status.is_success() {
+        return Err(Refused {
+            status,
+            kind: anthropic_error_kind(status),
+            msg: upstream_message(body),
+        });
+    }
+    match response_to_anthropic(body) {
+        Ok(v) => Ok(Bytes::from(v)),
+        Err(e) => Err(Refused {
+            status: StatusCode::BAD_GATEWAY,
+            kind: "api_error",
+            msg: format!("the upstream reply could not be translated to the Messages API: {e}"),
+        }),
+    }
+}
+
+/// The Anthropic `error.type` token for an upstream status.
+///
+/// An Anthropic SDK turns these into distinct exception classes and retries on only some of
+/// them, so an upstream `429` has to arrive as `rate_limit_error` rather than as a generic
+/// `api_error` that a harness will give up on.
+fn anthropic_error_kind(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+/// The most useful sentence in an upstream error body, whatever dialect it is in.
+///
+/// `error.message` is where both OpenAI and llama.cpp put it. A body that is neither is quoted
+/// verbatim up to [`UPSTREAM_MSG_CHARS`], because a truncated real message beats a generic one.
+fn upstream_message(body: &Bytes) -> String {
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let found = parsed
+        .as_ref()
+        .and_then(|v| {
+            v.pointer("/error/message")
+                .or_else(|| v.pointer("/message"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    found.unwrap_or_else(|| {
+        String::from_utf8_lossy(body)
+            .chars()
+            .take(UPSTREAM_MSG_CHARS)
+            .collect()
+    })
+}
+
+/// One OpenAI SSE stream, re-framed as the Anthropic named-event stream.
+///
+/// Wraps the body R-05 produced instead of reaching into it. R-05 still owns the
+/// [`InFlightGuard`], the idle timeout, the usage tee and the one `Drop` that seals the
+/// record; dropping this wrapper drops that body, so a client who hangs up mid-answer still
+/// produces exactly one `aborted` record and still frees the llama.cpp slot.
+///
+/// `model` is what [`SseTranslator`] echoes in `message_start` when an upstream chunk names
+/// none.
+fn anthropic_stream(inner: Body, model: String) -> Body {
+    /// The pump's state: the upstream bytes, the state machine, and frames not yet handed out.
+    struct St {
+        inner: axum::body::BodyDataStream,
+        tr: Option<SseTranslator>,
+        out: VecDeque<Bytes>,
+    }
+    let st = St {
+        inner: inner.into_data_stream(),
+        tr: Some(SseTranslator::new(model)),
+        out: VecDeque::new(),
+    };
+    Body::from_stream(futures_util::stream::unfold(st, |mut s| async move {
+        loop {
+            if let Some(frame) = s.out.pop_front() {
+                return Some((Ok::<Bytes, std::convert::Infallible>(frame), s));
+            }
+            // `tr` is taken exactly once, by whichever end arrives first; once it is gone the
+            // closing frames have been queued and drained, and the response is over.
+            s.tr.as_ref()?;
+            match s.inner.next().await {
+                Some(Ok(chunk)) => {
+                    if let Some(tr) = s.tr.as_mut() {
+                        let frames = tr.feed(&chunk);
+                        s.out.extend(frames);
+                    }
+                }
+                // R-05 has already turned an upstream death or an idle gap into its synthetic
+                // frame pair, which the translator reads as an `error` event followed by a
+                // clean close. An error this far out is the body itself failing, and the
+                // honest answer to it and to a bare EOF alike is to close every open block.
+                Some(Err(_)) | None => {
+                    if let Some(tr) = s.tr.take() {
+                        s.out.extend(tr.finish());
+                    }
+                }
+            }
+        }
+    }))
 }
 
 /// What a finished request turned out to be.
@@ -1084,18 +1321,13 @@ fn set(h: &mut HeaderMap, name: &'static str, value: &str) {
 
 /// An error body in the dialect the **client** speaks.
 ///
-/// The OpenAI shape comes from R-06. The Anthropic shape is built here for Stage 3; R-10
-/// publishes `anthropic::anthropic_error` in Stage 5 and this delegates to it then.
+/// The OpenAI shape comes from R-06, the Anthropic shape from R-10. Neither is spelled out
+/// here, so an error this file invents and an error the ingress translator invents cannot
+/// drift apart.
 fn error_response(ingress: Protocol, status: StatusCode, kind: &str, msg: &str) -> Response {
     match ingress {
         Protocol::OpenAi => openai_error(status, kind, msg),
-        Protocol::Anthropic => {
-            let body = serde_json::json!({
-                "type": "error",
-                "error": { "type": kind, "message": msg }
-            });
-            (status, axum::Json(body)).into_response()
-        }
+        Protocol::Anthropic => crate::anthropic::anthropic_error(status, kind, msg),
     }
 }
 
@@ -1789,26 +2021,395 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn anthropic_into_an_openai_backend_is_501_anthropic_shaped_until_r10() {
-        let up = MockServer::start().await;
-        let r = router_with(
+    // ---- the one translating cell: Anthropic -> OpenAi (R-10, wired here) ---------------------
+
+    /// A buffered OpenAI `ChatCompletion`, in llama.cpp's own spelling.
+    const OPENAI_REPLY: &[u8] =
+        br#"{"id":"chatcmpl-9","object":"chat.completion","model":"carnice",
+      "choices":[{"index":0,"message":{"role":"assistant","content":"Hi there."},
+      "finish_reason":"stop"}],
+      "usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}"#;
+
+    /// The smallest body the Messages API accepts.
+    const MINIMAL: &str =
+        r#"{"model":"auto","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    async fn json_of(resp: Response) -> serde_json::Value {
+        let body = body_to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&body).expect("json")
+    }
+
+    fn openai_upstream_at(up: &MockServer) -> Router {
+        router_with(
             vec![backend("up-a", &up.uri())],
             vec![route("auto", vec!["up-a"])],
-        );
-        let app = proxy_router(r);
-        let resp = call(&app, anthropic_post(r#"{"model":"auto","max_tokens":8}"#)).await;
+        )
+    }
 
-        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    #[tokio::test]
+    async fn anthropic_into_an_openai_backend_is_translated_both_ways() {
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(OPENAI_REPLY.to_vec(), "application/json"),
+            )
+            .expect(1)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let resp = call(
+            &app,
+            anthropic_post(
+                r#"{"model":"auto","max_tokens":64,"system":"Be terse.",
+                    "messages":[{"role":"user","content":[{"type":"text","text":"Hello"}]}]}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             header(&resp, "x-apexrouter-protocol"),
             Some("anthropic->open_ai")
         );
-        let body = body_to_bytes(resp.into_body(), 64 * 1024)
+        assert_eq!(header(&resp, "x-apexrouter-backend"), Some("up-a"));
+        assert_eq!(header(&resp, "x-usage"), Some("11+3"));
+
+        // The response the client sees is an Anthropic `Message`, not a ChatCompletion.
+        let v = json_of(resp).await;
+        assert_eq!(v["type"], "message");
+        assert_eq!(v["role"], "assistant");
+        assert_eq!(v["id"], "msg_chatcmpl-9");
+        assert_eq!(v["content"][0]["type"], "text");
+        assert_eq!(v["content"][0]["text"], "Hi there.");
+        assert_eq!(v["stop_reason"], "end_turn");
+        assert_eq!(v["usage"]["input_tokens"], 11);
+        assert_eq!(v["usage"]["output_tokens"], 3);
+        assert!(v["usage"].get("prompt_tokens").is_none());
+
+        // …and what reached the upstream is a ChatCompletion on the rewritten path, with the
+        // top-level `system` hoisted into a system message and the client's credential gone.
+        let seen = up.received_requests().await.expect("recording");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].url.path(), "/v1/chat/completions");
+        assert!(seen[0].headers.get("x-api-key").is_none());
+        assert!(seen[0].headers.get("anthropic-version").is_none());
+        let sent: serde_json::Value = serde_json::from_slice(&seen[0].body).expect("json");
+        assert_eq!(
+            sent["model"], "carnice",
+            "resolve()'s model rewrite still runs"
+        );
+        assert_eq!(sent["max_tokens"], 64);
+        assert_eq!(sent["messages"][0]["role"], "system");
+        assert_eq!(sent["messages"][0]["content"], "Be terse.");
+        assert_eq!(sent["messages"][1]["role"], "user");
+        assert_eq!(sent["messages"][1]["content"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn a_missing_max_tokens_is_a_400_and_costs_no_upstream_hop() {
+        // Required in Anthropic, optional in OpenAI — so it can only be caught here, and it
+        // must never be defaulted silently.
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let resp = call(
+            &app,
+            anthropic_post(r#"{"model":"auto","messages":[{"role":"user","content":"hi"}]}"#),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            header(&resp, "x-apexrouter-protocol"),
+            Some("anthropic->open_ai")
+        );
+        let v = json_of(resp).await;
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("max_tokens"),
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_with_the_flag_off_are_refused_loudly_and_never_stripped() {
+        // The failure mode this prevents: an agent asks for tools, the proxy quietly drops
+        // them, and the model answers in prose as if it had none.
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let resp = call(
+            &app,
+            anthropic_post(
+                r#"{"model":"auto","max_tokens":64,
+                    "messages":[{"role":"user","content":"weather?"}],
+                    "tools":[{"name":"get_weather","description":"w",
+                              "input_schema":{"type":"object","properties":{}}}]}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = json_of(resp).await;
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert!(
+            v["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("anthropic_tools"),
+            "the message must name the config key: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unknown_anthropic_version_is_a_400_before_anything_else() {
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        for version in [None, Some("1999-01-01")] {
+            let mut b = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/messages")
+                .header("content-type", "application/json");
+            if let Some(v) = version {
+                b = b.header("anthropic-version", v);
+            }
+            let req = b
+                .body(Body::from(r#"{"model":"auto","max_tokens":8}"#.to_owned()))
+                .expect("request");
+            let resp = call(&app, req).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{version:?}");
+            let v = json_of(resp).await;
+            assert_eq!(v["type"], "error");
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("anthropic-version"),
+                "{v}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_message_becomes_the_six_named_events_in_order() {
+        const FRAMES: &[u8] = concat!(
+            "data: {\"id\":\"chatcmpl-7\",\"model\":\"carnice\",\"choices\":",
+            "[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-7\",\"choices\":",
+            "[{\"index\":0,\"delta\":{\"content\":\" there\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl-7\",\"choices\":",
+            "[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"id\":\"chatcmpl-7\",\"choices\":[],",
+            "\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n"
+        )
+        .as_bytes();
+
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(FRAMES.to_vec(), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let resp = call(
+            &app,
+            anthropic_post(
+                r#"{"model":"auto","max_tokens":8,"stream":true,
+                    "messages":[{"role":"user","content":"hi"}]}"#,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "content-type"), Some("text/event-stream"));
+        assert_eq!(
+            header(&resp, "x-apexrouter-protocol"),
+            Some("anthropic->open_ai")
+        );
+
+        let body = body_to_bytes(resp.into_body(), 1024 * 1024)
             .await
             .expect("body");
-        let v: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let names: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("event: "))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ],
+            "{text}"
+        );
+        assert!(
+            !text.contains("data: [DONE]"),
+            "an Anthropic stream has no [DONE]: {text}"
+        );
+
+        // Indices, the mapped stop reason and the final usage.
+        let payloads: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect();
+        for p in &payloads {
+            if let Some(i) = p.get("index") {
+                assert_eq!(i, 0, "one text block means index 0 throughout");
+            }
+        }
+        let delta = payloads
+            .iter()
+            .find(|p| p["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(delta["usage"]["output_tokens"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_error_reaches_an_anthropic_client_in_its_own_shape() {
+        // An OpenAI error body handed to an Anthropic SDK reads as "unknown error". The
+        // status and the upstream's own sentence both survive the re-render.
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(ResponseTemplate::new(400).set_body_raw(
+                br#"{"error":{"message":"context window exceeded","type":"invalid_request_error"}}"#
+                    .to_vec(),
+                "application/json",
+            ))
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let resp = call(&app, anthropic_post(MINIMAL)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = json_of(resp).await;
         assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["message"], "context window exceeded");
+    }
+
+    #[tokio::test]
+    async fn the_translating_cell_keeps_the_retry_chain_and_the_record() {
+        // The Anthropic cell must not be a bypass: failover, the attempt count and the
+        // `RequestFinished` record are the same code as the OpenAI path.
+        let dead = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .respond_with(
+                ResponseTemplate::new(502).set_body_raw(b"{}".to_vec(), "application/json"),
+            )
+            .mount(&dead)
+            .await;
+        let good = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(OPENAI_REPLY.to_vec(), "application/json"),
+            )
+            .expect(1)
+            .mount(&good)
+            .await;
+
+        let r = router_with(
+            vec![
+                backend("up-dead", &dead.uri()),
+                backend("up-good", &good.uri()),
+            ],
+            vec![route("auto", vec!["up-dead", "up-good"])],
+        );
+        let mut rx = r.events.subscribe();
+        let app = proxy_router(r);
+
+        let resp = call(&app, anthropic_post(MINIMAL)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(header(&resp, "x-apexrouter-backend"), Some("up-good"));
+        assert_eq!(header(&resp, "x-apexrouter-attempts"), Some("2"));
+        assert_eq!(header(&resp, "x-apexrouter-fallback"), Some("true"));
+        let v = json_of(resp).await;
+        assert_eq!(v["type"], "message");
+
+        let mut finished = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::RequestFinished { record } = ev {
+                assert_eq!(record.ingress, Protocol::Anthropic);
+                assert_eq!(record.prompt_tokens.map(TokenCount::value), Some(11));
+                finished += 1;
+            }
+        }
+        assert_eq!(
+            finished, 1,
+            "exactly one sealed record on the Anthropic path"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_translating_cell_is_only_ever_reached_for_v1_messages() {
+        // R-10 translates one body shape and rewrites one path. An `anthropic-version` header
+        // on anything else must stay a byte relay, not become a `400` from handing
+        // `request_to_openai` a body that was never a MessagesRequest.
+        let up = MockServer::start().await;
+        Mock::given(m_method("POST"))
+            .and(m_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                br#"{"object":"list","data":[]}"#.to_vec(),
+                "application/json",
+            ))
+            .expect(1)
+            .mount(&up)
+            .await;
+        let app = proxy_router(openai_upstream_at(&up));
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/embeddings")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .body(Body::from(r#"{"model":"auto","input":"hi"}"#.to_owned()))
+            .expect("request");
+        let resp = call(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let seen = up.received_requests().await.expect("recording");
+        assert_eq!(
+            seen[0].url.path(),
+            "/v1/embeddings",
+            "path is not rewritten"
+        );
     }
 
     #[tokio::test]

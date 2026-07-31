@@ -1,0 +1,82 @@
+// OWNER: unit U-02. The non-modal side drawer.
+//
+// Non-modal on purpose: the Launch summary has to stay visible *while* you edit, and the
+// boot view it turns into has to stay watchable while you do something else.
+
+import { Palette } from "../palette.slint";
+import { Btn } from "widgets.slint";
+
+export component Drawer inherits Rectangle {
+    in property <bool> open: false;
+    in property <string> title;
+    in property <string> subtitle;
+    in property <length> drawer-width: 520px;
+    callback closed();
+
+    visible: root.open;
+    background: Palette.clear;
+
+    // A scrim that dims but does not block: clicking it closes the drawer.
+    Rectangle {
+        width: parent.width - root.drawer-width;
+        height: parent.height;
+        x: 0;
+        background: Palette.scrim;
+        TouchArea {
+            clicked => {
+                root.closed();
+            }
+        }
+    }
+
+    Rectangle {
+        x: parent.width - root.drawer-width;
+        width: root.drawer-width;
+        height: parent.height;
+        background: Palette.surface;
+        border-width: Palette.hair;
+        border-color: Palette.hairline;
+        // Swallow clicks so they do not reach the scrim behind.
+        TouchArea { }
+
+        VerticalLayout {
+            padding: Palette.pad;
+            spacing: Palette.gap;
+
+            HorizontalLayout {
+                spacing: Palette.gap;
+                VerticalLayout {
+                    spacing: 2px;
+                    Text {
+                        text: root.title;
+                        color: Palette.ink;
+                        font-size: Palette.font-lg;
+                        font-weight: 700;
+                    }
+                    if root.subtitle != "": Text {
+                        text: root.subtitle;
+                        color: Palette.muted;
+                        font-size: Palette.font-sm;
+                        overflow: elide;
+                    }
+                }
+                Rectangle { }
+                Btn {
+                    label: "close";
+                    kind: 3;
+                    icon: "✕";
+                    clicked => {
+                        root.closed();
+                    }
+                }
+            }
+
+            Rectangle {
+                height: Palette.hair;
+                background: Palette.hairline;
+            }
+
+            @children
+        }
+    }
+}

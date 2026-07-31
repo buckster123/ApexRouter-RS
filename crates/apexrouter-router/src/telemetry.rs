@@ -678,6 +678,7 @@ mod tests {
                 backend: GpuBackend::Vulkan,
                 vram_total_mb: 8192,
                 vram_free_mb: 6144,
+                pci_bus_id: None,
                 driver: Some("radv".into()),
                 is_software: false,
                 seen_by_builds: vec![],

@@ -1,0 +1,139 @@
+// OWNER: unit U-02. The log pane: a Flickable with follow mode and a filter box.
+//
+// `lines` is the **already-filtered** view. Rust keeps the whole buffer and re-derives
+// this on every `filter-changed`, so clearing the filter never turns out to have lost
+// lines. (Slint's string type has no `contains`, which settles the question anyway.)
+//
+// Follow mode is two Flickables rather than one: a `viewport-y` binding that mentions
+// `self.viewport-y` is a binding loop, and dropping the else-branch would yank a manually
+// scrolled pane back to the top every time a line arrives. Pinned and free are therefore
+// separate elements, and only one exists at a time.
+
+import { Palette } from "../palette.slint";
+import { Btn, Field, Toggle } from "widgets.slint";
+
+component Lines inherits VerticalLayout {
+    in property <[string]> lines;
+    spacing: 0px;
+    alignment: start;
+    for line in root.lines: Text {
+        height: 15px;
+        text: line;
+        color: Palette.ink-2;
+        font-size: Palette.font-sm;
+        font-family: Palette.mono;
+        overflow: elide;
+    }
+    if root.lines.length == 0: Text {
+        height: 15px;
+        text: "no lines — press reload to tail this source";
+        color: Palette.muted;
+        font-size: Palette.font-sm;
+    }
+}
+
+export component LogView inherits Rectangle {
+    in property <[string]> lines;
+    in-out property <bool> follow: true;
+    in-out property <string> filter;
+    in property <string> title: "logs";
+    in property <string> source;
+    in property <int> hidden-count: 0;
+    callback clear();
+    callback reload();
+    callback filter-changed(string);
+
+    background: Palette.surface-lo;
+    border-radius: Palette.radius-sm;
+    border-width: Palette.hair;
+    border-color: Palette.hairline;
+
+    VerticalLayout {
+        padding: Palette.pad-sm;
+        spacing: Palette.pad-sm;
+
+        HorizontalLayout {
+            spacing: Palette.gap;
+            Text {
+                text: root.title;
+                color: Palette.ink-2;
+                font-size: Palette.font-sm;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.source;
+                color: Palette.muted;
+                font-size: Palette.font-sm;
+                font-family: Palette.mono;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Rectangle { }
+            if root.hidden-count > 0: Text {
+                text: root.hidden-count + " hidden";
+                color: Palette.muted;
+                font-size: Palette.font-sm;
+                vertical-alignment: center;
+            }
+            Field {
+                width: 180px;
+                placeholder: "filter";
+                value <=> root.filter;
+                mono: true;
+                edited(t) => {
+                    root.filter-changed(t);
+                }
+            }
+            Toggle {
+                label: "follow";
+                checked <=> root.follow;
+            }
+            Btn {
+                label: "reload";
+                compact: true;
+                clicked => {
+                    root.reload();
+                }
+            }
+            Btn {
+                label: "clear";
+                compact: true;
+                clicked => {
+                    root.clear();
+                }
+            }
+        }
+
+        Rectangle {
+            clip: true;
+            min-width: 0px;
+            preferred-width: 0px;
+            horizontal-stretch: 1;
+
+            if root.follow: Flickable {
+                width: parent.width;
+                height: parent.height;
+                interactive: false;
+                viewport-width: self.width;
+                viewport-height: max(self.height, pinned.preferred-height);
+                viewport-y: min(0px, self.height - self.viewport-height);
+                pinned := Lines {
+                    width: parent.width;
+                    lines: root.lines;
+                }
+            }
+            if !root.follow: Flickable {
+                width: parent.width;
+                height: parent.height;
+                interactive: true;
+                viewport-width: self.width;
+                viewport-height: max(self.height, free.preferred-height);
+                free := Lines {
+                    width: parent.width;
+                    lines: root.lines;
+                }
+            }
+        }
+    }
+}

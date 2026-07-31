@@ -1,0 +1,363 @@
+// OWNER: unit U-02. Screen 4 — Fleet & cost.
+//
+// Destroy is always visible. That is the point of the screen: a box that is billing must
+// never be more than one click from being stopped, and the orphan-suspect banner is loud
+// on purpose (§4.8 — `Critical` is reserved for money leaking).
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, KV, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, Empty } from "../components/table.slint";
+import { Btn, Field, Toggle, Chooser, Labeled } from "../components/widgets.slint";
+
+component Stat inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <int> level: 0;
+    spacing: 2px;
+    Text {
+        text: root.label;
+        color: Palette.muted;
+        font-size: Palette.font-sm;
+    }
+    Text {
+        text: root.value;
+        color: root.level == 0 ? Palette.ink : Palette.level-color(root.level);
+        font-size: Palette.font-xl;
+        font-family: Palette.mono;
+    }
+}
+
+export component FleetScreen inherits VerticalLayout {
+    spacing: Palette.gap;
+
+    Card {
+        vertical-stretch: 0;
+        HorizontalLayout {
+            spacing: 32px;
+            Stat {
+                label: "credit remaining";
+                value: State.credit;
+            }
+            Stat {
+                label: "hourly burn";
+                value: State.burn-rate;
+                level: State.burn-rate == "$0.00/hr" ? 0 : 2;
+            }
+            Stat {
+                label: "burn-down";
+                value: State.burn-down;
+                level: State.burn-down == "—" ? 0 : 2;
+            }
+            Stat {
+                label: "spend 24 h";
+                value: State.spend-24h;
+            }
+            Stat {
+                label: "spend 7 d";
+                value: State.spend-7d;
+            }
+            Rectangle { }
+            VerticalLayout {
+                alignment: center;
+                Btn {
+                    label: "refresh fleet";
+                    icon: "↻";
+                    clicked => {
+                        State.refresh-fleet();
+                    }
+                }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Palette.gap;
+
+        Card {
+            title: "rented instances";
+            horizontal-stretch: 3;
+
+            ListScroll {
+                rows: State.instances.length;
+                row-height: 104px;
+                VerticalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    width: parent.width;
+                    for inst in State.instances: Rectangle {
+                        height: inst.stalled || inst.orphan ? 128px : 98px;
+                        background: Palette.surface-lo;
+                        border-radius: Palette.radius;
+                        border-width: Palette.hair;
+                        border-color: inst.orphan ? Palette.critical : Palette.hairline;
+                        VerticalLayout {
+                            padding: Palette.pad-sm;
+                            spacing: 4px;
+
+                            HorizontalLayout {
+                                spacing: Palette.gap;
+                                Dot { level: inst.level; }
+                                Text {
+                                    text: inst.id;
+                                    color: Palette.ink;
+                                    font-size: Palette.font;
+                                    font-family: Palette.mono;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                Badge {
+                                    label: inst.status;
+                                    level: inst.level;
+                                }
+                                Text {
+                                    text: inst.label;
+                                    color: Palette.ink-2;
+                                    font-size: Palette.font-sm;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Rectangle { }
+                                if inst.tunnel: Badge {
+                                    label: "tunnelled";
+                                    level: 1;
+                                    icon: "⇄";
+                                }
+                            }
+
+                            HorizontalLayout {
+                                spacing: 18px;
+                                Text {
+                                    text: inst.gpu;
+                                    color: Palette.ink-2;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                }
+                                Text {
+                                    text: "uptime " + inst.uptime;
+                                    color: Palette.muted;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                }
+                                Text {
+                                    text: "accrued " + inst.accrued;
+                                    color: Palette.ink-2;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                }
+                                Text {
+                                    text: inst.dph;
+                                    color: Palette.warn;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                }
+                                Text {
+                                    text: inst.geo + " · disk " + inst.disk;
+                                    color: Palette.muted;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                }
+                                Rectangle { }
+                            }
+
+                            if inst.orphan: Banner {
+                                message: "billing with no local record — reconcile or destroy";
+                                level: 4;
+                            }
+                            if inst.stalled: Banner {
+                                message: "download stalled";
+                                detail: inst.stall-note;
+                                level: 3;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 5px;
+                                Btn {
+                                    label: inst.tunnel ? "close tunnel" : "open tunnel";
+                                    compact: true;
+                                    clicked => {
+                                        State.instance-tunnel(inst.id, !inst.tunnel);
+                                    }
+                                }
+                                Btn {
+                                    label: "restart download";
+                                    compact: true;
+                                    clicked => {
+                                        State.instance-restart-download(inst.id);
+                                    }
+                                }
+                                Btn {
+                                    label: "diagnose";
+                                    compact: true;
+                                    clicked => {
+                                        State.instance-diagnose(inst.id);
+                                    }
+                                }
+                                Btn {
+                                    label: "reconcile";
+                                    compact: true;
+                                    clicked => {
+                                        State.instance-reconcile(inst.id);
+                                    }
+                                }
+                                Chooser {
+                                    width: 130px;
+                                    options: State.aliases;
+                                    current <=> State.bind-alias-index;
+                                    placeholder: "bind to…";
+                                }
+                                Btn {
+                                    label: "bind";
+                                    compact: true;
+                                    clicked => {
+                                        State.instance-bind(inst.id,
+                                            State.bind-alias-index >= 0
+                                                && State.bind-alias-index < State.aliases.length
+                                                ? State.aliases[State.bind-alias-index] : "");
+                                    }
+                                }
+                                Rectangle { }
+                                Btn {
+                                    label: "destroy";
+                                    kind: 2;
+                                    icon: "✕";
+                                    compact: true;
+                                    clicked => {
+                                        State.instance-destroy(inst.id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if State.instances.length == 0: Empty {
+                        message: "nothing rented — which is the cheapest possible fleet";
+                    }
+                }
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 2;
+            spacing: Palette.gap;
+            min-width: 300px;
+
+            Card {
+                title: "ssh tunnels";
+                vertical-stretch: 1;
+                HeadRow {
+                    HeadCell { text: "instance"; }
+                    HeadCell {
+                        text: "local";
+                        width: 56px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "remote";
+                        width: 56px;
+                        numeric: true;
+                    }
+                    HeadCell {
+                        text: "state";
+                        width: 74px;
+                    }
+                    HeadCell {
+                        text: "restarts";
+                        width: 60px;
+                        numeric: true;
+                    }
+                }
+                ListScroll {
+                    rows: State.tunnels.length;
+                    VerticalLayout {
+                        spacing: 0px;
+                        alignment: start;
+                        width: parent.width;
+                        for t[i] in State.tunnels: Row {
+                            striped: Math.mod(i, 2) == 1;
+                            Cell {
+                                text: t.instance;
+                                mono: true;
+                            }
+                            Cell {
+                                text: t.local-port + "";
+                                width: 56px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: t.remote-port + "";
+                                width: 56px;
+                                numeric: true;
+                                mono: true;
+                            }
+                            Cell {
+                                text: t.up ? "up" : "down";
+                                width: 74px;
+                                level: t.level;
+                            }
+                            Cell {
+                                text: t.restarts + "";
+                                width: 60px;
+                                numeric: true;
+                                mono: true;
+                            }
+                        }
+                        if State.tunnels.length == 0: Empty {
+                            message: "no tunnels";
+                        }
+                    }
+                }
+            }
+
+            Card {
+                title: "diagnose";
+                subtitle: State.diagnose-of;
+                vertical-stretch: 1;
+                ListScroll {
+                    rows: State.diagnose-rows.length;
+                    row-height: 34px;
+                    VerticalLayout {
+                        spacing: 3px;
+                        alignment: start;
+                        width: parent.width;
+                        for c in State.diagnose-rows: VerticalLayout {
+                            spacing: 1px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Badge {
+                                    label: c.status;
+                                    level: c.level;
+                                }
+                                Text {
+                                    text: c.label;
+                                    color: Palette.ink-2;
+                                    font-size: Palette.font-sm;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { }
+                                Text {
+                                    text: c.ms;
+                                    color: Palette.muted;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Text {
+                                text: c.detail;
+                                color: Palette.muted;
+                                font-size: Palette.font-sm;
+                                font-family: Palette.mono;
+                                overflow: elide;
+                            }
+                        }
+                        if State.diagnose-rows.length == 0: Empty {
+                            message: "press diagnose on an instance for the four SSH probes and the RX sample";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

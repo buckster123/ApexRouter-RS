@@ -1,0 +1,76 @@
+// OWNER: unit U-02 (crates/apexrouter-slint/src/**, except build.rs). Do not edit outside
+// that unit.
+//
+// THE ONLY FILE IN THIS TREE ALLOWED TO CONTAIN A COLOUR LITERAL OR A RADIUS.
+// CI greps every other .slint file for one. Everything else reads `Palette`.
+//
+// The eleven base tokens are byte-identical to the web UI's `:root` block
+// (ARCHITECTURE.md §11), so the two GUIs are the same product wearing the same skin.
+
+export global Palette {
+    // ── The eleven web tokens, verbatim ───────────────────────────────────
+    out property <color> page:     #0d0d0d;
+    out property <color> surface:  #1a1a19;
+    out property <color> hairline: #2c2c2a;
+    out property <color> ink:      #ffffff;
+    out property <color> ink-2:    #c3c2b7;
+    out property <color> muted:    #898781;
+    out property <color> accent:   #3987e5;
+    out property <color> good:     #0ca30c;
+    out property <color> warn:     #fab219;
+    out property <color> serious:  #ec835a;
+    out property <color> critical: #d03b3b;
+
+    // ── Derived tints. Same hues, lower alpha; no new identity colours. ────
+    out property <color> surface-hi: #232320;
+    out property <color> surface-lo: #141413;
+    out property <color> clear:      transparent;
+    out property <color> scrim:      #000000a0;
+    out property <color> accent-dim:   #3987e533;
+    out property <color> good-dim:     #0ca30c2e;
+    out property <color> warn-dim:     #fab2192e;
+    out property <color> serious-dim:  #ec835a2e;
+    out property <color> critical-dim: #d03b3b2e;
+    out property <color> muted-dim:    #8987812e;
+    out property <color> on-accent:    #ffffff;
+
+    // ── Shape and metrics ─────────────────────────────────────────────────
+    out property <length> radius:    6px;
+    out property <length> radius-sm: 4px;
+    out property <length> radius-lg: 10px;
+    out property <length> hair:      1px;
+    out property <length> pad:       10px;
+    out property <length> pad-sm:    6px;
+    out property <length> gap:       8px;
+    out property <length> row-h:     26px;
+    out property <length> ctl-h:     28px;
+    out property <length> font:      13px;
+    out property <length> font-sm:   11px;
+    out property <length> font-lg:   17px;
+    out property <length> font-xl:   22px;
+
+    // ── Type families. Monospace is reserved for code, ids and logs. ──────
+    out property <string> mono: "monospace";
+    out property <string> sans: "";
+
+    // ── Status level → colour. `level` is an int on every row struct:
+    //    0 neutral · 1 good · 2 warn · 3 serious · 4 critical · 5 accent.
+    //    Status colour is reserved for health, never for identity (§10).
+    public pure function level-color(l: int) -> color {
+        return l == 1 ? root.good
+             : l == 2 ? root.warn
+             : l == 3 ? root.serious
+             : l == 4 ? root.critical
+             : l == 5 ? root.accent
+             : root.muted;
+    }
+
+    public pure function level-tint(l: int) -> color {
+        return l == 1 ? root.good-dim
+             : l == 2 ? root.warn-dim
+             : l == 3 ? root.serious-dim
+             : l == 4 ? root.critical-dim
+             : l == 5 ? root.accent-dim
+             : root.muted-dim;
+    }
+}

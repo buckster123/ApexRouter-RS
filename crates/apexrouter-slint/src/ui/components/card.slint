@@ -1,0 +1,111 @@
+// OWNER: unit U-02. Surfaces: the card, the section header, the hairline.
+
+import { Palette } from "../palette.slint";
+
+// A panel. One hairline, one radius, both from `Palette`.
+export component Card inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <bool> flat: false;
+    in property <length> body-spacing: Palette.gap;
+
+    background: root.flat ? Palette.clear : Palette.surface;
+    border-width: root.flat ? 0px : Palette.hair;
+    border-color: Palette.hairline;
+    border-radius: root.flat ? 0px : Palette.radius;
+
+    VerticalLayout {
+        padding: root.flat ? 0px : Palette.pad;
+        spacing: root.body-spacing;
+
+        if root.title != "": HorizontalLayout {
+            spacing: Palette.gap;
+            alignment: start;
+            Text {
+                text: root.title;
+                color: Palette.ink;
+                font-size: Palette.font;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            if root.subtitle != "": Text {
+                text: root.subtitle;
+                color: Palette.muted;
+                font-size: Palette.font-sm;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        @children
+    }
+}
+
+// A 1px rule.
+export component Hairline inherits Rectangle {
+    height: Palette.hair;
+    background: Palette.hairline;
+}
+
+// A small all-caps section label.
+export component SectionLabel inherits Text {
+    color: Palette.muted;
+    font-size: Palette.font-sm;
+    letter-spacing: 0.6px;
+}
+
+// A "key: value" pair, the workhorse of every detail pane.
+export component KV inherits HorizontalLayout {
+    in property <string> key;
+    in property <string> value;
+    in property <bool> mono: false;
+    in property <int> level: 0;
+    in property <length> key-width: 120px;
+    spacing: Palette.gap;
+    Text {
+        text: root.key;
+        color: Palette.muted;
+        font-size: Palette.font-sm;
+        width: root.key-width;
+        vertical-alignment: center;
+    }
+    Text {
+        text: root.value;
+        color: root.level == 0 ? Palette.ink-2 : Palette.level-color(root.level);
+        font-size: Palette.font-sm;
+        font-family: root.mono ? Palette.mono : Palette.sans;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
+// A loud banner. Used for the route-table compile error, the download stall and the
+// orphan-suspect alert — the three places the operator must not be able to miss.
+export component Banner inherits Rectangle {
+    in property <string> message;
+    in property <string> detail;
+    in property <int> level: 4;
+    background: Palette.level-tint(root.level);
+    border-width: Palette.hair;
+    border-color: Palette.level-color(root.level);
+    border-radius: Palette.radius-sm;
+    VerticalLayout {
+        padding: Palette.pad-sm;
+        spacing: 2px;
+        Text {
+            text: root.message;
+            color: Palette.level-color(root.level);
+            font-size: Palette.font;
+            font-weight: 700;
+            wrap: word-wrap;
+        }
+        if root.detail != "": Text {
+            text: root.detail;
+            color: Palette.ink-2;
+            font-size: Palette.font-sm;
+            font-family: Palette.mono;
+            wrap: word-wrap;
+        }
+        @children
+    }
+}

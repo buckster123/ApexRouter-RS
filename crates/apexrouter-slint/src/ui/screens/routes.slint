@@ -1,0 +1,453 @@
+// OWNER: unit U-02. Screen 1 — Routes.
+//
+// This is the product. The list is read-only; everything to the right of it writes.
+// Save is a `PUT /v1/routes/{alias}` — hot, no restart.
+//
+// Drag-to-reorder is an honest deferral (docs/SLINT.md): targets move with ↑/↓ buttons,
+// which is the same operation with a different grip.
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, PaneScroll, Empty } from "../components/table.slint";
+import { Btn, Field, Toggle, Chooser, Stepper, Labeled } from "../components/widgets.slint";
+
+export component RoutesScreen inherits HorizontalLayout {
+    spacing: Palette.gap;
+
+    // ── The table ─────────────────────────────────────────────────────────
+    Card {
+        title: "routes";
+        subtitle: State.routes.length + " aliases";
+        horizontal-stretch: 3;
+
+        HorizontalLayout {
+            spacing: Palette.gap;
+            alignment: start;
+            vertical-stretch: 0;
+            Btn {
+                label: "new alias";
+                icon: "+";
+                kind: 1;
+                clicked => {
+                    State.route-new();
+                }
+            }
+            Btn {
+                label: "validate table";
+                clicked => {
+                    State.route-validate();
+                }
+            }
+            Btn {
+                label: "reload from disk";
+                clicked => {
+                    State.reload-config();
+                }
+            }
+        }
+
+        if !State.table-valid: Banner {
+            message: "the on-disk route table failed to compile — the previous table is still serving";
+            detail: State.table-error;
+            level: 3;
+        }
+
+        if State.route-issues.length > 0: Banner {
+            message: "validation";
+            level: 2;
+            for line in State.route-issues: Text {
+                text: line;
+                color: Palette.ink-2;
+                font-size: Palette.font-sm;
+                font-family: Palette.mono;
+                wrap: word-wrap;
+            }
+        }
+
+        HeadRow {
+            HeadCell {
+                text: "alias";
+                width: 150px;
+            }
+            HeadCell { text: "targets"; }
+            HeadCell {
+                text: "strategy";
+                width: 108px;
+            }
+            HeadCell {
+                text: "health";
+                width: 96px;
+            }
+            HeadCell {
+                text: "p50 ttft";
+                width: 74px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "p50 tok/s";
+                width: 74px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "$/Mtok";
+                width: 84px;
+                numeric: true;
+            }
+        }
+        ListScroll {
+            rows: State.routes.length;
+            VerticalLayout {
+                spacing: 0px;
+                alignment: start;
+                width: parent.width;
+                for r[i] in State.routes: Row {
+                    striped: Math.mod(i, 2) == 1;
+                    selected: r.alias == State.route-sel;
+                    clicked => {
+                        State.route-select(r.alias);
+                    }
+                    HorizontalLayout {
+                        width: 150px;
+                        spacing: 5px;
+                        Cell {
+                            text: r.alias;
+                            mono: true;
+                        }
+                        if r.is-default: Badge {
+                            label: "default";
+                            level: 5;
+                            icon: "★";
+                        }
+                    }
+                    Cell {
+                        text: r.targets;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.strategy;
+                        width: 108px;
+                    }
+                    HorizontalLayout {
+                        width: 96px;
+                        spacing: 5px;
+                        Dot { level: r.level; }
+                        Cell {
+                            text: r.health;
+                            level: r.level;
+                        }
+                    }
+                    Cell {
+                        text: r.ttft;
+                        width: 74px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.tps;
+                        width: 74px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.cost;
+                        width: 84px;
+                        numeric: true;
+                        mono: true;
+                    }
+                }
+                if State.routes.length == 0: Empty {
+                    message: "no routes — press “new alias” to author one";
+                }
+            }
+        }
+    }
+
+    // ── The editor ────────────────────────────────────────────────────────
+    Card {
+        title: State.route-editing ? "editing " + State.re-alias : "route editor";
+        subtitle: State.route-editing ? "" : "select an alias, or press “new alias”";
+        horizontal-stretch: 2;
+        min-width: 380px;
+
+        if State.route-editing: PaneScroll {
+            content-height: 700px;
+            VerticalLayout {
+                width: parent.width;
+                spacing: Palette.gap;
+                alignment: start;
+
+                Labeled {
+                    label: "alias";
+                    hint: "the string a client puts in `model`";
+                    Field {
+                        value <=> State.re-alias;
+                        mono: true;
+                        placeholder: "coder";
+                    }
+                }
+
+                Text {
+                    text: "targets — tried in order";
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                }
+                VerticalLayout {
+                    spacing: 4px;
+                    for t[i] in State.re-targets: Rectangle {
+                        height: 58px;
+                        background: Palette.surface-lo;
+                        border-radius: Palette.radius-sm;
+                        VerticalLayout {
+                            padding: 5px;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                spacing: 5px;
+                                Field {
+                                    horizontal-stretch: 2;
+                                    value: t.backend;
+                                    mono: true;
+                                    placeholder: "id:local-carnice | tag:cheap | glob:vast-*";
+                                    edited(v) => {
+                                        State.target-edit(i, v, t.model, t.weight);
+                                    }
+                                }
+                                Field {
+                                    horizontal-stretch: 2;
+                                    value: t.model;
+                                    mono: true;
+                                    placeholder: "upstream model (optional)";
+                                    edited(v) => {
+                                        State.target-edit(i, t.backend, v, t.weight);
+                                    }
+                                }
+                                Stepper {
+                                    value: t.weight;
+                                    minimum: 1;
+                                    maximum: 1000;
+                                    changed(v) => {
+                                        State.target-edit(i, t.backend, t.model, v);
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 5px;
+                                Text {
+                                    text: t.resolves;
+                                    color: t.level == 0 ? Palette.muted : Palette.level-color(t.level);
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Rectangle { }
+                                Btn {
+                                    label: "↑";
+                                    compact: true;
+                                    kind: 3;
+                                    enabled: i > 0;
+                                    clicked => {
+                                        State.target-move(i, -1);
+                                    }
+                                }
+                                Btn {
+                                    label: "↓";
+                                    compact: true;
+                                    kind: 3;
+                                    enabled: i < State.re-targets.length - 1;
+                                    clicked => {
+                                        State.target-move(i, 1);
+                                    }
+                                }
+                                Btn {
+                                    label: "remove";
+                                    compact: true;
+                                    kind: 2;
+                                    clicked => {
+                                        State.target-remove(i);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if State.re-targets.length == 0: Empty {
+                        message: "no targets — an alias with none resolves to nothing";
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 5px;
+                    Field {
+                        horizontal-stretch: 2;
+                        value <=> State.re-new-backend;
+                        mono: true;
+                        placeholder: "add target: id:… / tag:… / glob:…";
+                    }
+                    Field {
+                        horizontal-stretch: 2;
+                        value <=> State.re-new-model;
+                        mono: true;
+                        placeholder: "model (optional)";
+                    }
+                    Stepper {
+                        value <=> State.re-new-weight;
+                        minimum: 1;
+                        maximum: 1000;
+                    }
+                    Btn {
+                        label: "add";
+                        icon: "+";
+                        clicked => {
+                            State.target-add();
+                        }
+                    }
+                }
+
+                Hairline { }
+
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "strategy";
+                        Chooser {
+                            options: State.strategies;
+                            current <=> State.re-strategy;
+                        }
+                    }
+                    Labeled {
+                        label: "attempts";
+                        Stepper {
+                            value <=> State.re-attempts;
+                            minimum: 1;
+                            maximum: 10;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Toggle {
+                            label: "failover";
+                            checked <=> State.re-failover;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Toggle {
+                            label: "honor Retry-After";
+                            checked <=> State.re-honor-retry;
+                        }
+                    }
+                }
+
+                Text {
+                    text: "filter — a target that fails one of these is skipped";
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "require tags";
+                        Field {
+                            value <=> State.re-require-tags;
+                            mono: true;
+                            placeholder: "comma,separated";
+                        }
+                    }
+                    Labeled {
+                        label: "exclude tags";
+                        Field {
+                            value <=> State.re-exclude-tags;
+                            mono: true;
+                            placeholder: "comma,separated";
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "min ctx";
+                        Field {
+                            value <=> State.re-min-ctx;
+                            mono: true;
+                            placeholder: "32768";
+                        }
+                    }
+                    Labeled {
+                        label: "max $/Mtok";
+                        Field {
+                            value <=> State.re-max-cost;
+                            mono: true;
+                            placeholder: "0.60";
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Toggle {
+                            label: "vision";
+                            checked <=> State.re-require-vision;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: end;
+                        Toggle {
+                            label: "tools";
+                            checked <=> State.re-require-tools;
+                        }
+                    }
+                }
+
+                Labeled {
+                    label: "description";
+                    Field {
+                        value <=> State.re-description;
+                        placeholder: "what this alias is for";
+                    }
+                }
+
+                if State.route-test-result != "": Banner {
+                    message: "test";
+                    detail: State.route-test-result;
+                    level: State.route-test-level;
+                }
+
+                Hairline { }
+
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Btn {
+                        label: "save";
+                        kind: 1;
+                        icon: "✓";
+                        clicked => {
+                            State.route-save();
+                        }
+                    }
+                    Btn {
+                        label: "test";
+                        icon: "◎";
+                        clicked => {
+                            State.route-test();
+                        }
+                    }
+                    Btn {
+                        label: "make default";
+                        enabled: !State.re-is-default;
+                        clicked => {
+                            State.route-make-default();
+                        }
+                    }
+                    Rectangle { }
+                    Btn {
+                        label: "delete";
+                        kind: 2;
+                        icon: "✕";
+                        clicked => {
+                            State.route-delete();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

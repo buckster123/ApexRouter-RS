@@ -117,6 +117,10 @@ pub fn apply(paths: &Paths, cfg: &Config, plan: &MigrationPlan) -> Result<Migrat
                 next_cfg.docker = d;
                 cfg_dirty = true;
             }
+            Payload::MirrorUsageLog => {
+                next_cfg.compat.mirror_usage_log = true;
+                cfg_dirty = true;
+            }
             Payload::Fork { name, fork } => {
                 next_cfg.known_forks.entry(name).or_insert(fork);
                 cfg_dirty = true;
@@ -747,6 +751,8 @@ enum Payload {
     },
     /// The `[docker]` image map.
     Docker(DockerCfg),
+    /// `[compat] mirror_usage_log = true` — opt in to writing the legacy usage mirror.
+    MirrorUsageLog,
     /// A `[known_forks.<name>]` entry.
     Fork {
         /// The table key.
@@ -912,9 +918,10 @@ fn survey_usage_log(vg: &Path, cfg: &Config, out: &mut Vec<Planned>) {
         return;
     };
     let rows = text.lines().filter(|l| !l.trim().is_empty()).count();
+    let from = path.display().to_string();
     out.push(informational(
         "usage log",
-        &path.display().to_string(),
+        &from,
         MigrationAction::Skip,
         format!(
             "{rows} row(s), merged into every usage aggregate IN PLACE while \
@@ -923,6 +930,50 @@ fn survey_usage_log(vg: &Path, cfg: &Config, out: &mut Vec<Planned>) {
             cfg.compat.read_legacy_state
         ),
     ));
+    survey_usage_mirror(&path, cfg, out);
+}
+
+/// Offer `[compat] mirror_usage_log`, which is **off** unless a human asks for it.
+///
+/// This is the one place where turning it on is the obvious thing to want: a migration is
+/// exactly the transition period during which the old LocalRouter TUI's usage view should
+/// keep filling up. Everywhere else, appending to another tool's state file because our
+/// daemon started is a surprise, which is why the default is `false` — so the capability is
+/// *offered* here rather than buried in a config comment nobody reads.
+///
+/// The row is `Warn`, not `Import`: keeping it writes outside our own state directory from
+/// then on, and a plan that a human strikes rows out of should say so out loud.
+fn survey_usage_mirror(usage_log: &Path, cfg: &Config, out: &mut Vec<Planned>) {
+    let from = format!("{}#[compat] mirror_usage_log", usage_log.display());
+    if cfg.compat.mirror_usage_log {
+        out.push(informational(
+            "usage mirror",
+            &from,
+            MigrationAction::Skip,
+            "already enabled: every new usage row is appended to this file as well as to \
+             ApexRouter's own log. Nothing to do."
+                .to_owned(),
+        ));
+        return;
+    }
+    out.push(Planned {
+        item: MigrationItem {
+            what: "usage mirror".to_owned(),
+            from,
+            action: MigrationAction::Warn,
+            detail: format!(
+                "OPTIONAL, and OFF by default: keep this row to set `[compat] \
+                 mirror_usage_log = true`, so every new usage row is ALSO appended to {} in \
+                 the legacy field set and the old LocalRouter TUI's usage view keeps working \
+                 during the transition. Keeping it means ApexRouter writes into another \
+                 tool's state directory from then on; strike it out to leave that file \
+                 untouched. ApexRouter's own usage log is written either way, and the legacy \
+                 rows already there are read regardless.",
+                usage_log.display()
+            ),
+        },
+        payload: Payload::MirrorUsageLog,
+    });
 }
 
 /// `~/.vastai-gguf/local_logs/` — offered as history, never moved.
@@ -2787,6 +2838,66 @@ mod tests {
             "nothing selected means nothing written"
         );
         assert!(!paths.ledger().exists());
+    }
+
+    /// FINDING B: `[compat] mirror_usage_log` is off by default, so migration — the one
+    /// place where wanting it is obvious — has to *offer* it rather than leave it buried.
+    #[test]
+    fn migration_offers_the_usage_mirror_and_only_writes_it_when_kept() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let vg = home.path().join(".vastai-gguf");
+        write(
+            &vg.join("usage.log"),
+            "{\"timestamp\":\"2026-05-02T20:12:00Z\",\"provider\":\"together\"}\n",
+        );
+        let paths = test_paths(home.path(), None);
+        let cfg = Config::default();
+        assert!(!cfg.compat.mirror_usage_log, "the default is off");
+
+        let plan = super::plan(&paths, &cfg).expect("plan");
+        let offer = plan
+            .items
+            .iter()
+            .find(|i| i.what == "usage mirror")
+            .expect("migration must offer the mirror");
+        assert_eq!(offer.action, MigrationAction::Warn);
+        assert!(offer.detail.contains("mirror_usage_log"));
+        assert!(
+            offer.detail.contains("OFF by default"),
+            "the offer must say what it is turning on: {}",
+            offer.detail
+        );
+
+        // Struck out, nothing changes — the daemon still leaves the legacy file alone.
+        let mut struck = plan.clone();
+        for item in &mut struck.items {
+            item.action = MigrationAction::Skip;
+        }
+        apply(&paths, &cfg, &struck).expect("apply");
+        assert!(
+            !paths.config_file().exists(),
+            "nothing selected, nothing written"
+        );
+
+        // Kept, the config says so — and only then.
+        apply(&paths, &cfg, &plan).expect("apply");
+        let written = fs::read_to_string(paths.config_file()).expect("config");
+        assert!(
+            written.contains("mirror_usage_log = true"),
+            "keeping the row enables it: {written}"
+        );
+        let reloaded = Config::load_from(Some(&paths.config_file()), None).expect("load");
+        assert!(reloaded.compat.mirror_usage_log);
+
+        // With it already on, the row becomes an informational skip, not a second offer.
+        let again = super::plan(&paths, &reloaded).expect("plan");
+        let row = again
+            .items
+            .iter()
+            .find(|i| i.what == "usage mirror")
+            .expect("the row stays visible");
+        assert_eq!(row.action, MigrationAction::Skip);
+        assert!(row.detail.contains("already enabled"));
     }
 
     #[test]

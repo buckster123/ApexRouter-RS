@@ -2,22 +2,134 @@
 <!--
   OWNER: unit U-01 (ui-web/{index.html,app.js,style.css}). Do not edit outside that unit.
 
-  Stage 0 placeholder, so rust-embed's #[folder = "../../ui-web"] compiles.
-
   Three files. No npm, no CDN, no framework, no build step. `textContent` everywhere and
   `innerHTML` nowhere. Inline SVG emoji favicon as a data: URI.
+
+  This file is the shell only: the bars, the tab strip, the empty panel containers and the
+  two drawers. Everything inside them is built by app.js with `replaceChildren()`, because
+  the daemon is the only thing that knows how many endpoints, GPUs or rented boxes exist —
+  and the answer is never a fixed number (docs/port/00b).
 -->
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="referrer" content="no-referrer" />
     <title>ApexRouter</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Ctext%20x='50%25'%20y='52%25'%20dominant-baseline='central'%20text-anchor='middle'%20font-size='56'%3E%E2%9A%A1%3C/text%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main id="app">
-      <noscript>ApexRouter's web UI needs JavaScript. The REST API and the CLI do not.</noscript>
+    <a class="skip" href="#main">Skip to the panels</a>
+
+    <!-- Router bar — always visible. -->
+    <header class="routerbar" id="routerbar">
+      <div class="rb-id">
+        <span class="rb-mark" aria-hidden="true">⚡</span>
+        <span class="rb-name">ApexRouter</span>
+        <span class="rb-version" id="rb-version"></span>
+      </div>
+
+      <div class="rb-url">
+        <code id="rb-base-url" title="Point OPENAI_BASE_URL here">…</code>
+        <button type="button" id="rb-copy" class="btn btn-copy" title="Copy the base URL">
+          <span aria-hidden="true">⧉</span><span>Copy</span>
+        </button>
+        <code class="rb-key" id="rb-key">OPENAI_API_KEY=not-needed</code>
+        <button
+          type="button"
+          id="rb-copy-both"
+          class="btn btn-ghost"
+          title="Copy both environment variables"
+        >
+          <span aria-hidden="true">⧉</span><span>Copy env</span>
+        </button>
+        <span class="rb-copied" id="rb-copied" role="status" hidden>copied</span>
+      </div>
+
+      <div class="rb-stats" id="rb-stats"></div>
+
+      <label class="rb-default" for="rb-default-alias">
+        <span>default →</span>
+        <select id="rb-default-alias" title="Re-point the default alias"></select>
+      </label>
+
+      <div class="rb-conn" id="rb-conn" title="Control-plane connection">
+        <span class="dot dot-unknown" id="conn-dot" aria-hidden="true"></span>
+        <span id="conn-text">connecting…</span>
+      </div>
+    </header>
+
+    <!-- Rig strip — always visible, one bar per physical device plus RAM and swap. -->
+    <section class="rigstrip" id="rigstrip" aria-label="Rig"></section>
+
+    <!-- Standing alerts. -->
+    <section class="alerts" id="alerts" aria-label="Alerts" hidden></section>
+
+    <nav class="tabs" id="tabs" aria-label="Panels">
+      <button type="button" class="tab" data-panel="routes">Routes</button>
+      <button type="button" class="tab" data-panel="backends">Backends</button>
+      <button type="button" class="tab" data-panel="fleet">Fleet &amp; cost</button>
+      <button type="button" class="tab" data-panel="catalog">Catalog</button>
+      <button type="button" class="tab" data-panel="providers">Providers</button>
+      <button type="button" class="tab" data-panel="requests">Live requests</button>
+      <button type="button" class="tab" data-panel="usage">Usage</button>
+      <button type="button" class="tab" data-panel="doctor">Doctor</button>
+      <span class="tabs-spacer"></span>
+      <button type="button" class="btn btn-primary" id="open-launch">
+        <span aria-hidden="true">＋</span><span>Launch</span>
+      </button>
+    </nav>
+
+    <main id="main">
+      <noscript>
+        ApexRouter's web UI needs JavaScript. The REST API and the CLI do not.
+      </noscript>
+      <section class="panel" id="panel-routes" hidden></section>
+      <section class="panel" id="panel-backends" hidden></section>
+      <section class="panel" id="panel-fleet" hidden></section>
+      <section class="panel" id="panel-catalog" hidden></section>
+      <section class="panel" id="panel-providers" hidden></section>
+      <section class="panel" id="panel-requests" hidden></section>
+      <section class="panel" id="panel-usage" hidden></section>
+      <section class="panel" id="panel-doctor" hidden></section>
     </main>
+
+    <!-- Launch: a NON-modal drawer. The page behind it keeps updating and stays usable. -->
+    <aside class="drawer" id="drawer-launch" aria-label="Launch" hidden>
+      <header class="drawer-head">
+        <h2 id="launch-title">Launch</h2>
+        <button type="button" class="btn btn-ghost" id="launch-close" title="Close">
+          <span aria-hidden="true">✕</span><span>Close</span>
+        </button>
+      </header>
+      <div class="drawer-tabs" id="launch-tabs">
+        <button type="button" class="dtab" data-ltab="local">Local</button>
+        <button type="button" class="dtab" data-ltab="vllm">vLLM</button>
+        <button type="button" class="dtab" data-ltab="rent">Rent</button>
+      </div>
+      <div class="drawer-body" id="launch-body"></div>
+      <div class="drawer-summary" id="launch-summary"></div>
+    </aside>
+
+    <!-- The second drawer: route/recipe/profile editors, logs, request detail. -->
+    <aside class="drawer drawer-edit" id="drawer-edit" aria-label="Editor" hidden>
+      <header class="drawer-head">
+        <h2 id="edit-title">Editor</h2>
+        <button type="button" class="btn btn-ghost" id="edit-close" title="Close">
+          <span aria-hidden="true">✕</span><span>Close</span>
+        </button>
+      </header>
+      <div class="drawer-body" id="edit-body"></div>
+      <div class="drawer-summary" id="edit-summary"></div>
+    </aside>
+
+    <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
     <script src="/app.js"></script>
   </body>
 </html>

@@ -111,6 +111,25 @@ pub async fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Command::Endpoint { cmd } => endpoint::run(&ctx, cmd).await,
         Command::Route { cmd } => route::run(&ctx, cmd).await,
         Command::Switch { cmd } => switch::run(&ctx, cmd).await,
+        // ---- S-08 ------------------------------------------------------------------
+        Command::Up(a) => up::run(&ctx, a).await,
+        Command::Swap(a) => swap::run(&ctx, a).await,
+        Command::Open => open::run(&ctx).await,
+        Command::Env(a) => env::run(&ctx, a).await,
+        Command::Backend { cmd } => backend::run(&ctx, cmd).await,
+        Command::Recipe { cmd } => recipe::run(&ctx, cmd).await,
+        Command::Profile { cmd } => profile::run(&ctx, cmd).await,
+        Command::Provider { cmd } => provider::run(&ctx, cmd).await,
+        Command::Vast { cmd } => vast::run(&ctx, cmd).await,
+        Command::Tunnel { cmd } => tunnel::run(&ctx, cmd).await,
+        Command::Approvals { cmd } => approvals::run(&ctx, cmd).await,
+        Command::Hf { cmd } => hf::run(&ctx, cmd).await,
+        Command::Usage(a) => usage::run(&ctx, a).await,
+        Command::Compare(a) => compare::run(&ctx, a).await,
+        Command::Smoke(a) => smoke::run(&ctx, a).await,
+        Command::Doctor(a) => doctor::run(&ctx, a).await,
+        Command::Migrate(a) => migrate::run(&ctx, a),
+        Command::Token { cmd } => token::run(&ctx, cmd),
         // Handled above, before the on-disk state is touched.
         Command::Completions(_) | Command::External(_) => Ok(()),
     }
@@ -120,39 +139,7 @@ pub async fn dispatch(cli: &Cli) -> anyhow::Result<()> {
 ///
 /// Reporting this beats clap's "unrecognized subcommand": the operator running the
 /// MK1-CORE transcript learns which unit is missing and what to type meanwhile.
-const PENDING: &[(&str, &str, &str)] = &[
-    (
-        "up",
-        "S-08",
-        "use `apexrouter endpoint start <model> --alias <a>`",
-    ),
-    (
-        "swap",
-        "S-08",
-        "use `apexrouter route set <alias> --target <backend>`",
-    ),
-    ("backend", "S-08", ""),
-    (
-        "open",
-        "S-08",
-        "the web UI is at the control URL `apexrouter status` prints",
-    ),
-    ("env", "S-08", "use `apexrouter url`"),
-    ("doctor", "S-08", ""),
-    ("usage", "S-08", ""),
-    ("smoke", "S-08", ""),
-    ("compare", "S-08", ""),
-    ("recipe", "S-08", ""),
-    ("profile", "S-08", ""),
-    ("provider", "S-08", ""),
-    ("vast", "S-08", ""),
-    ("tunnel", "S-08", ""),
-    ("approvals", "S-08", ""),
-    ("hf", "S-08", ""),
-    ("token", "S-08", ""),
-    ("migrate", "S-08", ""),
-    ("mcp", "M-01", ""),
-];
+const PENDING: &[(&str, &str, &str)] = &[("mcp", "M-01", "")];
 
 /// Report an unimplemented — or simply unknown — verb.
 ///
@@ -179,10 +166,9 @@ mod tests {
 
     #[test]
     fn a_planned_verb_names_its_work_unit() {
-        let e = pending(&["up".to_string(), "x".to_string()]).expect_err("must fail");
+        let e = pending(&["mcp".to_string(), "x".to_string()]).expect_err("must fail");
         let msg = e.to_string();
-        assert!(msg.contains("S-08"), "{msg}");
-        assert!(msg.contains("endpoint start"), "{msg}");
+        assert!(msg.contains("M-01"), "{msg}");
     }
 
     #[test]

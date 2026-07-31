@@ -123,6 +123,12 @@ pub async fn serve(paths: Paths, cfg: Config, lock: DaemonLock) -> anyhow::Resul
 /// This is the form an embedder — ApexOS-RS, or a test — uses, because installing a
 /// process-wide `SIGTERM` handler is not a library's decision to make.
 ///
+/// It is also where **every process-global slot the control plane reads** is filled:
+/// `spawn_shutdown_bridges`' notifier, and S-07's provider clients. That is the same ruling
+/// in both cases, for the same reason — one process runs one daemon, so a global is correctly
+/// scoped in production, and a test process runs many, so a test that builds an [`AppState`]
+/// by hand must not have another daemon's client appear underneath it.
+///
 /// # Errors
 /// As [`serve`].
 pub async fn serve_with_shutdown(
@@ -132,9 +138,60 @@ pub async fn serve_with_shutdown(
     shutdown: ShutdownHandle,
 ) -> anyhow::Result<()> {
     let state = build_state(paths, cfg, lock).await?;
+    install_provider_clients(&state);
     let (trigger, local) = shutdown::channel();
     spawn_shutdown_bridges(&trigger, &shutdown);
     run(state, local).await
+}
+
+/// Fill S-07's provider slots — the vast client, the HuggingFace client and the tunnel
+/// supervisor — from the running configuration.
+///
+/// S-07 publishes `install_*` for each and documents them as "called once at daemon start,
+/// and by nothing else"; this is that call site, and until it existed every `/v1/vast/*` and
+/// `/v1/hf/*` route answered `503 vast_unavailable` / `503 hf_unavailable` no matter what
+/// credentials the machine held. The routes were mounted and the clients were absent, which
+/// is the mounting defect one level down.
+///
+/// **Nothing here can stop the daemon.** A missing vast key is the ordinary state of a
+/// machine that does not rent GPUs, and the `503` those routes already answer names the fix
+/// precisely; a daemon that refused to start over it would be a daemon that cannot serve the
+/// local models it was actually asked for. Each failure is one `info` line and nothing else —
+/// not even an alert, because "no vast key" is a configuration fact, not a fault.
+fn install_provider_clients(state: &Arc<AppState>) {
+    let cfg = state.cfg();
+
+    match apexrouter_providers::vast::VastApiHttp::from_config(&cfg, &state.paths) {
+        Ok(api) => {
+            tracing::info!(base = %api.base_url(), "vast client installed");
+            api::vast::install_vast_api(Some(Arc::new(api)));
+        }
+        Err(e) => {
+            tracing::info!(reason = %e, "no vast client: /v1/vast/* will answer 503 until a key is configured");
+            api::vast::install_vast_api(None);
+        }
+    }
+
+    match apexrouter_providers::hf::HfClient::new(&cfg, &state.paths) {
+        Ok(hf) => {
+            tracing::info!("huggingface client installed");
+            api::hf::install_hf_source(Some(Arc::new(hf)));
+        }
+        Err(e) => {
+            tracing::info!(reason = %e, "no huggingface client: /v1/hf/* will answer 503");
+            api::hf::install_hf_source(None);
+        }
+    }
+
+    // The tunnel supervisor needs no credential — it shells out to `ssh` — so it is always
+    // installed, and `GET /v1/tunnels` answers an empty list rather than a `503`.
+    api::vast::install_tunnels(Some(Arc::new(
+        apexrouter_providers::ssh::TunnelSupervisor::new(
+            state.paths.clone(),
+            (*cfg).clone(),
+            state.tx.clone(),
+        ),
+    )));
 }
 
 /// Steps 1–5 of ARCHITECTURE §1.3: the layout, the bind-exposure refusal, the owner record,
@@ -182,9 +239,15 @@ pub async fn build_state(
     ));
 
     // `core` defines the `Check` trait without ever depending on `providers`; the daemon is
-    // what puts the two together. Provider checks join this list in Stage 5 (P-08).
+    // what puts the two together, and it is the **only** thing that can — which is why both
+    // lists are registered here rather than by the module that runs them. Registration order
+    // is display order and the two lists continue each other: this machine first, then the
+    // things that cost money, then the things that carry traffic.
     let mut checks = Registry::new();
     for c in apexrouter_core::checks::local_checks() {
+        checks.register(c);
+    }
+    for c in apexrouter_providers::checks::provider_checks() {
         checks.register(c);
     }
 
@@ -689,22 +752,26 @@ pub fn api_router(state: Arc<AppState>) -> axum::Router {
 
 /// Every authenticated control route, in one place.
 ///
-/// **This is the merge point for the rest of Stage 4 and Stage 5.** Each API module
-/// publishes a `pub fn router() -> axum::Router<Arc<AppState>>` and gets exactly one line
-/// here; `api::router()` is S-03's own aggregate of `snapshot`, `backends`, `routes` and
-/// `endpoints`. Still to come, each one line:
+/// **This is the only merge point.** Each API module publishes a
+/// `pub fn router() -> axum::Router<Arc<AppState>>` and gets exactly one line here;
+/// `api::router()` is S-03's own aggregate of `snapshot`, `backends`, `routes` and
+/// `endpoints`. Only S-01 may edit this file — deliberately, because route-table assembly is
+/// exactly the file where two agents merging blind produce an axum panic at startup rather
+/// than a compile error.
 ///
-/// ```text
-/// .merge(api::vast::router())        // S-07
-/// .merge(api::hf::router())          // S-07
-/// .merge(api::providers::router())   // S-07
-/// .merge(api::checks::router())      // S-07
-/// .merge(api::compare::router())     // S-07
-/// ```
+/// # Every module in `api/` must appear below
 ///
-/// Only S-01 may edit this file, so those lines land with an S-01 pass — deliberately,
-/// because route-table assembly is exactly the file where two agents merging blind produce
-/// an axum panic at startup rather than a compile error.
+/// Twice now — Stage 4's `catalog` and Stage 5's `{vast, hf, providers, checks, compare}` —
+/// a module shipped implemented, unit-tested green and **unreachable**, because its one line
+/// here was written as prose instead of as code. A unit test cannot catch that: it builds the
+/// module's own `Router` and never sees the composed application.
+///
+/// `tests/mounted_routes.rs` is the guard. It enumerates every `pub fn router()` under
+/// `src/api/`, boots the real application, and asks axum itself — through the `Allow` header
+/// of a `405` — which methods the composed router serves at each of that module's paths. A
+/// module that is missing from the list below fails the build. **Do not write a merge as a
+/// doc comment; write it as a line of code, or the guard is the only thing that will tell
+/// you.**
 fn v1_routes() -> axum::Router<Arc<AppState>> {
     axum::Router::new()
         .route("/ws", get(ws::ws_handler))
@@ -715,6 +782,11 @@ fn v1_routes() -> axum::Router<Arc<AppState>> {
         .merge(api::usage::router())
         .merge(api::requests::router())
         .merge(api::jobs::router())
+        .merge(api::vast::router())
+        .merge(api::hf::router())
+        .merge(api::providers::router())
+        .merge(api::checks::router())
+        .merge(api::compare::router())
 }
 
 /// `GET /health` on the control listener: `{ok, product, version}` plus uptime (§6.2).
@@ -891,7 +963,11 @@ mod tests {
 
     /// The variables the fixture redirects, saved so the process is left as it was found —
     /// other units' tests share this binary and read some of these.
-    const REDIRECTED: [&str; 8] = [
+    ///
+    /// The last five are credential variables, cleared rather than redirected: HERMETICITY
+    /// says no test in this workspace may resolve a real credential, and the developer
+    /// running `cargo test` is exactly the person who has them exported.
+    const REDIRECTED: [&str; 13] = [
         "HOME",
         "APEXROUTER_HOME",
         "APEXROUTER_CONFIG",
@@ -900,6 +976,11 @@ mod tests {
         "XDG_CONFIG_HOME",
         "PROXY_PORT",
         "APEXROUTER_TOKEN",
+        "VAST_API_KEY",
+        "VASTAI_API_KEY",
+        "HF_TOKEN",
+        "HUGGING_FACE_HUB_TOKEN",
+        "TOGETHER_API_KEY",
     ];
 
     struct Fixture {
@@ -938,6 +1019,13 @@ mod tests {
         std::env::set_var("XDG_CONFIG_HOME", root.join("xdg-config"));
         std::env::remove_var("PROXY_PORT");
         std::env::remove_var("APEXROUTER_TOKEN");
+        // HERMETICITY: a real credential must not be resolvable from inside a test, whatever
+        // the developer has exported.
+        for k in ["VAST_API_KEY", "VASTAI_API_KEY", "HF_TOKEN"] {
+            std::env::remove_var(k);
+        }
+        std::env::remove_var("HUGGING_FACE_HUB_TOKEN");
+        std::env::remove_var("TOGETHER_API_KEY");
         let paths = Paths::resolve().expect("paths");
         paths.ensure_layout().expect("layout");
         Fixture {

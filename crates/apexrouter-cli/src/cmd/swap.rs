@@ -1,3 +1,214 @@
 //! OWNER: unit S-08 (cli/src/cmd/{vast,tunnel,hf,provider,recipe,profile,usage,smoke,doctor,compare,backend,swap,up,approvals,token,open,env,migrate}.rs). Do not edit outside that unit.
 //!
 //! `apexrouter swap <alias> --to <model|recipe|backend-id> [--mode hot|sequential]` — an RPC to `POST /v1/routes/{alias}/swap`, never a file write plus a hope that the watcher noticed.
+//!
+//! **One verb, and the mode is chosen for you** (`ARCHITECTURE.md` §4.7). `hot` brings the
+//! new backend up before the old one goes, which needs VRAM for both; `sequential` frees the
+//! old one first, which is the only option when it does not fit. Omitting `--mode` lets the
+//! daemon decide from `fit()`, because the daemon is the thing that knows what is resident —
+//! guessing here and being wrong means either an OOM or a needless gap in service.
+//!
+//! `--to` resolves in the same documented order [`crate::cmd::up`] uses, minus the "path on
+//! disk" step: a registered **backend id** first (nothing to start, so the swap is pure
+//! re-pointing), then a **recipe**, then a **model**. A `Vast` recipe is refused here on
+//! purpose: swapping is a routing operation, and one that quietly starts an hourly bill is
+//! not one — `apexrouter recipe run --yes` is where that decision is made out loud.
+
+use crate::cli::SwapArgs;
+use crate::cmd::{route, up, Ctx};
+use crate::daemon::Need;
+use crate::render;
+use apexrouter_client::NodeClient;
+use apexrouter_protocol::{
+    Backend, EndpointSpec, Recipe, RecipeKind, ServedBy, SwapMode, SwapReport,
+};
+
+/// Run `apexrouter swap`.
+///
+/// # Errors
+/// An invalid alias, an unresolvable `--to`, a `Vast` recipe, or a daemon that refuses.
+pub async fn run(ctx: &Ctx, args: &SwapArgs) -> anyhow::Result<()> {
+    let alias = route::parse_alias(&args.alias)?;
+    let client = ctx.serving(Need::Mutate).await?.into_daemon()?;
+    let to = resolve(ctx, &client, &args.to).await?;
+
+    let body = match args.mode {
+        Some(m) => serde_json::json!({ "to": to, "mode": SwapMode::from(m) }),
+        None => serde_json::json!({ "to": to }),
+    };
+    let report: SwapReport = client
+        .post(&format!("/v1/routes/{}/swap", alias.as_str()), &body)
+        .await?;
+
+    if args.json {
+        return render::print_json(ServedBy::Daemon, render::now_unix(), false, &report);
+    }
+    render::print_line(&format!(
+        "{}  {}  ->  {}  ({} · drained {} ms · {} ms total{})",
+        report.alias.as_str(),
+        report
+            .from
+            .as_ref()
+            .map(|b| b.as_str().to_string())
+            .unwrap_or_else(|| "(nothing)".to_string()),
+        report.to.as_str(),
+        render::variant(&report.mode),
+        report.drained_ms,
+        report.total_ms,
+        if report.parked > 0 {
+            format!(" · {} request(s) parked", report.parked)
+        } else {
+            String::new()
+        }
+    ));
+    Ok(())
+}
+
+/// Turn `--to` into a `SwapTarget`: a bare backend id, or an `EndpointSpec` to start first.
+///
+/// The untagged `SwapTarget` on the wire is `BackendId | EndpointSpec`, so a bare JSON
+/// string means "this already exists" and an object means "start this".
+///
+/// # Errors
+/// A `--to` that matches nothing, or a recipe that rents hardware.
+async fn resolve(ctx: &Ctx, client: &NodeClient, to: &str) -> anyhow::Result<serde_json::Value> {
+    // 1. A backend that is already registered. Nothing to start.
+    let backends: Vec<Backend> = client.get("/v1/backends").await?;
+    if let Some(b) = backends.iter().find(|b| b.id.as_str() == to) {
+        return Ok(serde_json::Value::from(b.id.as_str()));
+    }
+
+    // 2. A recipe, by exact id.
+    let recipes: Vec<Recipe> = client.get("/v1/recipes").await?;
+    if let Some(r) = recipes.iter().find(|r| r.id.as_str() == to) {
+        return Ok(serde_json::to_value(spec_of(r)?)?);
+    }
+
+    // 3. A model, resolved the way `up` and `endpoint start` resolve one.
+    match up::local_spec(ctx, client, to, None, None, None, None).await {
+        Ok(spec) => Ok(serde_json::to_value(spec)?),
+        Err(e) => {
+            let known: Vec<&str> = backends.iter().map(|b| b.id.as_str()).collect();
+            Err(anyhow::anyhow!(
+                "`{to}` is not a registered backend ({}), not a recipe, and not a model: {e}",
+                if known.is_empty() {
+                    "the table is empty".to_string()
+                } else {
+                    known.join(", ")
+                }
+            ))
+        }
+    }
+}
+
+/// The [`EndpointSpec`] a recipe instantiates, when swapping to it is a routing decision
+/// rather than a spending one.
+///
+/// # Errors
+/// A `Vast` recipe. Renting is deliberate spend and belongs behind `--yes`, so it is
+/// refused here with the verb that does ask.
+pub fn spec_of(r: &Recipe) -> anyhow::Result<EndpointSpec> {
+    match &r.kind {
+        RecipeKind::Local(s) => Ok(EndpointSpec::LocalLlama(s.clone())),
+        RecipeKind::LocalVllm(s) => Ok(EndpointSpec::LocalVllm(s.clone())),
+        RecipeKind::Managed(s) => Ok(EndpointSpec::Managed(s.clone())),
+        RecipeKind::Vast { .. } => anyhow::bail!(
+            "`{}` is a vast.ai recipe: swapping to it would start an hourly bill without \
+             asking. Rent it explicitly with `apexrouter recipe run {} --yes`, then \
+             `apexrouter swap <alias> --to <the new backend id>`.",
+            r.id.as_str(),
+            r.id.as_str()
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apexrouter_protocol::{Alias, BackendId, ProfileId, Provenance2, RecipeId};
+
+    fn recipe_with(kind: RecipeKind) -> Recipe {
+        Recipe {
+            id: RecipeId::parse("carnice").expect("id"),
+            label: "Carnice".to_string(),
+            description: None,
+            kind,
+            provenance: Provenance2::default(),
+            created_at_unix: 0,
+            updated_at_unix: 0,
+        }
+    }
+
+    fn vast_kind() -> RecipeKind {
+        RecipeKind::Vast {
+            profile: ProfileId::parse("two-3090s").expect("id"),
+            launch: apexrouter_protocol::ContainerLaunch {
+                runtime: apexrouter_protocol::ContainerRuntime::LlamaCpp,
+                image: "img".to_string(),
+                image_type: apexrouter_protocol::ImageType::Prebuilt,
+                disk_gb: 120,
+                env: Default::default(),
+                onstart: String::new(),
+                host: "127.0.0.1".to_string(),
+                port: 8000,
+                expose_public: false,
+            },
+            fit: None,
+        }
+    }
+
+    fn vllm_kind() -> RecipeKind {
+        RecipeKind::LocalVllm(apexrouter_protocol::LocalVllmSpec {
+            bin: "vllm".to_string(),
+            model_id: "Qwen/Qwen3".to_string(),
+            tp: None,
+            ctx: None,
+            quantization: None,
+            kv_cache_dtype: None,
+            enforce_eager: false,
+            reasoning_parser: None,
+            gpu_util: None,
+            max_num_seqs: None,
+            trust_remote: false,
+            chunked_prefill: true,
+            host: "127.0.0.1".to_string(),
+            port: None,
+            devices: Vec::new(),
+            extra_args: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_renting_recipe_is_refused_and_names_the_verb_that_asks() {
+        let e = spec_of(&recipe_with(vast_kind())).expect_err("must refuse");
+        let msg = e.to_string();
+        assert!(msg.contains("--yes"), "{msg}");
+        assert!(msg.contains("recipe run"), "{msg}");
+    }
+
+    #[test]
+    fn a_local_recipe_becomes_the_spec_it_launches() {
+        let spec = spec_of(&recipe_with(vllm_kind())).expect("spec");
+        assert!(matches!(spec, EndpointSpec::LocalVllm(_)));
+    }
+
+    #[test]
+    fn a_swap_from_nothing_renders_as_nothing_rather_than_a_blank_column() {
+        let report = SwapReport {
+            alias: Alias::parse("auto").expect("alias"),
+            mode: SwapMode::Sequential,
+            from: None,
+            to: BackendId::parse("local-carnice").expect("id"),
+            parked: 0,
+            drained_ms: 0,
+            total_ms: 12,
+        };
+        let from = report
+            .from
+            .as_ref()
+            .map(|b| b.as_str().to_string())
+            .unwrap_or_else(|| "(nothing)".to_string());
+        assert_eq!(from, "(nothing)");
+        assert_eq!(render::variant(&report.mode), "sequential");
+    }
+}

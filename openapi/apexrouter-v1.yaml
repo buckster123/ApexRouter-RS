@@ -1,0 +1,3280 @@
+openapi: 3.1.0
+info:
+  title: ApexRouter-RS
+  version: 0.1.0
+  summary: One local router in front of every OpenAI-compatible endpoint you can reach.
+  description: >-
+    The machine-readable form of ARCHITECTURE.md section 6. Two listeners: the proxy plane
+    (the OpenAI/Anthropic drop-in surface) and the control plane (rig, fit, routes, endpoints,
+    providers, vast, hf, jobs). Every operation carries an `x-listener` extension naming which
+    listener serves it; `/health` is the only path served by both. Prose lives in docs/API.md;
+    routing semantics live in docs/ROUTING.md. This file is diffed against the axum route table
+    by crates/apexrouter-server/tests/openapi_routes.rs on every CI run.
+  license:
+    name: MIT OR Apache-2.0
+    identifier: MIT OR Apache-2.0
+  contact:
+    name: ApexRouter-RS
+    url: https://github.com/buckster123/ApexRouter-RS
+
+servers:
+  - url: http://127.0.0.1:8888
+    description: 'proxy listener. `http://127.0.0.1:8888/v1` is equally valid: a doubled leading /v1 is collapsed.'
+  - url: http://127.0.0.1:2739
+    description: control listener.
+
+tags:
+  - name: proxy
+    description: The drop-in contract. OpenAI dialect by default, Anthropic ingress on /v1/messages.
+  - name: compat
+    description: LocalRouter-shaped routes kept byte-compatible on purpose.
+  - name: control
+    description: Daemon lifecycle, snapshot, websocket, metrics.
+  - name: rig
+    description: GPUs, llama.cpp builds, local GGUFs, and the fit solver.
+  - name: backends
+    description: Live upstreams in the routing table.
+  - name: routes
+    description: Aliases, strategies, filters, swap.
+  - name: endpoints
+    description: Things ApexRouter can start and stop.
+  - name: catalog
+    description: Recipes and Vast search profiles.
+  - name: providers
+    description: Managed providers and their credential sources.
+  - name: vast
+    description: The rented fleet. Every mutating path is gated behind SpendApproval.
+  - name: hf
+    description: Hugging Face search and downloads.
+  - name: observability
+    description: Requests, usage, compare, smoke, diagnose, jobs, migrate.
+
+security:
+  - bearerAuth: []
+  - tokenHeader: []
+  - tokenQuery: []
+
+paths:
+
+  # =====================================================================================
+  # proxy listener
+  # =====================================================================================
+
+  /v1/chat/completions:
+    post:
+      operationId: chatCompletions
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Routed chat completion, streaming or buffered.
+      description: >-
+        Relayed byte-for-byte unless the alias differs from the upstream model id, in which case
+        exactly one JSON key is rewritten. Never re-framed on a stream.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChatCompletionRequest' }
+      responses:
+        '200':
+          description: The upstream body, verbatim. `text/event-stream` when the upstream streamed.
+          headers:
+            X-ApexRouter-Route: { $ref: '#/components/headers/XApexRouterRoute' }
+            X-ApexRouter-Backend: { $ref: '#/components/headers/XApexRouterBackend' }
+            X-ApexRouter-Attempts: { $ref: '#/components/headers/XApexRouterAttempts' }
+            X-ApexRouter-Fallback: { $ref: '#/components/headers/XApexRouterFallback' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChatCompletionResponse' }
+            text/event-stream:
+              schema: { type: string }
+        '404': { $ref: '#/components/responses/OpenAiError' }
+        '413': { $ref: '#/components/responses/OpenAiError' }
+        '502': { $ref: '#/components/responses/OpenAiError' }
+        '503': { $ref: '#/components/responses/OpenAiError' }
+        '504': { $ref: '#/components/responses/OpenAiError' }
+        '508': { $ref: '#/components/responses/OpenAiError' }
+
+  /v1/completions:
+    post:
+      operationId: completions
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Routed legacy text completion.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompletionRequest' }
+      responses:
+        '200':
+          description: The upstream body, verbatim.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+            text/event-stream: { schema: { type: string } }
+        '404': { $ref: '#/components/responses/OpenAiError' }
+        '503': { $ref: '#/components/responses/OpenAiError' }
+
+  /v1/embeddings:
+    post:
+      operationId: embeddings
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Routed embeddings. Only embedding-capable backends are candidates.
+      description: Request class `Embedding`; a chat-only llama-server can never be selected here.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmbeddingsRequest' }
+      responses:
+        '200':
+          description: The upstream body, verbatim.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        '503': { $ref: '#/components/responses/OpenAiError' }
+
+  /v1/rerank:
+    post:
+      operationId: rerank
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Routed rerank, if the resolved target supports it.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RerankRequest' }
+      responses:
+        '200':
+          description: The upstream body, verbatim.
+          content:
+            application/json: { schema: { type: object, additionalProperties: true } }
+        '503': { $ref: '#/components/responses/OpenAiError' }
+
+  /v1/messages:
+    post:
+      operationId: anthropicMessages
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Anthropic ingress. Translated to an OpenAI upstream, relayed to an Anthropic one.
+      description: >-
+        Requires `anthropic-version: 2023-06-01`. `x-api-key` is accepted for auth and never
+        forwarded, and neither is `anthropic-version`. Routed by the same resolve() as every other
+        path. 501 when [router] anthropic_ingress = false. With [router] anthropic_tools = false a
+        body carrying `tools` is a 400 naming the config key, with zero upstream hops.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AnthropicVersion'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AnthropicMessagesRequest' }
+      responses:
+        '200':
+          description: An Anthropic Message, or the named-event SSE stream.
+          headers:
+            X-ApexRouter-Protocol: { $ref: '#/components/headers/XApexRouterProtocol' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnthropicMessage' }
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/AnthropicError' }
+        '501': { $ref: '#/components/responses/AnthropicError' }
+
+  /v1/messages/count_tokens:
+    post:
+      operationId: anthropicCountTokens
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Not implemented in mk1. Always 501, Anthropic-shaped.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json: { schema: { type: object, additionalProperties: true } }
+      responses:
+        '501': { $ref: '#/components/responses/AnthropicError' }
+
+  /v1/models:
+    get:
+      operationId: listModels
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Aggregated model list across aliases and every enabled backend.
+      description: >-
+        Served from the routing table; no backend is probed. The OpenAI list shape is the default
+        and stays byte-exact, because ApexOS's LAN compute sweep identifies a node by it. The
+        Anthropic list shape is emitted only when the request carries an `anthropic-version` header.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/AnthropicVersionOptional'
+      responses:
+        '200':
+          description: OpenAI list shape, or the Anthropic list shape when the header is present.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/ModelList'
+                  - $ref: '#/components/schemas/AnthropicModelList'
+
+  /v1/models/{id}:
+    get:
+      operationId: getModel
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: One model entry, by alias or by `backend/model`.
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: An alias, or `<backend_id>/<upstream_model>`.
+          schema: { type: string }
+        - $ref: '#/components/parameters/AnthropicVersionOptional'
+      responses:
+        '200':
+          description: One entry, in whichever dialect the header selected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelEntry' }
+        '404': { $ref: '#/components/responses/OpenAiError' }
+
+  /health:
+    get:
+      operationId: health
+      x-listener: [proxy, control]
+      tags: [compat, control]
+      summary: Liveness. Always 200, never probes a backend.
+      description: >-
+        Served by both listeners. The proxy listener returns the superset shape (with `provider`);
+        the control listener returns {ok, product, version, uptime}. Public on both.
+      security: []
+      responses:
+        '200':
+          description: A superset of the LocalRouter shape and of the house shape.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+    head:
+      operationId: healthHead
+      x-listener: [proxy, control]
+      tags: [compat, control]
+      summary: Liveness, headers only.
+      security: []
+      responses:
+        '200':
+          description: No body.
+
+  /providers:
+    get:
+      operationId: legacyProviders
+      x-listener: [proxy]
+      tags: [compat]
+      summary: The exact LocalRouter provider shape, plus additive endpoints[] and routes[].
+      description: >-
+        Probes run concurrently with a 3 s cap, and Together is detected from the full credential
+        chain rather than from $TOGETHER_API_KEY alone.
+      security: []
+      responses:
+        '200':
+          description: The legacy shape, with additive keys a legacy client ignores.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegacyProviders' }
+    head:
+      operationId: legacyProvidersHead
+      x-listener: [proxy]
+      tags: [compat]
+      summary: The provider probe, headers only.
+      security: []
+      responses:
+        '200':
+          description: No body.
+
+  /switch:
+    post:
+      operationId: legacySwitch
+      x-listener: [proxy]
+      tags: [compat]
+      summary: Retarget default_alias. LocalRouter's request and response shapes, extended.
+      description: >-
+        Gated by the mutation gate (ARCHITECTURE.md section 9.3), and any supplied base_url is
+        validated against [compat] allow_switch_hosts. Three LocalRouter silent no-ops are fixed
+        here: an `api_key` in a together body is persisted as a CredentialRef, `local` copies the
+        instance's key, and a malformed instance JSON returns a JSON 400 rather than an HTML 500.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SwitchRequest' }
+      responses:
+        '200':
+          description: Switched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SwitchAck' }
+        '400':
+          description: Malformed body, unknown instance, or a host outside allow_switch_hosts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegacyError' }
+        '403':
+          description: The mutation gate refused a cross-origin call.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LegacyError' }
+
+  /slots:
+    get:
+      operationId: slotsRedacted
+      x-listener: [proxy]
+      tags: [proxy]
+      summary: Always 403. /slots echoes prompt text and is never proxied outward.
+      description: >-
+        llama.cpp's /slots is read internally for semaphore sizing and the live slot counter; it
+        just never leaves the process.
+      security: []
+      responses:
+        '403': { $ref: '#/components/responses/OpenAiError' }
+
+  # =====================================================================================
+  # control listener: lifecycle
+  # =====================================================================================
+
+  /ws:
+    get:
+      operationId: websocket
+      x-listener: [control]
+      tags: [control]
+      summary: WebSocket. A full Snapshot first, then the Event stream.
+      description: >-
+        The broadcast is subscribed before the snapshot is sent, a full snapshot is re-sent on
+        RecvError::Lagged, and request_started/request_finished are only serialised when at least
+        one subscriber exists. usage_tick is coalesced to 1 Hz.
+      responses:
+        '101':
+          description: Switching protocols. Frames are Event, tagged by `type`.
+
+  /metrics:
+    get:
+      operationId: metrics
+      x-listener: [control]
+      tags: [control]
+      summary: Prometheus text exposition.
+      responses:
+        '200':
+          description: 'apexrouter_requests_total, _ttft_seconds, _tokens_total, _tokens_per_second, _backend_up, _inflight, _queue_depth, _cost_usd_total, _vram_free_mb.'
+          content:
+            text/plain: { schema: { type: string } }
+
+  /v1/snapshot:
+    get:
+      operationId: getSnapshot
+      x-listener: [control]
+      tags: [control]
+      summary: The full picture, in one call.
+      responses:
+        '200':
+          description: Everything both GUIs and `apexrouter status` render.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Snapshot' }
+
+  /v1/reload:
+    post:
+      operationId: reload
+      x-listener: [control]
+      tags: [control]
+      summary: Reparse config and routes. Keeps the old table on failure.
+      responses:
+        '200':
+          description: What the reparse found. `ok:false` means the previous table is still serving.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationReport' }
+
+  /v1/shutdown:
+    post:
+      operationId: shutdown
+      x-listener: [control]
+      tags: [control]
+      summary: Graceful shutdown. Admin scope.
+      responses:
+        '200':
+          description: Accepted. Children outlive the manager unless kill_children_on_exit is set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShutdownAck' }
+        '403': { $ref: '#/components/responses/ControlError' }
+
+  # =====================================================================================
+  # control listener: rig, discovery, fit
+  # =====================================================================================
+
+  /v1/rig:
+    get:
+      operationId: getRig
+      x-listener: [control]
+      tags: [rig]
+      summary: GPUs, builds, RAM, swap. The cached enumeration with live reservations folded in.
+      responses:
+        '200':
+          description: One Gpu per backend ENUMERATION, not per piece of silicon.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RigSnapshot' }
+
+  /v1/rig/rescan:
+    post:
+      operationId: rescanRig
+      x-listener: [control]
+      tags: [rig]
+      summary: Force the scan the 300 s cache would otherwise have served.
+      parameters:
+        - name: builds
+          in: query
+          required: false
+          description: Re-enumerate builds and devices. Defaults to true.
+          schema: { type: boolean }
+        - name: models
+          in: query
+          required: false
+          description: Re-walk the model roots. Defaults to true.
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: The fresh snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RigSnapshot' }
+
+  /v1/models/local:
+    get:
+      operationId: listLocalModels
+      x-listener: [control]
+      tags: [rig]
+      summary: Discovered GGUFs, with shards grouped into one logical model.
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: Skip the cache and walk the roots again.
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Every local model found under [endpoints] model_roots.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/LocalModel' }
+
+  /v1/fit:
+    get:
+      operationId: fitQuery
+      x-listener: [control]
+      tags: [rig]
+      summary: Solve a launch plan against the LIVE per-backend VRAM budget.
+      description: >-
+        The budget is per backend and never a sum across backends. `build` selects the backend, and
+        therefore which of a card's several enumerations the budget is over. Anything dropped lands
+        in FitPlan.why, because a fallback is a visible value.
+      parameters:
+        - name: model
+          in: query
+          required: true
+          description: Model id, display name, or the path of a shard.
+          schema: { type: string }
+        - name: ctx
+          in: query
+          required: false
+          description: TOTAL context pool, shared across `parallel` slots. Omit to make the solver search.
+          schema: { type: integer, format: int64 }
+        - name: parallel
+          in: query
+          required: false
+          description: Slot count (-np).
+          schema: { type: integer, format: int64 }
+        - name: kv
+          in: query
+          required: false
+          description: KV element type, spelled exactly as the -ctk/-ctv flag value.
+          schema: { $ref: '#/components/schemas/KvType' }
+        - name: devices
+          in: query
+          required: false
+          description: Comma-separated -dev tokens. Empty selects every non-software GPU of the scoped backend.
+          schema: { type: string }
+        - name: build
+          in: query
+          required: false
+          description: The build this would launch with, e.g. build-vulkan.
+          schema: { type: string }
+        - name: split_mode
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/SplitMode' }
+        - name: tensor_split
+          in: query
+          required: false
+          description: Comma-separated proportions, one per selected device.
+          schema: { type: string }
+        - name: main_gpu
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: The plan, with every derived number explained in `why`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FitPlan' }
+        '400': { $ref: '#/components/responses/ControlError' }
+    post:
+      operationId: fitBody
+      x-listener: [control]
+      tags: [rig]
+      summary: The pure form. You supply the budget; nothing is read from the machine.
+      description: >-
+        A caller-supplied budget mixing device tokens of two backends is not added up: the largest
+        single-backend group wins and a WARNING line says so. An ambiguous budget resolves downwards,
+        because over-optimism is the direction that OOMs a spawn.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FitInput' }
+      responses:
+        '200':
+          description: The plan.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FitPlan' }
+
+  /v1/fit/input:
+    post:
+      operationId: fitInputFor
+      x-listener: [control]
+      tags: [rig]
+      summary: Resolve a fit query into the FitInput the machine would have used, without solving.
+      description: >-
+        The bridge between GET /v1/fit and POST /v1/fit. A GUI calls this to show what is about to
+        be solved over before the user touches a slider.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FitQuery' }
+      responses:
+        '200':
+          description: The live budget, the parsed GGUF header, and the summed shard bytes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FitInput' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  # =====================================================================================
+  # control listener: backends
+  # =====================================================================================
+
+  /v1/backends:
+    get:
+      operationId: listBackends
+      x-listener: [control]
+      tags: [backends]
+      summary: Every live backend, from the registry rather than from disk.
+      responses:
+        '200':
+          description: The registry snapshot.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Backend' }
+    post:
+      operationId: registerBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: Register a URL something else is running. No lifecycle is taken over.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NodeSpec' }
+      responses:
+        '200':
+          description: The registered backend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Backend' }
+        '400': { $ref: '#/components/responses/ControlError' }
+
+  /v1/backends/{id}:
+    get:
+      operationId: getBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: One backend.
+      parameters: [{ $ref: '#/components/parameters/BackendId' }]
+      responses:
+        '200':
+          description: The backend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Backend' }
+        '404': { $ref: '#/components/responses/ControlError' }
+    patch:
+      operationId: patchBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: Tags, label, limits, enabled. Every field optional; absent means unchanged.
+      parameters: [{ $ref: '#/components/parameters/BackendId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BackendPatch' }
+      responses:
+        '200':
+          description: The updated backend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Backend' }
+        '404': { $ref: '#/components/responses/ControlError' }
+    delete:
+      operationId: deleteBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: Forget a backend.
+      parameters: [{ $ref: '#/components/parameters/BackendId' }]
+      responses:
+        '204':
+          description: Gone.
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/backends/{id}/probe:
+    post:
+      operationId: probeBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: Probe now, out of band from the health poller.
+      parameters: [{ $ref: '#/components/parameters/BackendId' }]
+      responses:
+        '200':
+          description: The backend, with fresh health.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Backend' }
+
+  /v1/backends/{id}/enable:
+    post:
+      operationId: enableBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: Put it back in the table.
+      parameters: [{ $ref: '#/components/parameters/BackendId' }]
+      responses:
+        '200':
+          description: The backend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Backend' }
+
+  /v1/backends/{id}/disable:
+    post:
+      operationId: disableBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: Take it out of the table without forgetting it.
+      parameters: [{ $ref: '#/components/parameters/BackendId' }]
+      responses:
+        '200':
+          description: The backend.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Backend' }
+
+  /v1/backends/{id}/drain:
+    post:
+      operationId: drainBackend
+      x-listener: [control]
+      tags: [backends]
+      summary: Stop accepting, let in-flight requests finish.
+      parameters: [{ $ref: '#/components/parameters/BackendId' }]
+      responses:
+        '200':
+          description: The backend, now Health::Draining.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Backend' }
+
+  /v1/backends/{id}/logs:
+    get:
+      operationId: backendLogs
+      x-listener: [control]
+      tags: [backends]
+      summary: Tail, or follow as SSE.
+      parameters:
+        - $ref: '#/components/parameters/BackendId'
+        - name: tail
+          in: query
+          required: false
+          description: How many lines. Defaults to 200.
+          schema: { type: integer, format: int64 }
+        - name: follow
+          in: query
+          required: false
+          description: '`1` streams new lines as SSE instead of returning text.'
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Plain text, or an SSE stream of log_line events.
+          content:
+            text/plain: { schema: { type: string } }
+            text/event-stream: { schema: { type: string } }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  # =====================================================================================
+  # control listener: routes
+  # =====================================================================================
+
+  /v1/routes:
+    get:
+      operationId: listRoutes
+      x-listener: [control]
+      tags: [routes]
+      summary: The table on disk, which is the table serving unless a compile failed.
+      responses:
+        '200':
+          description: Every route.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ModelRoute' }
+    put:
+      operationId: putRoutes
+      x-listener: [control]
+      tags: [routes]
+      summary: Replace the whole table, atomically.
+      description: >-
+        Compiles before it persists. A table that does not compile never reaches disk and never
+        displaces the one that is serving.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/ModelRoute' }
+      responses:
+        '200':
+          description: Applied.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ModelRoute' }
+        '400':
+          description: The table did not compile. The running table is untouched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationReport' }
+
+  /v1/routes/validate:
+    post:
+      operationId: validateRoutes
+      x-listener: [control]
+      tags: [routes]
+      summary: Compile a candidate table without touching the live one.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: '#/components/schemas/ModelRoute' }
+      responses:
+        '200':
+          description: Everything found, in the order found.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationReport' }
+
+  /v1/routes/default:
+    post:
+      operationId: setDefaultRoute
+      x-listener: [control]
+      tags: [routes]
+      summary: Set the alias unknown and legacy model names fall through to.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetDefault' }
+      responses:
+        '200':
+          description: Set.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ModelRoute' }
+        '400': { $ref: '#/components/responses/ControlError' }
+
+  /v1/routes/{alias}:
+    get:
+      operationId: getRoute
+      x-listener: [control]
+      tags: [routes]
+      summary: One route.
+      parameters: [{ $ref: '#/components/parameters/Alias' }]
+      responses:
+        '200':
+          description: The route.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRoute' }
+        '404': { $ref: '#/components/responses/ControlError' }
+    put:
+      operationId: putRoute
+      x-listener: [control]
+      tags: [routes]
+      summary: Upsert one route. `alias` is forced to the path segment.
+      parameters: [{ $ref: '#/components/parameters/Alias' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelRoute' }
+      responses:
+        '200':
+          description: Applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRoute' }
+        '400':
+          description: The resulting table did not compile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationReport' }
+    delete:
+      operationId: deleteRoute
+      x-listener: [control]
+      tags: [routes]
+      summary: Remove one route.
+      parameters: [{ $ref: '#/components/parameters/Alias' }]
+      responses:
+        '204':
+          description: Gone.
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/routes/{alias}/test:
+    post:
+      operationId: testRoute
+      x-listener: [control]
+      tags: [routes]
+      summary: A 20-token probe through the resolved route, using the resolved model id.
+      parameters: [{ $ref: '#/components/parameters/Alias' }]
+      responses:
+        '200':
+          description: One probe result.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SmokeProbe' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/routes/{alias}/swap:
+    post:
+      operationId: swapRoute
+      x-listener: [control]
+      tags: [routes]
+      summary: One verb; hot or sequential is chosen by fit() unless overridden.
+      parameters: [{ $ref: '#/components/parameters/Alias' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SwapRequest' }
+      responses:
+        '200':
+          description: What the swap actually did.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SwapReport' }
+        '404': { $ref: '#/components/responses/ControlError' }
+        '409': { $ref: '#/components/responses/ControlError' }
+
+  # =====================================================================================
+  # control listener: endpoints
+  # =====================================================================================
+
+  /v1/endpoints:
+    get:
+      operationId: listEndpoints
+      x-listener: [control]
+      tags: [endpoints]
+      summary: Every persisted endpoint record. There is deliberately no `status` field.
+      responses:
+        '200':
+          description: Facts only. Expectation IS state, and is a fact.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/EndpointRecord' }
+    post:
+      operationId: createEndpoint
+      x-listener: [control]
+      tags: [endpoints]
+      summary: Start something.
+      parameters:
+        - $ref: '#/components/parameters/NoWait'
+        - name: alias
+          in: query
+          required: false
+          description: Bind this alias to the endpoint once it is Ready.
+          schema: { type: string }
+        - name: force
+          in: query
+          required: false
+          description: Skip the VRAM admission refusal, and only that one.
+          schema: { type: boolean }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EndpointSpec' }
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointRecord' }
+        '202':
+          description: Accepted; poll the job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '409': { $ref: '#/components/responses/ControlError' }
+
+  /v1/endpoints/{id}:
+    get:
+      operationId: getEndpoint
+      x-listener: [control]
+      tags: [endpoints]
+      summary: One endpoint record.
+      parameters: [{ $ref: '#/components/parameters/EndpointId' }]
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointRecord' }
+        '404': { $ref: '#/components/responses/ControlError' }
+    delete:
+      operationId: deleteEndpoint
+      x-listener: [control]
+      tags: [endpoints]
+      summary: Stop and forget.
+      parameters: [{ $ref: '#/components/parameters/EndpointId' }]
+      responses:
+        '204':
+          description: Gone.
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/endpoints/{id}/stop:
+    post:
+      operationId: stopEndpoint
+      x-listener: [control]
+      tags: [endpoints]
+      summary: desired = Stopped.
+      parameters: [{ $ref: '#/components/parameters/EndpointId' }]
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointRecord' }
+
+  /v1/endpoints/{id}/restart:
+    post:
+      operationId: restartEndpoint
+      x-listener: [control]
+      tags: [endpoints]
+      summary: Stop, then start with the same spec.
+      parameters: [{ $ref: '#/components/parameters/EndpointId' }]
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointRecord' }
+
+  /v1/endpoints/{id}/adopt:
+    post:
+      operationId: adoptEndpoint
+      x-listener: [control]
+      tags: [endpoints]
+      summary: Take ownership of a running process whose identity matches.
+      description: >-
+        Requires /props (or /v1/models) to match the spec's model path, and records adopted:true.
+        A process identified as Foreign is never signalled.
+      parameters: [{ $ref: '#/components/parameters/EndpointId' }]
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EndpointRecord' }
+        '409': { $ref: '#/components/responses/ControlError' }
+
+  /v1/endpoints/{id}/argv:
+    get:
+      operationId: endpointArgv
+      x-listener: [control]
+      tags: [endpoints]
+      summary: Exactly what would be exec'd. No credential ever appears here.
+      parameters: [{ $ref: '#/components/parameters/EndpointId' }]
+      responses:
+        '200':
+          description: An argv vector; there is no `sh -c` anywhere in the codebase.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArgvPreview' }
+
+  # =====================================================================================
+  # control listener: recipes and profiles
+  # =====================================================================================
+
+  /v1/recipes:
+    get:
+      operationId: listRecipes
+      x-listener: [control]
+      tags: [catalog]
+      summary: Saved discovery results, with provenance so staleness is detectable.
+      responses:
+        '200':
+          description: Every recipe.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Recipe' }
+    post:
+      operationId: createRecipe
+      x-listener: [control]
+      tags: [catalog]
+      summary: Save a recipe.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Recipe' }
+      responses:
+        '200':
+          description: The stored recipe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+
+  /v1/recipes/from-endpoint/{id}:
+    post:
+      operationId: recipeFromEndpoint
+      x-listener: [control]
+      tags: [catalog]
+      summary: Save this running thing as a recipe.
+      parameters:
+        - $ref: '#/components/parameters/EndpointId'
+        - name: label
+          in: query
+          required: false
+          description: Human label for the new recipe. Defaults to the endpoint id.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The new recipe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/recipes/{id}:
+    get:
+      operationId: getRecipe
+      x-listener: [control]
+      tags: [catalog]
+      summary: One recipe.
+      parameters: [{ $ref: '#/components/parameters/RecipeId' }]
+      responses:
+        '200':
+          description: The recipe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+        '404': { $ref: '#/components/responses/ControlError' }
+    put:
+      operationId: putRecipe
+      x-listener: [control]
+      tags: [catalog]
+      summary: Upsert. `id` is forced to the path segment.
+      parameters: [{ $ref: '#/components/parameters/RecipeId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Recipe' }
+      responses:
+        '200':
+          description: The stored recipe.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Recipe' }
+    delete:
+      operationId: deleteRecipe
+      x-listener: [control]
+      tags: [catalog]
+      summary: Forget a recipe.
+      parameters: [{ $ref: '#/components/parameters/RecipeId' }]
+      responses:
+        '204':
+          description: Gone.
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/recipes/{id}/validate:
+    post:
+      operationId: validateRecipe
+      x-listener: [control]
+      tags: [catalog]
+      summary: Check a recipe against the machine. Staleness is a warning, never an error.
+      parameters: [{ $ref: '#/components/parameters/RecipeId' }]
+      responses:
+        '200':
+          description: The report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ValidationReport' }
+
+  /v1/recipes/{id}/instantiate:
+    post:
+      operationId: instantiateRecipe
+      x-listener: [control]
+      tags: [catalog]
+      summary: Start what the recipe describes.
+      parameters:
+        - $ref: '#/components/parameters/RecipeId'
+        - name: alias
+          in: query
+          required: false
+          description: Bind this alias to whatever comes up.
+          schema: { type: string }
+        - $ref: '#/components/parameters/NoWait'
+        - name: force
+          in: query
+          required: false
+          description: Skip the VRAM admission refusal, and nothing else.
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: An EndpointRecord, or a JobRecord under no_wait.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/EndpointRecord'
+                  - $ref: '#/components/schemas/JobRecord'
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/profiles:
+    get:
+      operationId: listProfiles
+      x-listener: [control]
+      tags: [catalog]
+      summary: Query templates over the live Vast market, not fixed tiers.
+      responses:
+        '200':
+          description: Every profile.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/SearchProfile' }
+    post:
+      operationId: createProfile
+      x-listener: [control]
+      tags: [catalog]
+      summary: Save a search profile.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchProfile' }
+      responses:
+        '200':
+          description: The stored profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchProfile' }
+
+  /v1/profiles/{id}:
+    get:
+      operationId: getProfile
+      x-listener: [control]
+      tags: [catalog]
+      summary: One profile.
+      parameters: [{ $ref: '#/components/parameters/ProfileId' }]
+      responses:
+        '200':
+          description: The profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchProfile' }
+        '404': { $ref: '#/components/responses/ControlError' }
+    put:
+      operationId: putProfile
+      x-listener: [control]
+      tags: [catalog]
+      summary: Upsert. `id` is forced to the path segment.
+      parameters: [{ $ref: '#/components/parameters/ProfileId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SearchProfile' }
+      responses:
+        '200':
+          description: The stored profile.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchProfile' }
+    delete:
+      operationId: deleteProfile
+      x-listener: [control]
+      tags: [catalog]
+      summary: Forget a profile.
+      parameters: [{ $ref: '#/components/parameters/ProfileId' }]
+      responses:
+        '204':
+          description: Gone.
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  # =====================================================================================
+  # control listener: providers
+  # =====================================================================================
+
+  /v1/providers:
+    get:
+      operationId: listProviders
+      x-listener: [control]
+      tags: [providers]
+      summary: Every configured provider, its credential SOURCE, and what we last saw.
+      description: Never the key, and never a probe.
+      responses:
+        '200':
+          description: Provider status rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ProviderStatus' }
+
+  /v1/providers/{id}:
+    get:
+      operationId: getProvider
+      x-listener: [control]
+      tags: [providers]
+      summary: One provider's status.
+      parameters: [{ $ref: '#/components/parameters/ProviderId' }]
+      responses:
+        '200':
+          description: The status row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderStatus' }
+        '404': { $ref: '#/components/responses/ControlError' }
+    put:
+      operationId: putProvider
+      x-listener: [control]
+      tags: [providers]
+      summary: Set base_url and exactly one credential form.
+      description: >-
+        A key the user typed goes to credentials.toml at 0600, never to config.toml. api_key_env and
+        api_key_file are references; nothing is copied.
+      parameters: [{ $ref: '#/components/parameters/ProviderId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProviderPut' }
+      responses:
+        '200':
+          description: The updated status row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProviderStatus' }
+        '400': { $ref: '#/components/responses/ControlError' }
+
+  /v1/providers/{id}/test:
+    post:
+      operationId: testProvider
+      x-listener: [control]
+      tags: [providers]
+      summary: Connection probe, plus an optional 16-token completion.
+      description: >-
+        `model` defaults to the first model the connection probe listed, never the hardcoded "x"
+        that 400s on a managed provider.
+      parameters:
+        - $ref: '#/components/parameters/ProviderId'
+        - name: completion
+          in: query
+          required: false
+          description: Also send a 16-token completion, not just a connection probe.
+          schema: { type: integer, format: int64 }
+        - name: model
+          in: query
+          required: false
+          description: Which model the completion should name.
+          schema: { type: string }
+      responses:
+        '200':
+          description: One row per probe.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CheckResult' }
+
+  /v1/providers/{id}/models:
+    get:
+      operationId: providerModels
+      x-listener: [control]
+      tags: [providers]
+      summary: The live catalogue, grouped by org.
+      parameters: [{ $ref: '#/components/parameters/ProviderId' }]
+      responses:
+        '200':
+          description: Upstream models.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/UpstreamModel' }
+        '503': { $ref: '#/components/responses/ControlError' }
+
+  # =====================================================================================
+  # control listener: vast
+  # =====================================================================================
+
+  /v1/vast/account:
+    get:
+      operationId: vastAccount
+      x-listener: [control]
+      tags: [vast]
+      summary: Credit, balance, can_pay. This type has no api_key field.
+      responses:
+        '200':
+          description: The account, minus anything secret.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VastAccount' }
+
+  /v1/vast/gpu-names:
+    get:
+      operationId: vastGpuNames
+      x-listener: [control]
+      tags: [vast]
+      summary: The LIVE vocabulary for the dropdown, read from the market.
+      responses:
+        '200':
+          description: GPU names.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+
+  /v1/vast/offers/search:
+    post:
+      operationId: vastSearchOffers
+      x-listener: [control]
+      tags: [vast]
+      summary: Search the market. Read-only; spends nothing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OfferQuery' }
+      responses:
+        '200':
+          description: Offers, ranked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OfferSearchResult' }
+
+  /v1/vast/instances:
+    get:
+      operationId: vastListInstances
+      x-listener: [control]
+      tags: [vast]
+      summary: The rented fleet.
+      responses:
+        '200':
+          description: Live instances.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/VastInstance' }
+    post:
+      operationId: vastRent
+      x-listener: [control]
+      tags: [vast]
+      summary: Rent. 409 without an explicit, bounded SpendApproval.
+      description: >-
+        Returns 409 without {confirm:true, max_usd_per_hour}; the 409 body carries the cost preview
+        and the current credit. max_usd_per_hour can never exceed the daemon-side ceiling in
+        [providers.vast] max_usd_per_hour_ceiling.
+      parameters: [{ $ref: '#/components/parameters/NoWait' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RentRequest' }
+      responses:
+        '202':
+          description: Accepted; poll the job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '409':
+          description: Approval required. Nothing was spent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /v1/vast/instances/{id}:
+    delete:
+      operationId: vastDestroyInstance
+      x-listener: [control]
+      tags: [vast]
+      summary: Destroy an instance. Requires ?confirm=true.
+      parameters:
+        - $ref: '#/components/parameters/InstanceId'
+        - name: confirm
+          in: query
+          required: true
+          description: Must be true. Destroying is irreversible.
+          schema: { type: boolean }
+      responses:
+        '204':
+          description: Destroyed.
+        '409': { $ref: '#/components/responses/ControlError' }
+
+  /v1/vast/instances/{id}/log:
+    get:
+      operationId: vastInstanceLog
+      x-listener: [control]
+      tags: [vast]
+      summary: The boot log, tailed or followed as SSE.
+      parameters:
+        - $ref: '#/components/parameters/InstanceId'
+        - name: follow
+          in: query
+          required: false
+          description: '`1` streams as SSE.'
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Text, or an SSE stream.
+          content:
+            text/plain: { schema: { type: string } }
+            text/event-stream: { schema: { type: string } }
+
+  /v1/vast/instances/{id}/restart-download:
+    post:
+      operationId: vastRestartDownload
+      x-listener: [control]
+      tags: [vast]
+      summary: The stall recovery. Restarts a wedged model download in place, then re-samples.
+      parameters: [{ $ref: '#/components/parameters/InstanceId' }]
+      responses:
+        '200':
+          description: Restarted. HOST=127.0.0.1 is re-forced on every stall-restart.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DownloadHealth' }
+
+  /v1/vast/instances/{id}/tunnel:
+    post:
+      operationId: vastTunnelUp
+      x-listener: [control]
+      tags: [vast]
+      summary: Bring up a supervised SSH tunnel to the instance.
+      parameters: [{ $ref: '#/components/parameters/InstanceId' }]
+      responses:
+        '200':
+          description: The tunnel.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TunnelStatus' }
+    delete:
+      operationId: vastTunnelDown
+      x-listener: [control]
+      tags: [vast]
+      summary: Tear the tunnel down. Returns the tunnels that remain.
+      parameters: [{ $ref: '#/components/parameters/InstanceId' }]
+      responses:
+        '200':
+          description: The remaining tunnels, so a UI needs no second call to refresh.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TunnelStatus' }
+
+  /v1/vast/instances/{id}/diagnose:
+    get:
+      operationId: vastDiagnoseInstance
+      x-listener: [control]
+      tags: [vast]
+      summary: The four SSH probes plus an RX sample.
+      parameters: [{ $ref: '#/components/parameters/InstanceId' }]
+      responses:
+        '200':
+          description: One row per probe.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CheckResult' }
+
+  /v1/tunnels:
+    get:
+      operationId: listTunnels
+      x-listener: [control]
+      tags: [vast]
+      summary: Every supervised tunnel. pid + identity, so a restart re-adopts.
+      responses:
+        '200':
+          description: Tunnel rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TunnelStatus' }
+
+  /v1/approvals:
+    get:
+      operationId: listApprovals
+      x-listener: [control]
+      tags: [vast]
+      summary: Pending human confirmations.
+      description: Only populated when [providers.vast] require_human_confirm = true.
+      responses:
+        '200':
+          description: Approval rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ApprovalRequest' }
+
+  /v1/approvals/{id}/grant:
+    post:
+      operationId: grantApproval
+      x-listener: [control]
+      tags: [vast]
+      summary: Grant a pending spend approval.
+      parameters: [{ $ref: '#/components/parameters/ApprovalId' }]
+      responses:
+        '200':
+          description: The approval, now granted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalRequest' }
+
+  /v1/approvals/{id}/deny:
+    post:
+      operationId: denyApproval
+      x-listener: [control]
+      tags: [vast]
+      summary: Deny a pending spend approval.
+      parameters: [{ $ref: '#/components/parameters/ApprovalId' }]
+      responses:
+        '200':
+          description: The approval, now denied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApprovalRequest' }
+
+  # =====================================================================================
+  # control listener: hugging face
+  # =====================================================================================
+
+  /v1/hf/search:
+    get:
+      operationId: hfSearch
+      x-listener: [control]
+      tags: [hf]
+      summary: GGUF repos, newest and most-downloaded first.
+      parameters:
+        - name: q
+          in: query
+          required: false
+          description: The search string. Empty is allowed.
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          description: Row cap, defaulted and hard-capped.
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Matching repos.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/HfModel' }
+
+  /v1/hf/models/{repo}/files:
+    get:
+      operationId: hfRepoFiles
+      x-listener: [control]
+      tags: [hf]
+      x-axum-route: /v1/hf/models/{*rest}
+      summary: Authoritative per-file sizes from paths-info, grouped by quant.
+      description: >-
+        `repo` contains a slash, so axum registers this as the wildcard `/v1/hf/models/{*rest}` and
+        the handler splits the trailing `/files` itself.
+      parameters:
+        - name: repo
+          in: path
+          required: true
+          description: 'e.g. unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'
+          schema: { type: string }
+      responses:
+        '200':
+          description: The same grouping the UI shows, so what downloads is what was clicked.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/HfFileGroup' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/hf/downloads:
+    get:
+      operationId: listHfDownloads
+      x-listener: [control]
+      tags: [hf]
+      summary: Download jobs.
+      responses:
+        '200':
+          description: Job rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/JobRecord' }
+    post:
+      operationId: startHfDownload
+      x-listener: [control]
+      tags: [hf]
+      summary: Download named files, or every shard of a quant.
+      parameters: [{ $ref: '#/components/parameters/NoWait' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HfDownloadRequest' }
+      responses:
+        '202':
+          description: Accepted; poll the job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '400': { $ref: '#/components/responses/ControlError' }
+
+  /v1/hf/downloads/{job}:
+    delete:
+      operationId: cancelHfDownload
+      x-listener: [control]
+      tags: [hf]
+      summary: Cancel a download.
+      parameters:
+        - name: job
+          in: path
+          required: true
+          description: The JobId.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The cancelled job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  # =====================================================================================
+  # control listener: observability
+  # =====================================================================================
+
+  /v1/requests:
+    get:
+      operationId: listRequests
+      x-listener: [control]
+      tags: [observability]
+      summary: The bounded ring of finished requests, newest first.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Defaults to 100, capped at the ring.
+          schema: { type: integer, format: int64 }
+        - name: alias
+          in: query
+          required: false
+          description: Only requests that resolved this alias.
+          schema: { type: string }
+        - name: backend
+          in: query
+          required: false
+          description: Only requests served by this backend.
+          schema: { type: string }
+        - $ref: '#/components/parameters/Since'
+      responses:
+        '200':
+          description: Request records.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/RequestRecord' }
+
+  /v1/requests/{id}:
+    get:
+      operationId: getRequest
+      x-listener: [control]
+      tags: [observability]
+      summary: One request record.
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      responses:
+        '200':
+          description: The record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestRecord' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/requests/{id}/cancel:
+    post:
+      operationId: cancelRequest
+      x-listener: [control]
+      tags: [observability]
+      summary: Abort an in-flight request.
+      parameters: [{ $ref: '#/components/parameters/RequestId' }]
+      responses:
+        '200':
+          description: The record, now aborted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RequestRecord' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/usage:
+    get:
+      operationId: getUsage
+      x-listener: [control]
+      tags: [observability]
+      summary: Aggregate the append-only usage rows over a window.
+      description: >-
+        Money is integer micro-USD, so there is no float dust. [compat] mirror_usage_log defaults to
+        false: rows go to $STATE/usage.jsonl, and appending them to another tool's usage.log is opt-in.
+      parameters:
+        - $ref: '#/components/parameters/Since'
+        - name: by
+          in: query
+          required: false
+          description: How to bucket. Defaults to `provider`, which is what the legacy cost.py printed.
+          schema:
+            type: string
+            enum: [provider, model, backend, alias, day]
+      responses:
+        '200':
+          description: The summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UsageSummary' }
+        '400': { $ref: '#/components/responses/ControlError' }
+
+  /v1/compare:
+    post:
+      operationId: compare
+      x-listener: [control]
+      tags: [observability]
+      summary: The same prompt against N aliases, at the same time.
+      description: Blocking by default, because the answer IS the comparison.
+      parameters: [{ $ref: '#/components/parameters/NoWait' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompareRequest' }
+      responses:
+        '200':
+          description: One row per alias.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/CompareRow' }
+        '202':
+          description: Accepted; the job's result is the same array.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+
+  /v1/smoke:
+    post:
+      operationId: smoke
+      x-listener: [control]
+      tags: [observability]
+      summary: SSE, one event per probe.
+      description: >-
+        Exactly one of alias and base_url is required. An alias is resolved through the live routing
+        table, so the probe uses the resolved route's model id rather than a hardcoded "x".
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SmokeRequest' }
+      responses:
+        '200':
+          description: An SSE stream of check_result events.
+          content:
+            text/event-stream: { schema: { type: string } }
+        '400': { $ref: '#/components/responses/ControlError' }
+
+  /v1/diagnose:
+    get:
+      operationId: diagnose
+      x-listener: [control]
+      tags: [observability]
+      summary: SSE, one event per check.
+      parameters:
+        - name: only
+          in: query
+          required: false
+          description: Comma-separated check ids. Absent runs them all.
+          schema: { type: string }
+      responses:
+        '200':
+          description: An SSE stream. A check that panics yields fail and never poisons the run.
+          content:
+            text/event-stream: { schema: { type: string } }
+
+  /v1/checks:
+    get:
+      operationId: listChecks
+      x-listener: [control]
+      tags: [observability]
+      summary: The check registry.
+      responses:
+        '200':
+          description: Every check id that /v1/diagnose can run.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+
+  /v1/jobs:
+    get:
+      operationId: listJobs
+      x-listener: [control]
+      tags: [observability]
+      summary: Every job. Nothing sits Pending forever.
+      responses:
+        '200':
+          description: Job rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/JobRecord' }
+
+  /v1/jobs/{id}:
+    get:
+      operationId: getJob
+      x-listener: [control]
+      tags: [observability]
+      summary: One job.
+      parameters: [{ $ref: '#/components/parameters/JobId' }]
+      responses:
+        '200':
+          description: The job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/jobs/{id}/cancel:
+    post:
+      operationId: cancelJob
+      x-listener: [control]
+      tags: [observability]
+      summary: Cancel a job.
+      parameters: [{ $ref: '#/components/parameters/JobId' }]
+      responses:
+        '200':
+          description: The job, now cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '404': { $ref: '#/components/responses/ControlError' }
+
+  /v1/migrate:
+    post:
+      operationId: migrate
+      x-listener: [control]
+      tags: [observability]
+      summary: Import ~/.vastai-gguf. dry_run writes nothing.
+      description: >-
+        --apply imports providers as credential REFERENCES; the real Together key is not copied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MigrateRequest' }
+      responses:
+        '200':
+          description: A MigrationPlan under dry_run, a MigrationReport otherwise.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/MigrationPlan'
+                  - $ref: '#/components/schemas/MigrationReport'
+
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 'Authorization: Bearer <token>. Scopes read|write|admin are derived from (path, method).'
+    tokenHeader:
+      type: apiKey
+      in: header
+      name: X-ApexRouter-Token
+      description: The same token, as a header.
+    tokenQuery:
+      type: apiKey
+      in: query
+      name: token
+      description: The same token, as a query parameter. Never recorded in a tracing span.
+
+  parameters:
+    AnthropicVersion:
+      name: anthropic-version
+      in: header
+      required: true
+      description: Must be 2023-06-01. Consumed by the proxy; never forwarded upstream.
+      schema: { type: string, enum: ['2023-06-01'] }
+    AnthropicVersionOptional:
+      name: anthropic-version
+      in: header
+      required: false
+      description: >-
+        Present selects the Anthropic list shape. Absent returns the byte-exact OpenAI list shape,
+        which ApexOS's LAN compute sweep depends on.
+      schema: { type: string, enum: ['2023-06-01'] }
+    NoWait:
+      name: no_wait
+      in: query
+      required: false
+      description: Return a JobRecord immediately instead of waiting.
+      schema: { type: boolean }
+    Since:
+      name: since
+      in: query
+      required: false
+      description: '`all`, a duration (30m, 24h, 7d, 4w), or an absolute timestamp.'
+      schema: { type: string }
+    BackendId:
+      name: id
+      in: path
+      required: true
+      description: 'A backend slug: ^[a-z0-9][a-z0-9._-]{0,63}$'
+      schema: { $ref: '#/components/schemas/BackendId' }
+    EndpointId:
+      name: id
+      in: path
+      required: true
+      description: The endpoint's BackendId.
+      schema: { $ref: '#/components/schemas/BackendId' }
+    Alias:
+      name: alias
+      in: path
+      required: true
+      description: A route alias. Same charset as a BackendId, with '/' banned.
+      schema: { $ref: '#/components/schemas/Alias' }
+    RecipeId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    ProfileId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    ProviderId:
+      name: id
+      in: path
+      required: true
+      description: 'together, vast-gguf, hf, …'
+      schema: { type: string }
+    InstanceId:
+      name: id
+      in: path
+      required: true
+      description: The Vast contract id (the `new_contract` field, not `id`).
+      schema: { type: integer, format: int64 }
+    ApprovalId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+    RequestId:
+      name: id
+      in: path
+      required: true
+      description: A ULID.
+      schema: { type: string }
+    JobId:
+      name: id
+      in: path
+      required: true
+      description: A ULID.
+      schema: { type: string }
+
+  headers:
+    XApexRouterRoute:
+      description: '<alias-or-"-">|<reason>, e.g. `auto|alias`.'
+      schema: { type: string }
+    XApexRouterBackend:
+      description: Which BackendId answered.
+      schema: { type: string }
+    XApexRouterAttempts:
+      description: How many candidates were tried.
+      schema: { type: string }
+    XApexRouterFallback:
+      description: true when the answer came from a non-first candidate.
+      schema: { type: string }
+    XApexRouterProtocol:
+      description: 'Emitted only when the ingress is not open_ai, e.g. `anthropic->open_ai`.'
+      schema: { type: string }
+
+  responses:
+    OpenAiError:
+      description: An OpenAI-shaped error. The dialect always matches the dialect the client spoke.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/OpenAiErrorEnvelope' }
+    AnthropicError:
+      description: An Anthropic-shaped error, because the client is an Anthropic SDK.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/AnthropicErrorEnvelope' }
+    ControlError:
+      description: A control-plane ErrorEnvelope. Clients branch on error.kind, never on prose.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+
+    # ---- identifiers and honesty types ----------------------------------------------
+    BackendId:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
+      description: A validated slug. An empty or malformed id is not constructible.
+    Alias:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9._-]{0,63}$'
+      description: The string a client puts in "model".
+    Money:
+      type: integer
+      format: int64
+      description: Integer micro-USD. 410000 is $0.41. No float dust, ever.
+    PriceSource:
+      type: string
+      enum: [provider_api, vast_offer, config_table, recipe_field, derived]
+    CostEstimate:
+      type: object
+      description: A guess must never render as a fact, so the assumption travels with the number.
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [metered, approximate, unknown] }
+        usd: { $ref: '#/components/schemas/Money' }
+        source: { $ref: '#/components/schemas/PriceSource' }
+        assumption: { type: [string, 'null'] }
+    TokenCount:
+      type: object
+      required: [kind, n]
+      properties:
+        kind: { type: string, enum: [reported, estimated] }
+        n: { type: integer, format: int64 }
+
+    # ---- errors -----------------------------------------------------------------------
+    OpenAiErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message: { type: string }
+            type:
+              type: string
+              enum: [model_not_found, upstream_unavailable, upstream_timeout, no_healthy_backend,
+                     server_overloaded, request_too_large, loop_detected, provider_not_configured,
+                     starting, redacted_endpoint, protocol_not_supported]
+            code: { type: [string, 'null'] }
+            param: { type: [string, 'null'] }
+    AnthropicErrorEnvelope:
+      type: object
+      required: [type, error]
+      properties:
+        type: { type: string, enum: [error] }
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              enum: [invalid_request_error, authentication_error, permission_error, not_found_error,
+                     request_too_large, rate_limit_error, api_error, overloaded_error]
+            message: { type: string }
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error: { $ref: '#/components/schemas/ErrorBody' }
+    ErrorBody:
+      type: object
+      required: [kind, message]
+      properties:
+        kind:
+          type: string
+          description: 'The discriminator, so no exit codes had to be invented.'
+          examples: [not_found, invalid_request, conflict, port_in_use, unauthorized, forbidden,
+                     upstream_unavailable, approval_required, internal]
+        message: { type: string }
+        param: { type: [string, 'null'] }
+        code: { type: [string, 'null'] }
+    LegacyError:
+      type: object
+      description: The legacy /switch failure body, kept exactly.
+      required: [error]
+      properties:
+        error: { type: string }
+
+    # ---- proxy plane -------------------------------------------------------------------
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      properties:
+        model:
+          type: string
+          description: >-
+            An alias, "<backend_id>/<model>", an upstream model id, or one of the legacy names
+            "", "x", "auto", "default" which all fall through to default_alias.
+        messages:
+          type: array
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [system, user, assistant, tool] }
+              content: {}
+        stream:
+          type: boolean
+          description: Read by a strict top-level-key scanner, not a full JSON parse.
+        stream_options:
+          type: object
+          properties:
+            include_usage: { type: boolean }
+        max_tokens: { type: integer, format: int64 }
+        temperature: { type: number }
+        tools: { type: array, items: { type: object, additionalProperties: true } }
+      additionalProperties: true
+    ChatCompletionResponse:
+      type: object
+      description: The upstream body, verbatim. `model` is the UPSTREAM id, not the alias.
+      properties:
+        id: { type: string }
+        object: { type: string }
+        created: { type: integer, format: int64 }
+        model: { type: string }
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: { type: integer, format: int64 }
+              message: { type: object, additionalProperties: true }
+              finish_reason:
+                type: [string, 'null']
+                enum: [stop, length, tool_calls, content_filter, null]
+        usage: { type: object, additionalProperties: true }
+      additionalProperties: true
+    CompletionRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model: { type: string }
+        prompt: {}
+        max_tokens: { type: integer, format: int64 }
+        stream: { type: boolean }
+      additionalProperties: true
+    EmbeddingsRequest:
+      type: object
+      required: [model, input]
+      properties:
+        model: { type: string, description: Must resolve to an embedding-capable backend. }
+        input: {}
+        encoding_format: { type: string, enum: [float, base64] }
+      additionalProperties: true
+    RerankRequest:
+      type: object
+      required: [model, query, documents]
+      properties:
+        model: { type: string }
+        query: { type: string }
+        documents: { type: array, items: { type: string } }
+        top_n: { type: integer, format: int64 }
+      additionalProperties: true
+    AnthropicMessagesRequest:
+      type: object
+      required: [model, max_tokens, messages]
+      properties:
+        model: { type: string }
+        max_tokens:
+          type: integer
+          format: int64
+          description: Required. Absent is a 400 with an Anthropic-shaped body.
+        system: { description: 'String or a content-block array; hoisted to a system message for an OpenAI upstream.' }
+        messages:
+          type: array
+          items:
+            type: object
+            properties:
+              role: { type: string, enum: [user, assistant] }
+              content: {}
+        stream: { type: boolean }
+        tools:
+          type: array
+          description: >-
+            With [router] anthropic_tools = false a non-empty tools array is refused with a 400
+            naming the config key. A clear error, never a silent wrong answer.
+          items: { type: object, additionalProperties: true }
+      additionalProperties: true
+    AnthropicMessage:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [message] }
+        role: { type: string, enum: [assistant] }
+        model: { type: string }
+        content:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [text, tool_use] }
+        stop_reason:
+          type: [string, 'null']
+          enum: [end_turn, max_tokens, stop_sequence, tool_use, null]
+          description: 'Mapped from finish_reason: stop→end_turn, length→max_tokens, tool_calls→tool_use.'
+        stop_sequence: { type: [string, 'null'] }
+        usage:
+          type: object
+          description: Anthropic field names, not OpenAI's.
+          properties:
+            input_tokens: { type: integer, format: int64 }
+            output_tokens: { type: integer, format: int64 }
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object: { type: string, enum: [list] }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/ModelEntry' }
+    ModelEntry:
+      type: object
+      required: [id, object]
+      properties:
+        id: { type: string }
+        object: { type: string, enum: [model] }
+        created: { type: integer, format: int64 }
+        owned_by: { type: string }
+        apexrouter:
+          type: object
+          description: Extras under one key, so strict clients ignore them.
+          properties:
+            kind: { type: string, enum: [alias, backend_model] }
+            strategy: { $ref: '#/components/schemas/Strategy' }
+            healthy: { type: boolean }
+            targets: { type: array, items: { type: string } }
+            status: { type: string, enum: [unknown, starting, ready, degraded, down, draining] }
+            ctx: { type: [integer, 'null'], format: int64 }
+            slots: { type: [string, 'null'] }
+            vision: { type: boolean }
+            price: {}
+            tok_per_s_p50: { type: [number, 'null'] }
+    AnthropicModelList:
+      type: object
+      description: The same rows, re-rendered. The apexrouter extras key is carried through untouched.
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [model] }
+              id: { type: string }
+              display_name: { type: string }
+              created_at: { type: string }
+        has_more: { type: boolean }
+        first_id: { type: [string, 'null'] }
+        last_id: { type: [string, 'null'] }
+    Health:
+      type: object
+      required: [ok, product, version]
+      properties:
+        ok: { type: boolean }
+        product: { type: string, enum: [apexrouter] }
+        version: { type: string }
+        provider:
+          type: string
+          description: Proxy listener only. The active provider label.
+        uptime: { type: number }
+    LegacyProviders:
+      type: object
+      description: The exact LocalRouter shape; endpoints[] and routes[] are additive.
+      properties:
+        active: { type: string, enum: [local, together, vast-gguf, endpoint] }
+        target: { type: [string, 'null'] }
+        providers:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              available: { type: boolean }
+              url: { type: [string, 'null'] }
+        local_instances:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              port: { type: integer, format: int64 }
+              running: { type: boolean }
+        endpoints: { type: array, items: { type: object, additionalProperties: true } }
+        routes: { type: array, items: { type: object, additionalProperties: true } }
+    SwitchRequest:
+      type: object
+      description: >-
+        Five forms. provider=together|local|vast-gguf are LocalRouter's; provider=endpoint and a
+        bare {alias} are additive.
+      properties:
+        provider: { type: string, enum: [together, vast-gguf, local, endpoint] }
+        base_url: { type: string, description: 'Validated against [compat] allow_switch_hosts.' }
+        model_id: { type: string }
+        api_key: { type: string, description: Persisted as a CredentialRef; never echoed back. }
+        name: { type: string, description: 'provider=local: the local_instances/<name>.json stem.' }
+        id: { $ref: '#/components/schemas/BackendId' }
+        alias: { $ref: '#/components/schemas/Alias' }
+    SwitchAck:
+      type: object
+      required: [status, provider]
+      properties:
+        status: { type: string, enum: [ok] }
+        provider: { type: string }
+
+    # ---- control plane: snapshot and events --------------------------------------------
+    Snapshot:
+      type: object
+      required: [product, version, served_by, as_of_unix, stale, proxy]
+      properties:
+        product: { type: string }
+        version: { type: string }
+        served_by: { type: string, enum: [daemon, offline] }
+        as_of_unix: { type: integer, format: int64 }
+        stale: { type: boolean, description: True when poller-derived fields could not be refreshed. }
+        proxy: { $ref: '#/components/schemas/ProxyStatus' }
+        backends: { type: array, items: { $ref: '#/components/schemas/Backend' } }
+        routes: { type: array, items: { $ref: '#/components/schemas/ModelRoute' } }
+        endpoints: { type: array, items: { $ref: '#/components/schemas/EndpointRecord' } }
+        rig: { oneOf: [{ $ref: '#/components/schemas/RigSnapshot' }, { type: 'null' }] }
+        alerts: { type: array, items: { type: object, additionalProperties: true } }
+      additionalProperties: true
+    ProxyStatus:
+      type: object
+      properties:
+        base_url: { type: string, description: The one string the user copies. }
+        control_url: { type: string }
+        uptime_secs: { type: number }
+        inflight: { type: integer, format: int64 }
+        req_per_min: { type: number }
+        tok_per_s: { type: number }
+        default_alias: { $ref: '#/components/schemas/Alias' }
+        table_valid: { type: boolean, description: 'false means the PREVIOUS table is still serving.' }
+        table_error: { type: [string, 'null'] }
+    ShutdownAck:
+      type: object
+      required: [ok, drain_timeout_secs, message]
+      properties:
+        ok: { type: boolean }
+        drain_timeout_secs: { type: integer, format: int64 }
+        message: { type: string, description: Spells out that children are not killed. }
+    ValidationReport:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean, description: True when nothing at Severity::Error was found. }
+        issues: { type: array, items: { $ref: '#/components/schemas/ValidationIssue' } }
+    ValidationIssue:
+      type: object
+      required: [field, severity, message]
+      properties:
+        field: { type: string, description: Dotted path to the offending field. }
+        severity: { type: string, enum: [info, warning, error] }
+        message: { type: string }
+        fix: { type: [string, 'null'], description: 'An actionable line, never prose.' }
+    JobRecord:
+      type: object
+      required: [id, kind, state, started_unix]
+      properties:
+        id: { type: string }
+        kind: { type: string, examples: [hf.download, vast.rent, endpoint.start, compare, swap] }
+        state:
+          type: string
+          enum: [pending, running, succeeded, failed, cancelled]
+          description: Never Pending forever; even a JoinError from a panic flips it to failed.
+        pct: { type: [number, 'null'] }
+        message: { type: [string, 'null'] }
+        started_unix: { type: integer, format: int64 }
+        finished_unix: { type: [integer, 'null'], format: int64 }
+        result: { description: 'The protocol type the operation produced, as JSON.' }
+        error: { type: [string, 'null'] }
+
+    # ---- control plane: rig and fit -----------------------------------------------------
+    LlamaBackend:
+      type: string
+      enum: [vulkan, cuda, rocm, hip, metal, sycl, cpu, other]
+    RigSnapshot:
+      type: object
+      properties:
+        gpus: { type: array, items: { $ref: '#/components/schemas/Gpu' } }
+        builds: { type: array, items: { $ref: '#/components/schemas/LlamaBuild' } }
+        ram_total_mb: { type: integer, format: int64 }
+        ram_free_mb: { type: integer, format: int64 }
+        swap_total_mb: { type: integer, format: int64 }
+        swap_used_mb: { type: integer, format: int64 }
+        cpu_threads: { type: integer, format: int64 }
+        scanned_at_unix: { type: integer, format: int64 }
+    Gpu:
+      type: object
+      description: >-
+        ONE ENUMERATION, NOT ONE PIECE OF SILICON. The same card is a different Gpu in every backend
+        that can reach it, and the readings disagree on purpose. Never sum two without comparing
+        physical_key first.
+      properties:
+        device: { type: string, description: 'The exact -dev token, e.g. Vulkan0.' }
+        index: { type: integer, format: int64 }
+        name: { type: string }
+        backend: { $ref: '#/components/schemas/LlamaBackend' }
+        vram_total_mb: { type: integer, format: int64 }
+        vram_free_mb:
+          type: integer
+          format: int64
+          description: 'As llama.cpp reports it. ROCm can report free > total (GTT), so total - free underflows.'
+        pci_bus_id: { type: [string, 'null'] }
+        driver: { type: [string, 'null'] }
+        is_software: { type: boolean, description: 'llvmpipe → true; excluded from default selection.' }
+        seen_by_builds: { type: array, items: { type: string } }
+        held_by: { type: array, items: { $ref: '#/components/schemas/BackendId' } }
+        reserved_mb: { type: integer, format: int64 }
+    LlamaBuild:
+      type: object
+      properties:
+        id: { type: string, description: 'The build-dir name, e.g. build-vulkan.' }
+        server_path: { type: string }
+        label: { type: string }
+        build_info: { type: [string, 'null'] }
+        backends:
+          type: array
+          description: From --list-devices, NEVER from grepping --help.
+          items: { $ref: '#/components/schemas/LlamaBackend' }
+        devices: { type: array, items: { type: string } }
+        flags: { $ref: '#/components/schemas/FlagSupport' }
+        probed_at_unix: { type: integer, format: int64 }
+    FlagSupport:
+      type: object
+      description: Feature detection, cached by (path, mtime, size). Never a hardcoded whitelist.
+      properties:
+        flags: { type: array, items: { type: string } }
+        jinja_default_on: { type: boolean }
+        fa_tristate: { type: boolean }
+        has_fit: { type: boolean }
+        has_router_mode: { type: boolean }
+    LocalModel:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        dir: { type: string }
+        shards: { type: array, items: { $ref: '#/components/schemas/ModelShard' } }
+        total_bytes: { type: integer, format: int64 }
+        mmproj:
+          type: array
+          description: Vision projectors found alongside; empty means text-only.
+          items: { $ref: '#/components/schemas/ModelShard' }
+        quant: { type: [string, 'null'] }
+        gguf: { oneOf: [{ $ref: '#/components/schemas/GgufMeta' }, { type: 'null' }] }
+        discovered_at_unix: { type: integer, format: int64 }
+    ModelShard:
+      type: object
+      properties:
+        path: { type: string }
+        bytes: { type: integer, format: int64 }
+    GgufMeta:
+      type: object
+      properties:
+        arch: { type: string }
+        n_layer: { type: integer, format: int64 }
+        n_head_kv: { type: integer, format: int64 }
+        n_embd_head_k: { type: integer, format: int64 }
+        n_embd_head_v: { type: integer, format: int64 }
+        n_ctx_train: { type: integer, format: int64 }
+        full_attn_layers:
+          type: [integer, 'null']
+          format: int64
+          description: Hybrid-linear models carry KV on only some layers.
+        n_expert: { type: [integer, 'null'], format: int64 }
+    KvType:
+      type: string
+      enum: [f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1]
+    SplitMode:
+      type: string
+      enum: [none, layer, row, tensor]
+    SplitPlan:
+      type: object
+      properties:
+        devices: { type: array, items: { type: string } }
+        mode: { $ref: '#/components/schemas/SplitMode' }
+        main_gpu: { type: [integer, 'null'], format: int64 }
+        tensor_split: { type: ['array', 'null'], items: { type: number } }
+    NglPlan:
+      type: object
+      required: [ngl]
+      properties:
+        ngl:
+          type: string
+          enum: [auto, all, layers]
+          description: 'auto = emit nothing and let llama.cpp --fit decide.'
+        '0': { type: integer, format: int64, description: 'Layer count, when ngl = layers.' }
+    DeviceBudget:
+      type: object
+      properties:
+        device: { type: string }
+        free_mb: { type: integer, format: int64 }
+        reserved_mb: { type: integer, format: int64 }
+    VramBudget:
+      type: object
+      description: >-
+        A VECTOR, never a scalar, and PER BACKEND: one llama-server process uses one backend, so a
+        budget is never a sum across backends.
+      properties:
+        devices: { type: array, items: { $ref: '#/components/schemas/DeviceBudget' } }
+        margin_mb: { type: integer, format: int64 }
+        host_ram_free_mb: { type: integer, format: int64 }
+        backend:
+          oneOf: [{ $ref: '#/components/schemas/LlamaBackend' }, { type: 'null' }]
+          description: 'null means no device. Never "all of them".'
+        notes: { type: array, items: { type: string }, description: 'What was dropped, and why.' }
+    FitInput:
+      type: object
+      required: [weights_bytes, gguf, budget]
+      properties:
+        weights_bytes: { type: integer, format: int64 }
+        gguf: { $ref: '#/components/schemas/GgufMeta' }
+        budget:
+          allOf: [{ $ref: '#/components/schemas/VramBudget' }]
+          description: LIVE, computed at plan time; never a 300 s cache.
+        want_ctx: { type: [integer, 'null'], format: int64 }
+        want_parallel: { type: [integer, 'null'], format: int64 }
+        want_kv: { oneOf: [{ $ref: '#/components/schemas/KvType' }, { type: 'null' }] }
+        split: { $ref: '#/components/schemas/SplitPlan' }
+    FitQuery:
+      type: object
+      required: [model]
+      properties:
+        model: { type: string }
+        ctx: { type: [integer, 'null'], format: int64 }
+        parallel: { type: [integer, 'null'], format: int64 }
+        kv: { oneOf: [{ $ref: '#/components/schemas/KvType' }, { type: 'null' }] }
+        devices: { type: [string, 'null'] }
+        build: { type: [string, 'null'] }
+        split_mode: { oneOf: [{ $ref: '#/components/schemas/SplitMode' }, { type: 'null' }] }
+        tensor_split: { type: [string, 'null'] }
+        main_gpu: { type: [integer, 'null'], format: int64 }
+    FitPlan:
+      type: object
+      properties:
+        ctx: { type: integer, format: int64, description: 'TOTAL pool, shared across `parallel` slots.' }
+        parallel: { type: integer, format: int64 }
+        kv_type: { $ref: '#/components/schemas/KvType' }
+        ngl: { $ref: '#/components/schemas/NglPlan' }
+        split: { $ref: '#/components/schemas/SplitPlan' }
+        weights_mb: { type: integer, format: int64 }
+        kv_mb: { type: integer, format: int64 }
+        compute_mb: { type: integer, format: int64 }
+        headroom_mb: { type: integer, format: int64 }
+        per_device_mb:
+          type: array
+          items: { type: array, items: {} }
+        verdict: { $ref: '#/components/schemas/FitVerdict' }
+        why:
+          type: array
+          items: { type: string }
+          description: Rendered as tooltips next to every derived field. A fallback is a visible value.
+    FitVerdict:
+      type: object
+      required: [verdict]
+      properties:
+        verdict: { type: string, enum: [fits, tight, needs_offload, wont_fit] }
+        headroom_mb: { type: integer, format: int64 }
+        layers_on_gpu: { type: integer, format: int64 }
+        short_by_mb: { type: integer, format: int64 }
+
+    # ---- control plane: backends and routes --------------------------------------------
+    Protocol:
+      type: string
+      enum: [open_ai, anthropic]
+      description: The wire dialect a listener accepts or an upstream speaks. Defaults to open_ai.
+    BackendKind:
+      type: string
+      enum: [local_llama, local_vllm, vast_llama, vast_vllm, managed, node]
+    Provenance:
+      type: string
+      enum: [discovered, spawned, rented, manual, adopted, imported]
+    CredentialSource:
+      type: object
+      description: A DESCRIPTION of where a credential lives. Never key material.
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [none, env, file, managed, instance] }
+        var: { type: string }
+        path: { type: string }
+        store: { type: string }
+    BackendLimits:
+      type: object
+      properties:
+        max_concurrent: { type: integer, format: int64 }
+        queue_depth: { type: integer, format: int64 }
+        ctx: { type: [integer, 'null'], format: int64 }
+        slots_total: { type: [integer, 'null'], format: int64 }
+    PriceModel:
+      type: object
+      required: [kind]
+      properties:
+        kind: { type: string, enum: [per_token, per_hour, free] }
+        input: { $ref: '#/components/schemas/Money' }
+        output: { $ref: '#/components/schemas/Money' }
+        dph: { $ref: '#/components/schemas/Money' }
+    UpstreamModel:
+      type: object
+      properties:
+        id: { type: string }
+        ctx: { type: [integer, 'null'], format: int64 }
+        vision: { type: boolean }
+    BackendHealth:
+      type: object
+      required: [state]
+      properties:
+        state: { type: string, enum: [unknown, starting, ready, degraded, down, draining] }
+        phase: { $ref: '#/components/schemas/BootPhase' }
+        since_unix: { type: integer, format: int64 }
+        slots_busy: { type: integer, format: int64 }
+        slots_total: { type: integer, format: int64 }
+        tps_p50: { type: [number, 'null'] }
+        reason: { type: string }
+        consecutive_failures: { type: integer, format: int64 }
+        retry_at_unix: { type: integer, format: int64 }
+        in_flight: { type: integer, format: int64 }
+        detail: { type: [string, 'null'] }
+    BootPhase:
+      type: object
+      required: [phase]
+      properties:
+        phase:
+          type: string
+          enum: [reserved, provisioning, pulling, compiling, downloading, loading, healthy, failed, destroyed]
+        pct: { type: [number, 'null'] }
+        mbps: { type: [number, 'null'] }
+        reason: { type: string }
+    Backend:
+      type: object
+      required: [id, kind, label, base_url, enabled]
+      properties:
+        id: { $ref: '#/components/schemas/BackendId' }
+        kind: { $ref: '#/components/schemas/BackendKind' }
+        protocol: { $ref: '#/components/schemas/Protocol' }
+        label: { type: string }
+        base_url: { type: string, description: ALWAYS stored WITHOUT a trailing /v1. }
+        credential: { $ref: '#/components/schemas/CredentialSource' }
+        tags: { type: array, items: { type: string } }
+        models: { type: array, items: { $ref: '#/components/schemas/UpstreamModel' } }
+        limits: { $ref: '#/components/schemas/BackendLimits' }
+        price: { oneOf: [{ $ref: '#/components/schemas/PriceModel' }, { type: 'null' }] }
+        health: { $ref: '#/components/schemas/BackendHealth' }
+        provenance: { $ref: '#/components/schemas/Provenance' }
+        endpoint:
+          description: Some(..) when ApexRouter can start and stop it.
+          oneOf:
+            - type: object
+              properties:
+                id: { $ref: '#/components/schemas/BackendId' }
+                kind: { $ref: '#/components/schemas/BackendKind' }
+            - type: 'null'
+        enabled: { type: boolean }
+    BackendPatch:
+      type: object
+      description: Every field optional; absent means unchanged.
+      properties:
+        tags: { type: ['array', 'null'], items: { type: string } }
+        label: { type: [string, 'null'] }
+        limits: { oneOf: [{ $ref: '#/components/schemas/BackendLimits' }, { type: 'null' }] }
+        enabled: { type: [boolean, 'null'] }
+    NodeSpec:
+      type: object
+      required: [base_url]
+      properties:
+        base_url: { type: string, description: Stored WITHOUT /v1. }
+        credential: { $ref: '#/components/schemas/CredentialSource' }
+        label: { type: string }
+        declared_models:
+          type: array
+          items: { type: string }
+          description: Empty means the prober discovers them.
+        protocol: { $ref: '#/components/schemas/Protocol' }
+    Strategy:
+      type: string
+      enum: [first_healthy, round_robin, least_busy, cheapest]
+      description: mk1 ships exactly the strategies it implements. No reachable todo!() from config.
+    BackendSelector:
+      type: object
+      required: [sel]
+      properties:
+        sel: { type: string, enum: [id, tag, glob] }
+        value: { type: string, description: 'A BackendId, a tag, or a shell glob like vast-*.' }
+    RouteTarget:
+      type: object
+      properties:
+        backend: { $ref: '#/components/schemas/BackendSelector' }
+        model: { type: [string, 'null'], description: 'null passes the alias through unchanged.' }
+        weight: { type: integer, format: int64 }
+    RouteFilter:
+      type: object
+      properties:
+        require_tags: { type: array, items: { type: string } }
+        exclude_tags: { type: array, items: { type: string } }
+        max_cost_per_mtok: { oneOf: [{ $ref: '#/components/schemas/Money' }, { type: 'null' }] }
+        min_ctx: { type: [integer, 'null'], format: int64 }
+        require_vision: { type: boolean }
+        require_tools: { type: boolean }
+    RetryPolicy:
+      type: object
+      properties:
+        attempts: { type: integer, format: int64, description: '1 means no failover attempt at all.' }
+        failover: { type: boolean }
+        honor_retry_after: { type: boolean }
+    ModelRoute:
+      type: object
+      required: [alias, targets, strategy]
+      properties:
+        alias: { $ref: '#/components/schemas/Alias' }
+        targets:
+          type: array
+          description: Ordered.
+          items: { $ref: '#/components/schemas/RouteTarget' }
+        strategy: { $ref: '#/components/schemas/Strategy' }
+        filter: { $ref: '#/components/schemas/RouteFilter' }
+        retry: { $ref: '#/components/schemas/RetryPolicy' }
+        is_default: { type: boolean }
+        description: { type: [string, 'null'] }
+    SetDefault:
+      type: object
+      required: [alias]
+      properties:
+        alias: { $ref: '#/components/schemas/Alias' }
+    SwapMode:
+      type: string
+      enum: [hot, sequential]
+      description: Chosen by fit(); sequential when both models would not fit at once.
+    SwapRequest:
+      type: object
+      required: [to]
+      properties:
+        to:
+          description: 'Untagged: a bare string is a registered backend, an object is an EndpointSpec to start first.'
+          oneOf:
+            - $ref: '#/components/schemas/BackendId'
+            - $ref: '#/components/schemas/EndpointSpec'
+        mode: { oneOf: [{ $ref: '#/components/schemas/SwapMode' }, { type: 'null' }] }
+    SwapReport:
+      type: object
+      properties:
+        alias: { $ref: '#/components/schemas/Alias' }
+        mode: { $ref: '#/components/schemas/SwapMode' }
+        from: { oneOf: [{ $ref: '#/components/schemas/BackendId' }, { type: 'null' }] }
+        to: { $ref: '#/components/schemas/BackendId' }
+        parked: { type: integer, format: int64, description: Requests parked on the Notify during a sequential swap. }
+        drained_ms: { type: integer, format: int64 }
+        total_ms: { type: integer, format: int64 }
+    SmokeProbe:
+      type: object
+      properties:
+        name: { type: string, examples: [smoke.models, smoke.warmup, smoke.tools, smoke.throughput] }
+        ok: { type: boolean }
+        ms: { type: integer, format: int64 }
+        detail: { type: string }
+        ttft_ms: { type: [integer, 'null'], format: int64 }
+        tok_per_s: { type: [number, 'null'] }
+        tokens: { type: [integer, 'null'], format: int64 }
+
+    # ---- control plane: endpoints -------------------------------------------------------
+    SamplingMode:
+      type: string
+      enum: [thinking, coding, nonthinking, raw]
+    TriState:
+      type: string
+      enum: [on, off, auto]
+    EndpointSpec:
+      type: object
+      required: [kind]
+      description: Tagged by `kind`. Only LocalLlama's fields are spelled out here.
+      properties:
+        kind: { type: string, enum: [local_llama, local_vllm, vast, node, managed] }
+        build: { type: string }
+        model_path: { type: string, description: 'Absolute and expanded; the raw ~ form is NEVER stored.' }
+        mmproj: { type: [string, 'null'] }
+        alias_flag: { type: string, description: 'The -a value: the model id this server advertises.' }
+        host: { type: string }
+        port: { type: [integer, 'null'], format: int64, description: 'null allocates from [endpoints] port_range.' }
+        ctx: { type: [integer, 'null'], format: int64, description: 'null leaves --ctx-size UNSET so --fit works.' }
+        parallel: { type: [integer, 'null'], format: int64 }
+        kv_type: { oneOf: [{ $ref: '#/components/schemas/KvType' }, { type: 'null' }] }
+        ngl: { $ref: '#/components/schemas/NglPlan' }
+        split: { $ref: '#/components/schemas/SplitPlan' }
+        mode: { $ref: '#/components/schemas/SamplingMode' }
+        flash_attn: { oneOf: [{ $ref: '#/components/schemas/TriState' }, { type: 'null' }] }
+        api_key:
+          description: Written via --api-key-file, NEVER argv.
+          oneOf: [{ $ref: '#/components/schemas/CredentialSource' }, { type: 'null' }]
+        extra_args: { type: array, items: { type: string } }
+      additionalProperties: true
+    ProcFacts:
+      type: object
+      properties:
+        pid: { type: integer, format: int64 }
+        start_time_ticks:
+          type: integer
+          format: int64
+          description: Parsed from /proc/<pid>/stat AFTER THE LAST ')'.
+        boot_id: { type: string, description: Part of the identity; start_time_ticks is not comparable across a reboot. }
+        exe: { type: string }
+        cmdline_sha256: { type: string }
+    EndpointRecord:
+      type: object
+      description: Facts only. There is deliberately no `status` field — expectation IS state.
+      required: [id, spec, desired]
+      properties:
+        id: { $ref: '#/components/schemas/BackendId' }
+        spec: { $ref: '#/components/schemas/EndpointSpec' }
+        desired: { type: string, enum: [running, stopped] }
+        proc:
+          oneOf: [{ $ref: '#/components/schemas/ProcFacts' }, { type: 'null' }]
+          description: null for Managed and Node endpoints.
+        port: { type: [integer, 'null'], format: int64 }
+        log_path: { type: [string, 'null'] }
+        started_at_unix: { type: integer, format: int64 }
+        fit:
+          oneOf: [{ $ref: '#/components/schemas/FitPlan' }, { type: 'null' }]
+          description: What we planned; used for VRAM reservation accounting.
+        adopted: { type: boolean }
+    ArgvPreview:
+      type: object
+      properties:
+        program: { type: string }
+        args:
+          type: array
+          items: { type: string }
+          description: 'argv excluding argv[0]. No credential ever appears here, and there is no sh -c.'
+        env: { type: array, items: { type: array, items: { type: string } } }
+        cwd: { type: string }
+        warnings: { type: array, items: { type: string } }
+
+    # ---- control plane: catalog ----------------------------------------------------------
+    Recipe:
+      type: object
+      required: [id, label, kind]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        description: { type: [string, 'null'] }
+        kind:
+          type: object
+          description: Tagged by `kind`; carries the spec the recipe would instantiate.
+          required: [kind]
+          properties:
+            kind: { type: string, enum: [local, vllm, vast, node, managed] }
+          additionalProperties: true
+        provenance: { type: object, additionalProperties: true, description: 'Where it came from, so staleness is detectable.' }
+        created_at_unix: { type: integer, format: int64 }
+        updated_at_unix: { type: integer, format: int64 }
+    GeoFilter:
+      type: string
+      enum: [any, eu, us, asia]
+      description: Matched on the tail of "Country, CC", never on the whole string.
+    OfferSort:
+      type: string
+      enum: [dph_asc, dph_desc, reliability, vram, score]
+    SearchProfile:
+      type: object
+      required: [id, label]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        gpu_names: { type: array, items: { type: string } }
+        min_vram_gb: { type: [integer, 'null'], format: int64 }
+        max_dph: { type: [number, 'null'] }
+        geo: { $ref: '#/components/schemas/GeoFilter' }
+        min_reliability: { type: [number, 'null'] }
+        min_inet_down_mbps: { type: [number, 'null'] }
+        sort: { $ref: '#/components/schemas/OfferSort' }
+      additionalProperties: true
+
+    # ---- control plane: providers ---------------------------------------------------------
+    ProviderStatus:
+      type: object
+      required: [id, base_url, credential, credential_present]
+      properties:
+        id: { type: string }
+        base_url:
+          type: string
+          description: 'A legacy api.together.xyz is used as-is and never rewritten to .ai.'
+        credential: { $ref: '#/components/schemas/CredentialSource' }
+        credential_present: { type: boolean, description: Whether resolving that source actually produced something. }
+        models_cached: { type: integer, format: int64 }
+        last_ok_unix: { type: [integer, 'null'], format: int64 }
+        last_error: { type: [string, 'null'] }
+        rate_limit: { type: [object, 'null'], additionalProperties: true }
+    ProviderPut:
+      type: object
+      description: At most one of api_key, api_key_env, api_key_file.
+      properties:
+        base_url: { type: [string, 'null'] }
+        api_key: { type: [string, 'null'], description: Typed by a human → credentials.toml at 0600. }
+        api_key_env: { type: [string, 'null'], description: A reference. Nothing is copied. }
+        api_key_file: { type: [string, 'null'], description: A reference. Nothing is copied. }
+    CheckResult:
+      type: object
+      required: [id, label, status, ms, detail]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        status: { type: string, enum: [pass, warn, fail, skipped] }
+        ms: { type: integer, format: int64 }
+        detail: { type: string }
+        fix: { type: [string, 'null'], description: 'An actionable line, never prose.' }
+
+    # ---- control plane: vast ---------------------------------------------------------------
+    VastAccount:
+      type: object
+      description: No api_key field exists here, even though the upstream API echoes one.
+      properties:
+        credit: { type: number }
+        balance: { type: number }
+        can_pay: { type: boolean }
+    OfferQuery:
+      type: object
+      description: Either a saved {profile}, or the full query.
+      properties:
+        profile: { type: string }
+        gpu_names: { type: array, items: { type: string } }
+        num_gpus: { type: integer, format: int64 }
+        min_vram_gb: { type: integer, format: int64 }
+        max_dph: { type: number }
+        geo: { $ref: '#/components/schemas/GeoFilter' }
+        min_reliability: { type: number }
+        sort: { $ref: '#/components/schemas/OfferSort' }
+        limit: { type: integer, format: int64 }
+    OfferSearchResult:
+      type: object
+      properties:
+        offers: { type: array, items: { type: object, additionalProperties: true } }
+        queried_at_unix: { type: integer, format: int64 }
+        notes: { type: array, items: { type: string } }
+      additionalProperties: true
+    VastInstance:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: integer
+          format: int64
+          description: The contract id. The create call returns it as `new_contract`, not `id`.
+        actual_status:
+          type: [string, 'null']
+          description: >-
+            created | scheduling | starting | loading | pulling | running | stopped | inactive |
+            exited | offline | unknown. Anything unrecognised maps to BootPhase::Provisioning,
+            never Failed: a status we have never seen is not evidence that a box we are paying
+            for is dead.
+        status_msg: { type: [string, 'null'] }
+        ssh_host:
+          type: [string, 'null']
+          description: 'sshN.vast.ai. Recycled, which is why $STATE keeps a dedicated known_hosts.'
+        ssh_port: { type: [integer, 'null'], format: int64 }
+        public_ipaddr: { type: [string, 'null'] }
+        ports:
+          description: 'The docs say int[]; the CLI writes a Docker map. Kept raw and read tolerantly.'
+        direct_port_start: { type: [integer, 'null'], format: int64 }
+        direct_port_end: { type: [integer, 'null'], format: int64 }
+        gpu_name: { type: [string, 'null'] }
+        num_gpus: { type: [integer, 'null'], format: int64 }
+        gpu_util: { type: [number, 'null'] }
+        dph_total: { type: [number, 'null'], description: Dollars per hour we are being billed. }
+        geolocation: { type: [string, 'null'], examples: ['Czechia, CZ'] }
+        label: { type: [string, 'null'] }
+        start_date: { type: [number, 'null'], description: 'When billing started, unix seconds.' }
+        disk_util: { type: [number, 'null'] }
+        disk_space: { type: [number, 'null'] }
+        inet_down: { type: [number, 'null'] }
+      additionalProperties: true
+    RentRequest:
+      type: object
+      description: 409 without {confirm:true, max_usd_per_hour}. Deliberate spend, never an accident.
+      properties:
+        profile: { type: string }
+        offer_id: { type: integer, format: int64 }
+        launch: { type: object, additionalProperties: true }
+        confirm: { type: boolean }
+        max_usd_per_hour:
+          type: number
+          description: Cannot exceed [providers.vast] max_usd_per_hour_ceiling, a hard daemon-side cap.
+    TunnelStatus:
+      type: object
+      properties:
+        instance_id: { type: integer, format: int64 }
+        local_port: { type: integer, format: int64 }
+        pid: { type: integer, format: int64 }
+        state: { type: string, enum: [starting, up, down, adopted] }
+        since_unix: { type: integer, format: int64 }
+        last_error: { type: [string, 'null'] }
+    ApprovalRequest:
+      type: object
+      required: [id, what, max_usd_per_hour, est_total_usd, requested_at_unix, source]
+      properties:
+        id: { type: string, description: The JobId the approval unblocks. }
+        what: { type: string, description: 'What is being asked for, in words.' }
+        max_usd_per_hour:
+          type: number
+          description: The requested ceiling. Cannot exceed the daemon-side max_usd_per_hour_ceiling.
+        est_total_usd:
+          type: number
+          description: The estimated total, so a human sees the bill and not just the rate.
+        credit: { type: [number, 'null'] }
+        requested_at_unix: { type: integer, format: int64 }
+        source: { type: string, enum: [cli, mcp, web_ui, slint] }
+    DownloadHealth:
+      type: object
+      description: 'One sample of a rented box''s download progress, from a 4-second /proc/net/dev delta.'
+      required: [sampled_at_unix, rx_bytes_4s, mbps, verdict]
+      properties:
+        sampled_at_unix: { type: integer, format: int64 }
+        rx_bytes_4s: { type: integer, format: int64, description: Bytes received on eth0 over the window. }
+        mbps: { type: number }
+        verdict: { $ref: '#/components/schemas/StallVerdict' }
+    StallVerdict:
+      type: string
+      enum: [active, slow, stalled]
+      description: '< 1000 bytes over the window is stalled; < 50 Mbps is slow.'
+
+    # ---- control plane: hugging face --------------------------------------------------------
+    HfModel:
+      type: object
+      required: [id, gated]
+      properties:
+        id: { type: string, examples: ['unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'] }
+        author: { type: [string, 'null'] }
+        downloads: { type: [integer, 'null'], format: int64 }
+        likes: { type: [integer, 'null'], format: int64 }
+        gated:
+          type: boolean
+          description: 'Gated repos need access granted; the UI must show the request-access URL, never "not found".'
+        last_modified: { type: [string, 'null'], description: ISO timestamp as HF sends it. }
+        tags: { type: array, items: { type: string } }
+    HfFile:
+      type: object
+      required: [rfilename, is_mmproj]
+      properties:
+        rfilename: { type: string, description: Path within the repo. }
+        size: { type: [integer, 'null'], format: int64, description: 'Bytes, from paths-info.' }
+        quant: { type: [string, 'null'] }
+        is_mmproj:
+          type: boolean
+          description: 'Matched as a filename TOKEN, not a path substring, so a directory named vocab-x hides nothing.'
+        shard_of:
+          type: ['array', 'null']
+          description: '(index, total) parsed from -00001-of-000NN.'
+          items: { type: integer, format: int64 }
+    HfFileGroup:
+      type: object
+      description: 'Files grouped into one downloadable unit: a quant plus its shards plus its projector.'
+      required: [label, total_bytes]
+      properties:
+        label: { type: string }
+        quant: { type: [string, 'null'] }
+        total_bytes:
+          type: integer
+          format: int64
+          description: Sum of every file's size — the number the fit solver and the disk check use.
+        files: { type: array, items: { $ref: '#/components/schemas/HfFile' } }
+        mmproj: { type: array, items: { $ref: '#/components/schemas/HfFile' } }
+    HfDownloadRequest:
+      type: object
+      required: [repo]
+      properties:
+        repo: { type: string }
+        files:
+          type: array
+          items: { type: string }
+          description: Exact repo-relative paths. Wins over `quant` when both are given.
+        quant: { type: [string, 'null'] }
+        dest: { type: [string, 'null'], description: 'null uses [hf] download_dir.' }
+
+    # ---- control plane: observability --------------------------------------------------------
+    RouteReason:
+      type: string
+      enum: [alias, explicit_pin, upstream_id_match, implicit_multi, default_fallback, legacy_model_name]
+    RequestRecord:
+      type: object
+      properties:
+        id: { type: string }
+        started_unix: { type: integer, format: int64 }
+        alias: { oneOf: [{ $ref: '#/components/schemas/Alias' }, { type: 'null' }] }
+        backend: { oneOf: [{ $ref: '#/components/schemas/BackendId' }, { type: 'null' }] }
+        upstream_model: { type: [string, 'null'] }
+        route_reason: { $ref: '#/components/schemas/RouteReason' }
+        ingress:
+          allOf: [{ $ref: '#/components/schemas/Protocol' }]
+          description: Which dialect the CLIENT spoke. With the Backend's, it names the matrix cell.
+        method: { type: string }
+        path: { type: string }
+        status: { type: integer, format: int64 }
+        attempts: { type: integer, format: int64 }
+        streamed: { type: boolean }
+        aborted: { type: boolean }
+        ttft_ms: { type: [integer, 'null'], format: int64 }
+        total_ms: { type: integer, format: int64 }
+        prompt_tokens: { oneOf: [{ $ref: '#/components/schemas/TokenCount' }, { type: 'null' }] }
+        completion_tokens: { oneOf: [{ $ref: '#/components/schemas/TokenCount' }, { type: 'null' }] }
+        cached_tokens: { type: [integer, 'null'], format: int64, description: llama.cpp timings.cache_n. }
+        tok_per_s: { type: [number, 'null'], description: timings.predicted_per_second. }
+        cost: { $ref: '#/components/schemas/CostEstimate' }
+        error: { type: [string, 'null'] }
+    UsageBucket:
+      type: object
+      properties:
+        key: { type: string }
+        cost: { $ref: '#/components/schemas/CostEstimate' }
+        prompt_tokens: { type: integer, format: int64 }
+        completion_tokens: { type: integer, format: int64 }
+        requests: { type: integer, format: int64 }
+        tok_per_s_p50: { type: [number, 'null'] }
+    UsageSummary:
+      type: object
+      properties:
+        window: { type: string }
+        by: { type: array, items: { $ref: '#/components/schemas/UsageBucket' } }
+        total_cost: { $ref: '#/components/schemas/CostEstimate' }
+        total_prompt: { type: integer, format: int64 }
+        total_completion: { type: integer, format: int64 }
+        rows: { type: integer, format: int64 }
+    CompareRequest:
+      type: object
+      required: [prompt]
+      properties:
+        aliases: { type: array, items: { type: string } }
+        prompt: { type: string }
+        max_tokens: { type: [integer, 'null'], format: int64 }
+    CompareRow:
+      type: object
+      properties:
+        alias: { $ref: '#/components/schemas/Alias' }
+        backend: { oneOf: [{ $ref: '#/components/schemas/BackendId' }, { type: 'null' }] }
+        model: { type: string }
+        ok: { type: boolean }
+        ms: { type: integer, format: int64 }
+        ttft_ms: { type: [integer, 'null'], format: int64 }
+        tok_per_s: { type: [number, 'null'] }
+        prompt_tokens:
+          description: 'The REAL number from the response, never word_count × 1.3.'
+          oneOf: [{ $ref: '#/components/schemas/TokenCount' }, { type: 'null' }]
+        text: { type: [string, 'null'] }
+      additionalProperties: true
+    SmokeRequest:
+      type: object
+      description: Exactly one of alias and base_url is required.
+      properties:
+        alias: { type: [string, 'null'] }
+        base_url: { type: [string, 'null'], description: Stored and used WITHOUT a trailing /v1. }
+        model: { type: [string, 'null'], description: Override the model id the probes ask for. }
+    MigrateRequest:
+      type: object
+      required: [dry_run]
+      properties:
+        dry_run: { type: boolean, description: 'true returns a MigrationPlan and writes NOTHING.' }
+    MigrationItem:
+      type: object
+      properties:
+        what: { type: string, examples: [recipe, usage row, known_fork, provider, instance] }
+        from: { type: string }
+        action: { type: string, enum: [import, skip, warn] }
+        detail: { type: string, description: 'The reason, per row.' }
+    MigrationPlan:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/MigrationItem' } }
+        source_paths: { type: array, items: { type: string } }
+    MigrationReport:
+      type: object
+      properties:
+        imported: { type: integer, format: int64 }
+        skipped: { type: integer, format: int64 }
+        warnings: { type: array, items: { type: string } }

@@ -12,7 +12,8 @@
 //! (`mcp`) add their own variants here when they land.
 
 use crate::daemon::Need;
-use apexrouter_protocol::{KvType, SamplingMode, SplitMode, Strategy};
+use apexrouter_core::usage::GroupBy;
+use apexrouter_protocol::{GeoFilter, KvType, SamplingMode, SplitMode, Strategy, SwapMode};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -116,6 +117,78 @@ pub enum Command {
         /// Where to point it.
         #[command(subcommand)]
         cmd: SwitchCmd,
+    },
+    /// The one-command happy path: resolve, start, bind, print the URL.
+    Up(UpArgs),
+    /// Move an alias onto something else, with the mode chosen for you.
+    Swap(SwapArgs),
+    /// Ensure a daemon and open the web UI in a browser.
+    Open,
+    /// Print the two shell exports an OpenAI client needs.
+    Env(JsonFlag),
+    /// Upstreams in the routing table.
+    Backend {
+        /// What to do with them.
+        #[command(subcommand)]
+        cmd: BackendCmd,
+    },
+    /// Saved launch plans.
+    Recipe {
+        /// What to do with them.
+        #[command(subcommand)]
+        cmd: RecipeCmd,
+    },
+    /// Saved vast.ai search profiles.
+    Profile {
+        /// What to do with them.
+        #[command(subcommand)]
+        cmd: ProfileCmd,
+    },
+    /// Managed providers and where their credentials live.
+    Provider {
+        /// What to do with them.
+        #[command(subcommand)]
+        cmd: ProviderCmd,
+    },
+    /// vast.ai — the verbs that spend money.
+    Vast {
+        /// What to do.
+        #[command(subcommand)]
+        cmd: VastCmd,
+    },
+    /// Supervised `ssh -L` tunnels to rented boxes.
+    Tunnel {
+        /// What to do.
+        #[command(subcommand)]
+        cmd: TunnelCmd,
+    },
+    /// Spend approvals waiting for a human.
+    Approvals {
+        /// What to do.
+        #[command(subcommand)]
+        cmd: ApprovalsCmd,
+    },
+    /// HuggingFace search and download.
+    Hf {
+        /// What to do.
+        #[command(subcommand)]
+        cmd: HfCmd,
+    },
+    /// Tokens and cost over a window.
+    Usage(UsageArgs),
+    /// One prompt against several aliases, side by side.
+    Compare(CompareArgs),
+    /// The four native smoke probes.
+    Smoke(SmokeArgs),
+    /// The check registry, with a fix line per row.
+    Doctor(DoctorArgs),
+    /// Import `~/.vastai-gguf` and a LocalRouter checkout.
+    Migrate(MigrateArgs),
+    /// Bearer tokens for a non-loopback bind.
+    Token {
+        /// What to do.
+        #[command(subcommand)]
+        cmd: TokenCmd,
     },
     /// Anything this build does not implement yet, reported by name.
     #[command(external_subcommand)]
@@ -529,8 +602,748 @@ pub enum SwitchCmd {
 }
 
 // ---------------------------------------------------------------------------------------
+// S-08 — the remainder of the surface in ARCHITECTURE §7
+// ---------------------------------------------------------------------------------------
+
+/// `apexrouter up <model|recipe> [--alias A] [--yes] …`.
+#[derive(Debug, Clone, Args)]
+pub struct UpArgs {
+    /// Recipe id, model id, unique model prefix, or a path on disk — resolved in that order.
+    pub what: String,
+    /// Bind this alias once the thing is `Ready`. Defaults to the default alias.
+    #[arg(long, value_name = "ALIAS")]
+    pub alias: Option<String>,
+    /// Total context pool.
+    #[arg(long)]
+    pub ctx: Option<u32>,
+    /// Slots sharing that pool.
+    #[arg(long)]
+    pub parallel: Option<u32>,
+    /// `-dev` tokens, comma separated.
+    #[arg(long, value_name = "D,D")]
+    pub devices: Option<String>,
+    /// Sampling preset.
+    #[arg(long, value_enum)]
+    pub mode: Option<ModeArg>,
+    /// Return a job id immediately instead of waiting for `Ready`.
+    #[arg(long)]
+    pub no_wait: bool,
+    /// Start even when the fit solver says it will not fit.
+    #[arg(long)]
+    pub force: bool,
+    /// Required before anything that costs money runs.
+    #[arg(long)]
+    pub yes: bool,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter swap <alias> --to <model|recipe|backend-id> [--mode hot|sequential]`.
+#[derive(Debug, Clone, Args)]
+pub struct SwapArgs {
+    /// The alias to move.
+    pub alias: String,
+    /// Where to move it: a backend id, a recipe id, or a model.
+    #[arg(long, value_name = "TARGET")]
+    pub to: String,
+    /// `hot` keeps both up; `sequential` frees the VRAM first. Chosen for you when omitted.
+    #[arg(long, value_enum)]
+    pub mode: Option<SwapModeArg>,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter backend …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum BackendCmd {
+    /// Every upstream in the table.
+    Ls(JsonFlag),
+    /// One upstream in detail.
+    Show {
+        /// Backend id.
+        id: String,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register a URL as a backend.
+    Add(BackendAddArgs),
+    /// Let it take traffic again.
+    Enable {
+        /// Backend id.
+        id: String,
+    },
+    /// Take it out of the table without forgetting it.
+    Disable {
+        /// Backend id.
+        id: String,
+    },
+    /// Finish in-flight requests, then stop routing to it.
+    Drain {
+        /// Backend id.
+        id: String,
+    },
+    /// Probe it now rather than waiting for the poller.
+    Probe {
+        /// Backend id.
+        id: String,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Forget it.
+    Rm {
+        /// Backend id.
+        id: String,
+    },
+}
+
+/// `apexrouter backend add <url> …`.
+#[derive(Debug, Clone, Args)]
+pub struct BackendAddArgs {
+    /// Base URL, with or without a trailing `/v1`.
+    pub url: String,
+    /// Human label.
+    #[arg(long, value_name = "L")]
+    pub label: Option<String>,
+    /// A tag, repeatable. Tags are what `tag:` route targets select on.
+    #[arg(long = "tag", value_name = "T")]
+    pub tags: Vec<String>,
+    /// Name the environment variable holding this backend's key.
+    #[arg(long, value_name = "VAR")]
+    pub key_env: Option<String>,
+    /// Models the backend serves, comma separated, when it will not list them itself.
+    #[arg(long, value_name = "M,M")]
+    pub models: Option<String>,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter recipe …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum RecipeCmd {
+    /// Every saved recipe.
+    Ls(JsonFlag),
+    /// One recipe in detail.
+    Show {
+        /// Recipe id.
+        id: String,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save a running endpoint as a recipe.
+    New {
+        /// Which endpoint to snapshot. Required: a recipe is never invented from nothing.
+        #[arg(long, value_name = "ID")]
+        from_endpoint: String,
+        /// Open the result in `$VISUAL`/`$EDITOR` afterwards.
+        #[arg(long)]
+        edit: bool,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Edit a recipe as JSON in `$VISUAL`/`$EDITOR`.
+    Edit {
+        /// Recipe id.
+        id: String,
+    },
+    /// Delete a recipe.
+    Rm {
+        /// Recipe id.
+        id: String,
+    },
+    /// Check that everything a recipe names still exists.
+    Validate {
+        /// Recipe id.
+        id: String,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Instantiate a recipe.
+    Run {
+        /// Recipe id.
+        id: String,
+        /// Bind this alias once it is `Ready`.
+        #[arg(long, value_name = "ALIAS")]
+        alias: Option<String>,
+        /// Return a job id immediately.
+        #[arg(long)]
+        no_wait: bool,
+        /// Required when the recipe rents hardware.
+        #[arg(long)]
+        yes: bool,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `apexrouter profile …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum ProfileCmd {
+    /// Every saved search profile.
+    Ls(JsonFlag),
+    /// One profile in detail.
+    Show {
+        /// Profile id.
+        id: String,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a profile.
+    New(ProfileNewArgs),
+    /// Edit a profile as JSON in `$VISUAL`/`$EDITOR`.
+    Edit {
+        /// Profile id.
+        id: String,
+    },
+    /// Delete a profile.
+    Rm {
+        /// Profile id.
+        id: String,
+    },
+}
+
+/// `apexrouter profile new …`.
+#[derive(Debug, Clone, Args)]
+pub struct ProfileNewArgs {
+    /// Human label. The id is derived from it.
+    pub label: String,
+    /// Exact GPU names from the live vocabulary, comma separated.
+    #[arg(long, value_name = "N,N")]
+    pub gpu: Option<String>,
+    /// Minimum GPU count.
+    #[arg(long, default_value_t = 1)]
+    pub num_gpus_min: u32,
+    /// Maximum GPU count.
+    #[arg(long, default_value_t = 1)]
+    pub num_gpus_max: u32,
+    /// Ceiling on `dph_total`.
+    #[arg(long, value_name = "USD")]
+    pub max_price: Option<f64>,
+    /// `any`, `eu`, `eu-nordic`, `us`, or a comma-separated ISO-3166 alpha-2 list.
+    #[arg(long, value_name = "GEO")]
+    pub geo: Option<String>,
+    /// Minimum `reliability2`.
+    #[arg(long, default_value_t = 0.98)]
+    pub min_reliability: f32,
+    /// Minimum inbound bandwidth, Mbps.
+    #[arg(long, default_value_t = 200)]
+    pub min_inet_down: u32,
+    /// Minimum disk, GB.
+    #[arg(long, default_value_t = 60)]
+    pub min_disk_gb: u32,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter provider …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum ProviderCmd {
+    /// Every configured provider and where its credential lives.
+    Ls(JsonFlag),
+    /// One provider in detail.
+    Show {
+        /// Provider id.
+        id: String,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set the base URL, the key, or where the key lives.
+    Set(ProviderSetArgs),
+    /// Connection probe, plus an optional 16-token completion.
+    Test {
+        /// Provider id.
+        id: String,
+        /// Also send a completion, not just a connection probe.
+        #[arg(long)]
+        completion: bool,
+        /// Which model the completion should name.
+        #[arg(long, value_name = "M")]
+        model: Option<String>,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The live catalogue, grouped by org.
+    Models {
+        /// Provider id.
+        id: String,
+        /// Show only one org.
+        #[arg(long, value_name = "O")]
+        org: Option<String>,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `apexrouter provider set <id> …`.
+#[derive(Debug, Clone, Args)]
+pub struct ProviderSetArgs {
+    /// Provider id.
+    pub id: String,
+    /// The API root, stored **without** a trailing `/v1` and never rewritten.
+    #[arg(long, value_name = "U")]
+    pub base_url: Option<String>,
+    /// Name the environment variable holding the key.
+    #[arg(long, value_name = "VAR")]
+    pub key_env: Option<String>,
+    /// Name a file holding the key.
+    #[arg(long, value_name = "P")]
+    pub key_file: Option<PathBuf>,
+    /// Read the key from stdin. The only way a typed key reaches `credentials.toml`.
+    #[arg(long)]
+    pub key_stdin: bool,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter vast …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum VastCmd {
+    /// Credit, balance and whether the account can pay.
+    Account(JsonFlag),
+    /// Search the market.
+    Offers(VastOffersArgs),
+    /// The LIVE GPU-name vocabulary. Never a hardcoded enum.
+    GpuNames(JsonFlag),
+    /// Rent a box. **Spends money.**
+    Rent(VastRentArgs),
+    /// Rented instances, from the ledger when the daemon is down.
+    Ls {
+        /// Show only rows that are billing with no live record.
+        #[arg(long)]
+        orphans: bool,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Follow one instance's boot state machine until it is serving or dead.
+    Watch {
+        /// Instance id.
+        id: u64,
+    },
+    /// The instance's container log.
+    Log {
+        /// Instance id.
+        id: u64,
+        /// Keep printing as it grows.
+        #[arg(short = 'f', long)]
+        follow: bool,
+    },
+    /// The four SSH probes plus an RX sample.
+    Diagnose {
+        /// Instance id.
+        id: u64,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recover a stalled model download in place.
+    RestartDownload {
+        /// Instance id.
+        id: u64,
+    },
+    /// Destroy an instance. **Stops the billing; verifies before forgetting.**
+    Destroy {
+        /// Instance id. Omit with `--all`.
+        id: Option<u64>,
+        /// Destroy every instance the ledger believes is live.
+        #[arg(long)]
+        all: bool,
+        /// Required. There is no interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// `apexrouter vast offers …`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct VastOffersArgs {
+    /// Start from a saved search profile.
+    #[arg(long, value_name = "P")]
+    pub profile: Option<String>,
+    /// An exact GPU name from the live vocabulary, repeatable.
+    #[arg(long = "gpu", value_name = "NAME")]
+    pub gpus: Vec<String>,
+    /// Exactly this many GPUs.
+    #[arg(long)]
+    pub num_gpus: Option<u32>,
+    /// `any`, `eu`, `eu-nordic`, `us`, or a comma-separated ISO-3166 alpha-2 list.
+    #[arg(long, value_name = "GEO")]
+    pub geo: Option<String>,
+    /// Ceiling on `dph_total`.
+    #[arg(long, value_name = "USD")]
+    pub max_price: Option<f64>,
+    /// Row cap.
+    #[arg(long, default_value_t = 20)]
+    pub limit: u32,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter vast rent …`. Every field the money gate reads.
+#[derive(Debug, Clone, Args)]
+pub struct VastRentArgs {
+    /// The offer to take. Omit with `--auto`.
+    pub offer_id: Option<u64>,
+    /// Take the cheapest offer the profile matches.
+    #[arg(long, conflicts_with = "offer_id")]
+    pub auto: bool,
+    /// Which search profile describes the hardware.
+    #[arg(long, value_name = "P")]
+    pub profile: String,
+    /// HF repo for a GGUF launch.
+    #[arg(long, value_name = "R")]
+    pub model_repo: Option<String>,
+    /// Which quant within that repo.
+    #[arg(long, value_name = "Q")]
+    pub quant: Option<String>,
+    /// HF model id for a vLLM launch.
+    #[arg(long, value_name = "M")]
+    pub model_id: Option<String>,
+    /// Total context pool.
+    #[arg(long)]
+    pub ctx: Option<u32>,
+    /// Disk to request, GB.
+    #[arg(long, default_value_t = 120)]
+    pub disk_gb: u32,
+    /// The ceiling this approval carries. **Required.**
+    #[arg(long, value_name = "USD")]
+    pub max_hourly: f64,
+    /// Bind this alias once the box is serving.
+    #[arg(long, value_name = "ALIAS")]
+    pub alias: Option<String>,
+    /// Required. There is no interactive prompt.
+    #[arg(long)]
+    pub yes: bool,
+    /// Return a job id immediately instead of streaming `BootPhase`.
+    #[arg(long)]
+    pub no_wait: bool,
+    /// Print the quote and stop. Nothing is rented, nothing is reserved.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter tunnel …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum TunnelCmd {
+    /// Open a supervised tunnel to an instance.
+    Up {
+        /// Instance id.
+        instance_id: u64,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close one tunnel, or every tunnel.
+    Down {
+        /// Instance id. Omit to close them all.
+        id: Option<u64>,
+    },
+    /// Every tunnel and whether it is up.
+    Status(JsonFlag),
+}
+
+/// `apexrouter approvals …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum ApprovalsCmd {
+    /// Every request waiting for a human.
+    Ls(JsonFlag),
+    /// Approve one. **This is the money decision.**
+    Grant {
+        /// Approval id.
+        id: String,
+        /// Required. Granting is spending.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Refuse one.
+    Deny {
+        /// Approval id.
+        id: String,
+    },
+}
+
+/// `apexrouter hf …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum HfCmd {
+    /// Search GGUF repos.
+    Search {
+        /// The query. Empty lists the most-downloaded GGUF repos.
+        #[arg(default_value = "")]
+        query: String,
+        /// Row cap.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Authoritative per-file sizes, grouped by quant.
+    Files {
+        /// `owner/repo`.
+        repo: String,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download a quant, resume-capable and size-verified.
+    Get {
+        /// `owner/repo`.
+        repo: String,
+        /// A quant label from the grouped listing.
+        #[arg(long, value_name = "Q")]
+        quant: Option<String>,
+        /// An exact repo-relative path, repeatable. Wins over `--quant`.
+        #[arg(long = "file", value_name = "F")]
+        files: Vec<String>,
+        /// Also fetch the vision projector that pairs with the group.
+        #[arg(long)]
+        mmproj: bool,
+        /// Where to put it.
+        #[arg(long, value_name = "DIR")]
+        dest: Option<String>,
+        /// Return a job id immediately instead of following the download.
+        #[arg(long)]
+        no_wait: bool,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// `apexrouter usage …`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct UsageArgs {
+    /// `all`, a duration (`30m`, `24h`, `7d`, `4w`), or an absolute timestamp.
+    #[arg(long, value_name = "WINDOW", default_value = "24h")]
+    pub since: String,
+    /// How to bucket.
+    #[arg(long, value_enum, default_value_t = GroupByArg::Provider)]
+    pub by: GroupByArg,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter compare …`.
+#[derive(Debug, Clone, Args)]
+pub struct CompareArgs {
+    /// An alias to include, repeatable. At least two is the point.
+    #[arg(long = "alias", value_name = "A", required = true, num_args = 1..)]
+    pub aliases: Vec<String>,
+    /// The one prompt every alias gets.
+    #[arg(long, value_name = "P")]
+    pub prompt: String,
+    /// Generation budget per alias.
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter smoke …`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct SmokeArgs {
+    /// Smoke whatever this alias resolves to right now.
+    #[arg(long, value_name = "A")]
+    pub alias: Option<String>,
+    /// Smoke a URL directly, with or without a trailing `/v1`.
+    #[arg(long, value_name = "URL", conflicts_with = "alias")]
+    pub base_url: Option<String>,
+    /// Override the model id the probes ask for.
+    #[arg(long, value_name = "M")]
+    pub model: Option<String>,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter doctor …`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct DoctorArgs {
+    /// An exact check id, a namespace, or any fragment. Separators are ignored.
+    #[arg(long, value_name = "CHECK")]
+    pub only: Option<String>,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter migrate …`.
+#[derive(Debug, Clone, Default, Args)]
+pub struct MigrateArgs {
+    /// Print the plan and write nothing. The default.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Actually import. Without it, `migrate` only ever prints.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub apply: bool,
+    /// The legacy state directory. Must be named `.vastai-gguf`.
+    #[arg(long, value_name = "DIR")]
+    pub from: Option<PathBuf>,
+    /// The LocalRouter checkout.
+    #[arg(long, value_name = "PATH")]
+    pub localrouter: Option<PathBuf>,
+    /// Print the JSON envelope and nothing else.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `apexrouter token …`.
+#[derive(Debug, Clone, Subcommand)]
+pub enum TokenCmd {
+    /// Mint one. Shown **once**, never stored by this command.
+    Create {
+        /// Which scope the operator intends it to carry.
+        #[arg(long, value_enum, default_value_t = ScopeArg::Admin)]
+        scope: ScopeArg,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Where the daemon looks for a token, and whether it finds one.
+    Ls(JsonFlag),
+    /// How to take a token out of service.
+    Revoke {
+        /// The env var name, or the token's first characters.
+        id: String,
+    },
+}
+
+// ---------------------------------------------------------------------------------------
 // value enums — mirrors of protocol enums, because the protocol crate has no clap dep
 // ---------------------------------------------------------------------------------------
+
+/// `--mode` on `swap`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SwapModeArg {
+    /// Bring the new one up first. Needs VRAM for both.
+    Hot,
+    /// Stop the old one first. The only option when VRAM is tight.
+    Sequential,
+}
+
+impl From<SwapModeArg> for SwapMode {
+    fn from(m: SwapModeArg) -> SwapMode {
+        match m {
+            SwapModeArg::Hot => SwapMode::Hot,
+            SwapModeArg::Sequential => SwapMode::Sequential,
+        }
+    }
+}
+
+/// `--by` on `usage`. Defaults to `provider`, which is what the legacy `cost.py` printed.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum GroupByArg {
+    /// By provider id.
+    #[default]
+    Provider,
+    /// By upstream model id.
+    Model,
+    /// By backend id.
+    Backend,
+    /// By alias.
+    Alias,
+    /// By calendar day, UTC.
+    Day,
+}
+
+impl From<GroupByArg> for GroupBy {
+    fn from(g: GroupByArg) -> GroupBy {
+        match g {
+            GroupByArg::Provider => GroupBy::Provider,
+            GroupByArg::Model => GroupBy::Model,
+            GroupByArg::Backend => GroupBy::Backend,
+            GroupByArg::Alias => GroupBy::Alias,
+            GroupByArg::Day => GroupBy::Day,
+        }
+    }
+}
+
+impl GroupByArg {
+    /// The spelling `GET /v1/usage?by=` expects.
+    pub fn as_query(self) -> &'static str {
+        match self {
+            GroupByArg::Provider => "provider",
+            GroupByArg::Model => "model",
+            GroupByArg::Backend => "backend",
+            GroupByArg::Alias => "alias",
+            GroupByArg::Day => "day",
+        }
+    }
+}
+
+/// `--scope` on `token create`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ScopeArg {
+    /// Read-only.
+    Read,
+    /// Read and mutate.
+    Write,
+    /// Everything, including `/v1/tokens*` and `/v1/shutdown`.
+    Admin,
+}
+
+impl ScopeArg {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeArg::Read => "read",
+            ScopeArg::Write => "write",
+            ScopeArg::Admin => "admin",
+        }
+    }
+}
+
+/// Parse a `--geo` argument into the protocol filter.
+///
+/// `any`, `eu`, `eu-nordic`/`eu_nordic`/`nordic`, `us`, or a comma-separated ISO-3166
+/// alpha-2 list. The list form is what makes the filter honest about a country the four
+/// named groups do not cover.
+///
+/// # Errors
+/// When a code in the list is not two ASCII letters — a typo there silently rents in the
+/// wrong hemisphere otherwise.
+pub fn parse_geo(s: &str) -> anyhow::Result<GeoFilter> {
+    match s.trim().to_lowercase().as_str() {
+        "" | "any" => Ok(GeoFilter::Any),
+        "eu" => Ok(GeoFilter::Eu),
+        "eu-nordic" | "eu_nordic" | "nordic" => Ok(GeoFilter::EuNordic),
+        "us" => Ok(GeoFilter::Us),
+        _ => {
+            let codes = split_list(s);
+            for c in &codes {
+                if c.len() != 2 || !c.chars().all(|ch| ch.is_ascii_alphabetic()) {
+                    anyhow::bail!(
+                        "`{c}` is not an ISO-3166 alpha-2 country code — --geo takes \
+                         `any`, `eu`, `eu-nordic`, `us`, or a list like `CZ,PL,DE`"
+                    );
+                }
+            }
+            Ok(GeoFilter::Codes(
+                codes.iter().map(|c| c.to_uppercase()).collect(),
+            ))
+        }
+    }
+}
 
 /// `--kv`. The names are exactly the `-ctk`/`-ctv` flag values.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -667,6 +1480,45 @@ impl Command {
             | Command::Fit(_)
             | Command::Serve(_)
             | Command::External(_) => Need::Pure,
+            // `migrate` is an offline *writer*, like `config init`: it edits `config.toml`,
+            // the catalog and the ledger, so autostarting a daemon that would then be
+            // holding a stale copy of all three is exactly the wrong reflex.
+            Command::Migrate(_) => Need::Pure,
+            // A token is minted here and shown once; no daemon has to exist for that.
+            Command::Token { .. } => Need::Pure,
+            // Every check either reads this machine or reaches the network, and §7 puts
+            // `doctor` in ReadState so it answers with nothing running.
+            Command::Doctor(_) | Command::Usage(_) | Command::Env(_) => Need::ReadState,
+            Command::Recipe { cmd } => match cmd {
+                RecipeCmd::Ls(_) | RecipeCmd::Show { .. } => Need::ReadState,
+                _ => Need::Mutate,
+            },
+            Command::Profile { cmd } => match cmd {
+                ProfileCmd::Ls(_) | ProfileCmd::Show { .. } => Need::ReadState,
+                _ => Need::Mutate,
+            },
+            Command::Backend { cmd } => match cmd {
+                BackendCmd::Ls(_) | BackendCmd::Show { .. } => Need::ReadState,
+                _ => Need::Mutate,
+            },
+            Command::Tunnel { cmd } => match cmd {
+                TunnelCmd::Status(_) => Need::ReadState,
+                _ => Need::Mutate,
+            },
+            Command::Vast { cmd } => match cmd {
+                // The cached listing: the ledger is a file, and a box that is billing must
+                // stay visible when the daemon is not running.
+                VastCmd::Ls { .. } => Need::ReadState,
+                _ => Need::Mutate,
+            },
+            Command::Up(_)
+            | Command::Swap(_)
+            | Command::Open
+            | Command::Provider { .. }
+            | Command::Approvals { .. }
+            | Command::Hf { .. }
+            | Command::Compare(_)
+            | Command::Smoke(_) => Need::Mutate,
             Command::Config { cmd } => match cmd {
                 // `config init` is an offline *writer*: it takes the daemon lock itself,
                 // and thereby proves no daemon is running. It never wants one started.
@@ -738,6 +1590,74 @@ impl Command {
                 SwitchCmd::Local { json, .. }
                 | SwitchCmd::Endpoint { json, .. }
                 | SwitchCmd::Alias { json, .. } => *json,
+            },
+            Command::Up(a) => a.json,
+            Command::Swap(a) => a.json,
+            Command::Open => false,
+            Command::Env(a) => a.json,
+            Command::Usage(a) => a.json,
+            Command::Compare(a) => a.json,
+            Command::Smoke(a) => a.json,
+            Command::Doctor(a) => a.json,
+            Command::Migrate(a) => a.json,
+            Command::Backend { cmd } => match cmd {
+                BackendCmd::Ls(a) => a.json,
+                BackendCmd::Show { json, .. } | BackendCmd::Probe { json, .. } => *json,
+                BackendCmd::Add(a) => a.json,
+                BackendCmd::Enable { .. }
+                | BackendCmd::Disable { .. }
+                | BackendCmd::Drain { .. }
+                | BackendCmd::Rm { .. } => false,
+            },
+            Command::Recipe { cmd } => match cmd {
+                RecipeCmd::Ls(a) => a.json,
+                RecipeCmd::Show { json, .. }
+                | RecipeCmd::New { json, .. }
+                | RecipeCmd::Validate { json, .. }
+                | RecipeCmd::Run { json, .. } => *json,
+                RecipeCmd::Edit { .. } | RecipeCmd::Rm { .. } => false,
+            },
+            Command::Profile { cmd } => match cmd {
+                ProfileCmd::Ls(a) => a.json,
+                ProfileCmd::Show { json, .. } => *json,
+                ProfileCmd::New(a) => a.json,
+                ProfileCmd::Edit { .. } | ProfileCmd::Rm { .. } => false,
+            },
+            Command::Provider { cmd } => match cmd {
+                ProviderCmd::Ls(a) => a.json,
+                ProviderCmd::Show { json, .. }
+                | ProviderCmd::Test { json, .. }
+                | ProviderCmd::Models { json, .. } => *json,
+                ProviderCmd::Set(a) => a.json,
+            },
+            Command::Vast { cmd } => match cmd {
+                VastCmd::Account(a) | VastCmd::GpuNames(a) => a.json,
+                VastCmd::Offers(a) => a.json,
+                VastCmd::Rent(a) => a.json,
+                VastCmd::Ls { json, .. } | VastCmd::Diagnose { json, .. } => *json,
+                VastCmd::Watch { .. }
+                | VastCmd::Log { .. }
+                | VastCmd::RestartDownload { .. }
+                | VastCmd::Destroy { .. } => false,
+            },
+            Command::Tunnel { cmd } => match cmd {
+                TunnelCmd::Status(a) => a.json,
+                TunnelCmd::Up { json, .. } => *json,
+                TunnelCmd::Down { .. } => false,
+            },
+            Command::Approvals { cmd } => match cmd {
+                ApprovalsCmd::Ls(a) => a.json,
+                ApprovalsCmd::Grant { .. } | ApprovalsCmd::Deny { .. } => false,
+            },
+            Command::Hf { cmd } => match cmd {
+                HfCmd::Search { json, .. }
+                | HfCmd::Files { json, .. }
+                | HfCmd::Get { json, .. } => *json,
+            },
+            Command::Token { cmd } => match cmd {
+                TokenCmd::Ls(a) => a.json,
+                TokenCmd::Create { json, .. } => *json,
+                TokenCmd::Revoke { .. } => false,
             },
         }
     }
@@ -916,11 +1836,240 @@ mod tests {
 
     #[test]
     fn an_unimplemented_verb_lands_in_external_rather_than_a_clap_error() {
-        let cli = Cli::parse_from(["apexrouter", "up", "Carnice-9b-Q6_K", "--alias", "auto"]);
+        // `mcp` belongs to M-01 and is intercepted in `main` before clap; until it lands it
+        // is the verb that proves the fallback still reports an owner rather than clap's
+        // bare "unrecognized subcommand".
+        let cli = Cli::parse_from(["apexrouter", "mcp", "--proxy", "http://127.0.0.1:2739"]);
         match cli.verb() {
-            Command::External(args) => assert_eq!(args[0], "up"),
+            Command::External(args) => assert_eq!(args[0], "mcp"),
             other => panic!("expected External, got {other:?}"),
         }
+    }
+
+    /// The S-08 half of ARCHITECTURE §7, line by line.
+    #[test]
+    fn the_s08_surface_parses() {
+        let cases: Vec<Vec<&str>> = vec![
+            vec!["apexrouter", "up", "Carnice-9b-Q6_K", "--alias", "auto"],
+            vec![
+                "apexrouter",
+                "swap",
+                "auto",
+                "--to",
+                "local-carnice",
+                "--mode",
+                "sequential",
+            ],
+            vec!["apexrouter", "open"],
+            vec!["apexrouter", "env"],
+            vec!["apexrouter", "backend", "ls", "--json"],
+            vec![
+                "apexrouter",
+                "backend",
+                "add",
+                "http://127.0.0.1:8100",
+                "--label",
+                "box",
+                "--tag",
+                "local",
+                "--key-env",
+                "SOME_KEY",
+            ],
+            vec!["apexrouter", "backend", "probe", "local-carnice"],
+            vec!["apexrouter", "backend", "rm", "local-carnice"],
+            vec!["apexrouter", "recipe", "ls", "--json"],
+            vec![
+                "apexrouter",
+                "recipe",
+                "new",
+                "--from-endpoint",
+                "local-carnice",
+            ],
+            vec!["apexrouter", "recipe", "validate", "carnice"],
+            vec!["apexrouter", "recipe", "run", "carnice", "--alias", "auto"],
+            vec!["apexrouter", "profile", "ls"],
+            vec![
+                "apexrouter",
+                "profile",
+                "new",
+                "two-3090s",
+                "--gpu",
+                "RTX 3090",
+                "--num-gpus-min",
+                "2",
+                "--geo",
+                "EU",
+            ],
+            vec!["apexrouter", "provider", "ls", "--json"],
+            vec![
+                "apexrouter",
+                "provider",
+                "set",
+                "together",
+                "--base-url",
+                "https://api.together.ai",
+                "--key-env",
+                "TOGETHER_API_KEY",
+            ],
+            vec!["apexrouter", "provider", "test", "together"],
+            vec![
+                "apexrouter",
+                "provider",
+                "models",
+                "together",
+                "--org",
+                "Qwen",
+            ],
+            vec!["apexrouter", "vast", "account", "--json"],
+            vec![
+                "apexrouter",
+                "vast",
+                "offers",
+                "--profile",
+                "two-3090s",
+                "--gpu",
+                "RTX 3090",
+                "--num-gpus",
+                "2",
+                "--geo",
+                "EU",
+                "--max-price",
+                "0.5",
+                "--json",
+            ],
+            vec!["apexrouter", "vast", "gpu-names", "--json"],
+            vec![
+                "apexrouter",
+                "vast",
+                "rent",
+                "--auto",
+                "--profile",
+                "two-3090s",
+                "--model-repo",
+                "unsloth/Qwen3-GGUF",
+                "--quant",
+                "Q4_K_M",
+                "--max-hourly",
+                "0.6",
+                "--yes",
+                "--no-wait",
+            ],
+            vec!["apexrouter", "vast", "ls", "--orphans", "--json"],
+            vec!["apexrouter", "vast", "watch", "12345"],
+            vec!["apexrouter", "vast", "log", "12345", "-f"],
+            vec!["apexrouter", "vast", "diagnose", "12345"],
+            vec!["apexrouter", "vast", "restart-download", "12345"],
+            vec!["apexrouter", "vast", "destroy", "12345", "--yes"],
+            vec!["apexrouter", "vast", "destroy", "--all", "--yes"],
+            vec!["apexrouter", "tunnel", "up", "12345"],
+            vec!["apexrouter", "tunnel", "down"],
+            vec!["apexrouter", "tunnel", "status", "--json"],
+            vec!["apexrouter", "approvals", "ls"],
+            vec!["apexrouter", "approvals", "grant", "01J", "--yes"],
+            vec!["apexrouter", "approvals", "deny", "01J"],
+            vec!["apexrouter", "hf", "search", "qwen3 gguf", "--json"],
+            vec!["apexrouter", "hf", "files", "unsloth/Qwen3-GGUF", "--json"],
+            vec![
+                "apexrouter",
+                "hf",
+                "get",
+                "unsloth/Qwen3-GGUF",
+                "--quant",
+                "UD-Q4_K_XL",
+                "--no-wait",
+            ],
+            vec![
+                "apexrouter",
+                "usage",
+                "--since",
+                "7d",
+                "--by",
+                "model",
+                "--json",
+            ],
+            vec![
+                "apexrouter",
+                "compare",
+                "--alias",
+                "a",
+                "--alias",
+                "b",
+                "--prompt",
+                "hi",
+                "--max-tokens",
+                "64",
+                "--json",
+            ],
+            vec!["apexrouter", "smoke", "--alias", "auto", "--json"],
+            vec!["apexrouter", "smoke", "--base-url", "http://127.0.0.1:8100"],
+            vec!["apexrouter", "doctor", "--only", "creds", "--json"],
+            vec!["apexrouter", "migrate", "--dry-run"],
+            vec!["apexrouter", "migrate", "--apply"],
+            vec!["apexrouter", "token", "create", "--scope", "admin"],
+            vec!["apexrouter", "token", "ls"],
+            vec!["apexrouter", "token", "revoke", "APEXROUTER_TOKEN"],
+        ];
+        for case in cases {
+            Cli::try_parse_from(&case).unwrap_or_else(|e| panic!("{case:?} did not parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_money_verb_refuses_to_parse_without_its_required_ceiling() {
+        // `--max-hourly` is not optional: a rent with no ceiling is an unbounded approval.
+        assert!(Cli::try_parse_from([
+            "apexrouter",
+            "vast",
+            "rent",
+            "--auto",
+            "--profile",
+            "p",
+            "--yes"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn geo_accepts_the_named_groups_and_an_explicit_list() {
+        assert_eq!(parse_geo("any").expect("any"), GeoFilter::Any);
+        assert_eq!(parse_geo("EU").expect("eu"), GeoFilter::Eu);
+        assert_eq!(parse_geo("eu-nordic").expect("nordic"), GeoFilter::EuNordic);
+        assert_eq!(
+            parse_geo("cz, pl").expect("codes"),
+            GeoFilter::Codes(vec!["CZ".to_string(), "PL".to_string()])
+        );
+        assert!(parse_geo("Czechia").is_err(), "a country NAME is a typo");
+    }
+
+    #[test]
+    fn the_s08_need_and_json_tables_agree_with_the_architecture() {
+        let need = |args: &[&str]| Cli::parse_from(args).verb().need();
+        assert_eq!(need(&["apexrouter", "usage"]), Need::ReadState);
+        assert_eq!(need(&["apexrouter", "doctor"]), Need::ReadState);
+        assert_eq!(need(&["apexrouter", "vast", "ls"]), Need::ReadState);
+        assert_eq!(need(&["apexrouter", "recipe", "ls"]), Need::ReadState);
+        assert_eq!(need(&["apexrouter", "profile", "ls"]), Need::ReadState);
+        assert_eq!(need(&["apexrouter", "migrate"]), Need::Pure);
+        assert_eq!(need(&["apexrouter", "token", "create"]), Need::Pure);
+        assert_eq!(
+            need(&["apexrouter", "up", "carnice"]),
+            Need::Mutate,
+            "starting something is a mutation"
+        );
+        assert_eq!(
+            need(&[
+                "apexrouter",
+                "vast",
+                "rent",
+                "--auto",
+                "--profile",
+                "p",
+                "--max-hourly",
+                "1",
+                "--yes"
+            ]),
+            Need::Mutate
+        );
     }
 
     #[test]

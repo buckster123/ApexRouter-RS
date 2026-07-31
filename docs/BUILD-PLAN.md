@@ -615,10 +615,31 @@ pub struct RigSnapshot { pub gpus: Vec<Gpu>, pub builds: Vec<LlamaBuild>,
     pub ram_total_mb: u64, pub ram_free_mb: u64, pub swap_total_mb: u64, pub swap_used_mb: u64,
     pub cpu_threads: u32, pub scanned_at_unix: i64 }
 
+/// ONE ENUMERATION, NOT ONE PIECE OF SILICON. Two backends see the same card as two `Gpu`s.
 pub struct Gpu { pub device: String, pub index: u32, pub name: String, pub backend: Backend,
-    pub vram_total_mb: u64, pub vram_free_mb: u64, pub driver: Option<String>,
+    pub vram_total_mb: u64, pub vram_free_mb: u64, pub pci_bus_id: Option<String>,
+    pub driver: Option<String>,
     pub is_software: bool, pub seen_by_builds: Vec<BuildId>,
     pub held_by: Vec<BackendId>, pub reserved_mb: u64 }
+impl Gpu {
+    pub fn vram_used_mb(&self) -> Option<u64>;   // None when free > total (GTT). NEVER subtract.
+    pub fn reports_gtt_overcommit(&self) -> bool;
+    pub fn physical_key(&self, ordinal: usize) -> String;
+}
+
+/// One piece of silicon; every backend enumeration that reaches it. Derived, never stored.
+pub struct PhysicalDevice { pub key: String, pub pci_bus_id: Option<String>, pub name: String,
+    pub is_software: bool, pub views: Vec<Gpu> }
+impl PhysicalDevice {
+    pub fn backends(&self) -> Vec<Backend>;
+    pub fn device_tokens(&self) -> Vec<String>;
+    pub fn view_for(&self, backend: &Backend) -> Option<&Gpu>;  // VRAM is per backend, on purpose
+    pub fn held_by(&self) -> Vec<BackendId>;
+    pub fn seen_by_builds(&self) -> Vec<BuildId>;
+}
+impl RigSnapshot { pub fn physical_devices(&self) -> Vec<PhysicalDevice>; }
+pub fn physical_devices(gpus: &[Gpu]) -> Vec<PhysicalDevice>;
+pub fn normalise_device_name(name: &str) -> String;
 
 pub enum Backend { Vulkan, Cuda, Rocm, Hip, Metal, Sycl, Cpu, Other(String) }
 
@@ -649,8 +670,11 @@ pub struct BinaryChoiceInfo { pub chosen: BuildId, pub exact: bool,
 
 ```rust
 pub struct DeviceBudget { pub device: String, pub free_mb: u64, pub reserved_mb: u64 }
+/// PER BACKEND. One llama-server process uses one backend, so `devices` are all on `backend`
+/// and this is never a sum across backends.
 pub struct VramBudget { pub devices: Vec<DeviceBudget>, pub margin_mb: u64,
-                        pub host_ram_free_mb: u64 }
+                        pub host_ram_free_mb: u64,
+                        pub backend: Option<Backend>, pub notes: Vec<String> }
 impl VramBudget {
     pub fn total_usable_mb(&self) -> u64;   // Σ (free - reserved) - margin, saturating
     pub fn largest_usable_mb(&self) -> u64;
@@ -1264,7 +1288,9 @@ Carnice file, handles typed KV/array/string values, and never reads more than 8 
 **C-11 · the fit solver** — owns `core/src/fit.rs`
 ```rust
 pub fn fit(input: &FitInput) -> FitPlan;                              // pure, no I/O
-pub fn budget_from_rig(rig: &RigSnapshot, devices: &[String], margin_mb: u64,
+pub enum BackendScope<'a> { Build(&'a BuildId), Backend(&'a Backend), Auto }
+pub fn budget_from_rig(rig: &RigSnapshot, scope: BackendScope<'_>, devices: &[String],
+                       margin_mb: u64,
                        running: &[EndpointRecord]) -> VramBudget;     // subtracts reservations
 ```
 *Acceptance*: unit tests calibrate against the archived run log in `docs/port/03` — Qwen3.5-9B
@@ -1273,6 +1299,28 @@ Q4_K_M, ctx 32768, kv q8_0, Vulkan → 5956 MiB total = 4861 weights + 594 KV + 
 `parallel`. A multi-device budget sums correctly and `per_device_mb` splits by `tensor_split` when
 given, else evenly by `SplitMode::Layer`. `budget_from_rig` subtracts `fit.weights+kv+compute` of
 every `EndpointRecord` whose `desired == Running`. `why[]` is non-empty and human-readable.
+**A budget is per backend and is NEVER a sum across backends** (MK1-CORE acceptance finding A):
+`scope` resolves to exactly one backend, `devices` narrows within it and can never widen across it,
+and everything dropped lands in `VramBudget::notes` → `FitPlan::why`. A synthetic two-backend
+one-device rig must not sum; a synthetic 4-card CUDA rig must. Reservations are attributed by
+`Gpu::physical_key`, so a card held through one backend is subtracted from its budget under
+another. `fit()` refuses to add up a caller-supplied budget whose tokens mix backends: the largest
+single-backend group wins, loudly.
+
+**C-11b · physical device identity** — owns `core/src/discover/physical.rs`
+```rust
+pub struct PciGpu { pub bus_id: String, pub vendor_id: u16, pub device_id: u16,
+                    pub vendor: GpuVendor }
+pub enum GpuVendor { Amd, Nvidia, Intel, Unknown }
+pub fn scan_pci_gpus() -> Vec<PciGpu>;                  // /sys/bus/pci/devices, class 0x03xxxx
+pub fn scan_pci_gpus_in(root: &Path) -> Vec<PciGpu>;    // same, against a synthetic sysfs
+pub fn attach_pci_ids(gpus: &mut [Gpu], pci: &[PciGpu]);   // pure; called by probe_devices
+```
+*Acceptance*: on the real machine both `ROCm0` and `Vulkan0` come back with
+`pci_bus_id == Some("0000:04:00.0")` and `RigSnapshot::physical_devices()` returns **one** device
+with two backends. Alignment is per backend, bucketed by the vendor inferred from the device name,
+and happens **only** when the counts agree exactly — an ambiguous rig gets `None` and falls back to
+the documented name heuristic rather than to a guess. `llvmpipe` never receives a bus id.
 
 **C-12 · the argv/env builder (ONE builder, both targets)** — owns `core/src/argv.rs`
 ```rust
@@ -2167,6 +2215,7 @@ Quick check that no file is owned twice. If you are about to write a file not on
 | C-09 | `core/src/discover/builds.rs`, `core/src/discover/mod.rs` |
 | C-10 | `core/src/discover/models.rs`, `core/src/discover/gguf.rs` |
 | C-11 | `core/src/fit.rs` |
+| C-11b | `core/src/discover/physical.rs` |
 | C-12 | `core/src/argv.rs` |
 | C-13 | `core/src/upstream.rs` |
 | C-14 | `core/src/usage.rs`, `core/src/pricing.rs` |

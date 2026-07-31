@@ -1,0 +1,373 @@
+// OWNER: unit U-02. Screen 2 — Backends.
+//
+// One list, one detail pane, one log pane. Replaces LocalRouter's Local-status +
+// Instances + Providers menus with a single surface, and every verb on it writes:
+// probe · enable/disable · drain · bind to alias · stop · restart · destroy · forget.
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, KV, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, PaneScroll, Empty } from "../components/table.slint";
+import { Btn, Field, Toggle, Chooser, Labeled } from "../components/widgets.slint";
+import { LogView } from "../components/logview.slint";
+
+export component BackendsScreen inherits HorizontalLayout {
+    spacing: Palette.gap;
+
+    VerticalLayout {
+        horizontal-stretch: 3;
+        spacing: Palette.gap;
+
+        Card {
+            title: "backends";
+            subtitle: State.device-filter == "" ? State.backends.length + " known"
+                : "filtered by " + State.device-filter;
+            vertical-stretch: 1;
+
+            HeadRow {
+                HeadCell {
+                    text: "id";
+                    width: 160px;
+                }
+                HeadCell { text: "label / models"; }
+                HeadCell {
+                    text: "kind";
+                    width: 96px;
+                }
+                HeadCell {
+                    text: "health";
+                    width: 110px;
+                }
+                HeadCell {
+                    text: "slots";
+                    width: 60px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "queue";
+                    width: 52px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "p50/p95";
+                    width: 96px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "price";
+                    width: 96px;
+                    numeric: true;
+                }
+            }
+            ListScroll {
+                rows: State.backends.length;
+                VerticalLayout {
+                    spacing: 0px;
+                    alignment: start;
+                    width: parent.width;
+                    for b[i] in State.backends: Row {
+                        striped: Math.mod(i, 2) == 1;
+                        selected: b.id == State.backend-sel;
+                        clicked => {
+                            State.backend-select(b.id);
+                        }
+                        Cell {
+                            text: b.id;
+                            width: 160px;
+                            mono: true;
+                            level: b.enabled ? 0 : 2;
+                        }
+                        Cell { text: b.label + (b.models == "" ? "" : "  ·  " + b.models); }
+                        Cell {
+                            text: b.kind;
+                            width: 96px;
+                        }
+                        HorizontalLayout {
+                            width: 110px;
+                            spacing: 5px;
+                            Dot { level: b.level; }
+                            Cell {
+                                text: b.health;
+                                level: b.level;
+                            }
+                        }
+                        Cell {
+                            text: b.slots;
+                            width: 60px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: b.queue;
+                            width: 52px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: b.latency;
+                            width: 96px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: b.price;
+                            width: 96px;
+                            numeric: true;
+                            mono: true;
+                        }
+                    }
+                    if State.backends.length == 0: Empty {
+                        message: "no backends — start one from Launch, or register a node URL on the right";
+                    }
+                }
+            }
+        }
+
+        LogView {
+            vertical-stretch: 1;
+            min-height: 180px;
+            lines: State.log-lines;
+            follow <=> State.log-follow;
+            filter <=> State.log-filter;
+            hidden-count: State.log-hidden;
+            source: State.log-source;
+            title: "logs";
+            reload => {
+                State.log-open(State.backend-sel);
+            }
+            clear => {
+                State.log-clear();
+            }
+            filter-changed(f) => {
+                State.log-filter-changed(f);
+            }
+        }
+    }
+
+    // ── Detail + actions ──────────────────────────────────────────────────
+    VerticalLayout {
+        horizontal-stretch: 2;
+        spacing: Palette.gap;
+        min-width: 340px;
+
+        Card {
+            title: State.backend-sel == "" ? "no backend selected" : State.backend-sel;
+            vertical-stretch: 1;
+
+            if State.backend-sel == "": Empty {
+                message: "pick a row to probe, drain, bind, stop or destroy it";
+            }
+
+            if State.backend-sel != "": PaneScroll {
+                content-height: 470px;
+                VerticalLayout {
+                    width: parent.width;
+                    spacing: 4px;
+                    alignment: start;
+
+                    KV {
+                        key: "label";
+                        value: State.sel-label;
+                    }
+                    KV {
+                        key: "kind";
+                        value: State.sel-kind + " / " + State.sel-protocol;
+                    }
+                    KV {
+                        key: "base url";
+                        value: State.sel-base-url;
+                        mono: true;
+                    }
+                    KV {
+                        key: "health";
+                        value: State.sel-health;
+                        level: State.sel-level;
+                    }
+                    KV {
+                        key: "models";
+                        value: State.sel-models;
+                        mono: true;
+                    }
+                    KV {
+                        key: "devices";
+                        value: State.sel-devices;
+                        mono: true;
+                    }
+                    KV {
+                        key: "tags";
+                        value: State.sel-tags;
+                        mono: true;
+                    }
+                    KV {
+                        key: "slots / queue";
+                        value: State.sel-slots + " / " + State.sel-queue;
+                        mono: true;
+                    }
+                    KV {
+                        key: "latency";
+                        value: State.sel-latency;
+                        mono: true;
+                    }
+                    KV {
+                        key: "price";
+                        value: State.sel-price;
+                        mono: true;
+                    }
+                    KV {
+                        key: "uptime";
+                        value: State.sel-uptime;
+                        mono: true;
+                    }
+                    if State.sel-last-error != "": Banner {
+                        message: "last error";
+                        detail: State.sel-last-error;
+                        level: 3;
+                    }
+
+                    Hairline { }
+
+                    HorizontalLayout {
+                        spacing: 5px;
+                        Btn {
+                            label: "probe";
+                            icon: "◎";
+                            compact: true;
+                            clicked => {
+                                State.backend-probe(State.backend-sel);
+                            }
+                        }
+                        Btn {
+                            label: State.sel-enabled ? "disable" : "enable";
+                            compact: true;
+                            clicked => {
+                                State.backend-set-enabled(State.backend-sel, !State.sel-enabled);
+                            }
+                        }
+                        Btn {
+                            label: "drain";
+                            compact: true;
+                            clicked => {
+                                State.backend-drain(State.backend-sel);
+                            }
+                        }
+                        Btn {
+                            label: "logs";
+                            compact: true;
+                            clicked => {
+                                State.log-open(State.backend-sel);
+                            }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        Btn {
+                            label: "stop";
+                            compact: true;
+                            enabled: State.sel-stoppable;
+                            clicked => {
+                                State.backend-stop(State.backend-sel);
+                            }
+                        }
+                        Btn {
+                            label: "restart";
+                            compact: true;
+                            enabled: State.sel-stoppable;
+                            clicked => {
+                                State.backend-restart(State.backend-sel);
+                            }
+                        }
+                        Btn {
+                            label: "forget";
+                            compact: true;
+                            clicked => {
+                                State.backend-forget(State.backend-sel);
+                            }
+                        }
+                        Rectangle { }
+                        Btn {
+                            label: "destroy";
+                            kind: 2;
+                            icon: "✕";
+                            compact: true;
+                            clicked => {
+                                State.backend-destroy(State.backend-sel);
+                            }
+                        }
+                    }
+
+                    Hairline { }
+
+                    Text {
+                        text: "bind to alias — a hot swap, no restart";
+                        color: Palette.muted;
+                        font-size: Palette.font-sm;
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        Chooser {
+                            options: State.aliases;
+                            current <=> State.bind-alias-index;
+                            placeholder: "alias";
+                        }
+                        Btn {
+                            label: "bind";
+                            kind: 1;
+                            clicked => {
+                                State.backend-bind(
+                                    State.bind-alias-index >= 0
+                                        && State.bind-alias-index < State.aliases.length
+                                        ? State.aliases[State.bind-alias-index] : "",
+                                    State.backend-sel);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Register a remote node ────────────────────────────────────────
+        Card {
+            title: "register a node";
+            subtitle: "any OpenAI-compatible URL";
+            vertical-stretch: 0;
+            HorizontalLayout {
+                spacing: 5px;
+                Field {
+                    horizontal-stretch: 2;
+                    value <=> State.node-url;
+                    mono: true;
+                    placeholder: "http://127.0.0.1:8100";
+                }
+                Field {
+                    horizontal-stretch: 1;
+                    value <=> State.node-label;
+                    placeholder: "label";
+                }
+            }
+            HorizontalLayout {
+                spacing: 5px;
+                Field {
+                    horizontal-stretch: 2;
+                    value <=> State.node-models;
+                    mono: true;
+                    placeholder: "declared models (comma separated, optional)";
+                }
+                Field {
+                    horizontal-stretch: 1;
+                    value <=> State.node-tags;
+                    mono: true;
+                    placeholder: "tags";
+                }
+                Btn {
+                    label: "register";
+                    kind: 1;
+                    icon: "+";
+                    clicked => {
+                        State.backend-register();
+                    }
+                }
+            }
+        }
+    }
+}

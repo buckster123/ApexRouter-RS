@@ -1,0 +1,459 @@
+// OWNER: unit U-02. Screen 0 — Dashboard.
+//
+// The router bar and the rig strip live in AppWindow because §10 says "always visible";
+// this screen is the rest of it: standing alerts, aggregate stats, backend cards with
+// health dots, background jobs, and the live request ticker straight off the WS.
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, KV, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip, CostBadge } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, Empty } from "../components/table.slint";
+import { Btn } from "../components/widgets.slint";
+
+component Stat inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <int> level: 0;
+    spacing: 2px;
+    Text {
+        text: root.label;
+        color: Palette.muted;
+        font-size: Palette.font-sm;
+    }
+    Text {
+        text: root.value;
+        color: root.level == 0 ? Palette.ink : Palette.level-color(root.level);
+        font-size: Palette.font-xl;
+        font-family: Palette.mono;
+    }
+}
+
+component BackendCard inherits Rectangle {
+    in property <string> id;
+    in property <string> label;
+    in property <string> kind;
+    in property <string> health;
+    in property <int> level: 0;
+    in property <string> models;
+    in property <string> slots;
+    in property <string> queue;
+    in property <string> latency;
+    in property <string> price;
+    in property <string> devices;
+    in property <string> last-error;
+    in property <string> uptime;
+    callback clicked();
+
+    height: root.last-error == "" ? 62px : 78px;
+    background: ta.has-hover ? Palette.surface-hi : Palette.surface;
+    border-width: Palette.hair;
+    border-color: Palette.hairline;
+    border-radius: Palette.radius;
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+    VerticalLayout {
+        padding: Palette.pad-sm;
+        spacing: 3px;
+        HorizontalLayout {
+            spacing: Palette.gap;
+            Dot {
+                level: root.level;
+            }
+            Text {
+                text: root.label;
+                color: Palette.ink;
+                font-size: Palette.font;
+                font-weight: 700;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Badge {
+                label: root.kind;
+                level: 0;
+                icon: "▣";
+            }
+            Badge {
+                label: root.health;
+                level: root.level;
+            }
+            Rectangle { }
+            Text {
+                text: root.uptime;
+                color: Palette.muted;
+                font-size: Palette.font-sm;
+                font-family: Palette.mono;
+                vertical-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: Palette.gap;
+            Text {
+                text: root.models;
+                color: Palette.ink-2;
+                font-size: Palette.font-sm;
+                font-family: Palette.mono;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            Rectangle { }
+            Text {
+                text: "slots " + root.slots + " · queue " + root.queue + " · " + root.latency
+                    + " · " + root.price + (root.devices == "" ? "" : " · " + root.devices);
+                color: Palette.muted;
+                font-size: Palette.font-sm;
+                font-family: Palette.mono;
+                vertical-alignment: center;
+            }
+        }
+        if root.last-error != "": Text {
+            text: root.last-error;
+            color: Palette.serious;
+            font-size: Palette.font-sm;
+            font-family: Palette.mono;
+            overflow: elide;
+        }
+    }
+}
+
+export component DashboardScreen inherits VerticalLayout {
+    spacing: Palette.gap;
+
+    // ── Standing alerts. Critical is reserved for money leaking. ──────────
+    if State.alerts.length > 0: VerticalLayout {
+        spacing: 4px;
+        for a in State.alerts: Banner {
+            message: a.message;
+            detail: a.at;
+            level: a.level;
+            HorizontalLayout {
+                alignment: start;
+                spacing: Palette.gap;
+                if a.action != "": Btn {
+                    label: a.action;
+                    kind: a.level >= 4 ? 2 : 0;
+                    compact: true;
+                    clicked => {
+                        State.alert-act(a.id, a.action);
+                    }
+                }
+            }
+        }
+    }
+
+    if !State.table-valid: Banner {
+        message: "the on-disk route table failed to compile — the previous table is still serving";
+        detail: State.table-error;
+        level: 3;
+    }
+
+    // ── Aggregate stats ───────────────────────────────────────────────────
+    Card {
+        vertical-stretch: 0;
+        HorizontalLayout {
+            spacing: 28px;
+            Stat {
+                label: "in flight";
+                value: State.inflight + "";
+            }
+            Stat {
+                label: "req/min";
+                value: State.req-per-min;
+            }
+            Stat {
+                label: "tok/s";
+                value: State.tok-per-s;
+            }
+            Stat {
+                label: "spend 24 h";
+                value: State.spend-24h;
+            }
+            Stat {
+                label: "credit";
+                value: State.credit;
+            }
+            Stat {
+                label: "burn";
+                value: State.burn-rate;
+                level: State.burn-rate == "$0.00/hr" ? 0 : 2;
+            }
+            Rectangle { }
+            VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+                HorizontalLayout {
+                    alignment: end;
+                    spacing: Palette.gap;
+                    Badge {
+                        label: State.spend-metered ? "metered" : "approximate";
+                        level: State.spend-metered ? 1 : 2;
+                        icon: State.spend-metered ? "=" : "~";
+                    }
+                    Badge {
+                        label: State.served-by;
+                        level: State.served-by == "daemon" ? 1 : 2;
+                        icon: "◆";
+                    }
+                    if State.stale: Badge {
+                        label: "stale";
+                        level: 2;
+                        icon: "⌛";
+                    }
+                }
+                Text {
+                    text: "uptime " + State.uptime + " · burn-down " + State.burn-down;
+                    color: Palette.muted;
+                    font-size: Palette.font-sm;
+                    font-family: Palette.mono;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Palette.gap;
+
+        // ── Backend cards ─────────────────────────────────────────────────
+        Card {
+            title: "backends";
+            subtitle: State.device-filter == "" ? "" : "filtered by " + State.device-filter;
+            horizontal-stretch: 3;
+            HorizontalLayout {
+                alignment: start;
+                spacing: Palette.gap;
+                vertical-stretch: 0;
+                if State.device-filter != "": Chip {
+                    label: "clear filter: " + State.device-filter;
+                    active: true;
+                    clicked => {
+                        State.filter-by-device("");
+                    }
+                }
+            }
+            ListScroll {
+                rows: State.backends.length;
+                row-height: 68px;
+                VerticalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    width: parent.width;
+                    for b in State.backends: BackendCard {
+                        id: b.id;
+                        label: b.label;
+                        kind: b.kind;
+                        health: b.health;
+                        level: b.level;
+                        models: b.models;
+                        slots: b.slots;
+                        queue: b.queue;
+                        latency: b.latency;
+                        price: b.price;
+                        devices: b.devices;
+                        last-error: b.last-error;
+                        uptime: b.uptime;
+                        clicked => {
+                            State.backend-select(b.id);
+                            State.screen = 2;
+                        }
+                    }
+                    if State.backends.length == 0: Empty {
+                        message: "no backends — open Launch to start one, or register a node URL on the Backends screen";
+                    }
+                }
+            }
+        }
+
+        // ── Jobs ──────────────────────────────────────────────────────────
+        Card {
+            title: "jobs";
+            horizontal-stretch: 1;
+            ListScroll {
+                rows: State.jobs.length;
+                row-height: 42px;
+                VerticalLayout {
+                    spacing: 4px;
+                    alignment: start;
+                    width: parent.width;
+                    for j in State.jobs: Rectangle {
+                        height: 38px;
+                        background: Palette.surface-lo;
+                        border-radius: Palette.radius-sm;
+                        VerticalLayout {
+                            padding: 5px;
+                            spacing: 2px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: j.kind;
+                                    color: Palette.ink-2;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                }
+                                Rectangle { }
+                                Badge {
+                                    label: j.state;
+                                    level: j.level;
+                                }
+                                if j.state == "running" || j.state == "pending": Btn {
+                                    label: "cancel";
+                                    compact: true;
+                                    kind: 3;
+                                    clicked => {
+                                        State.cancel-job(j.id);
+                                    }
+                                }
+                            }
+                            Text {
+                                text: j.message;
+                                color: Palette.muted;
+                                font-size: Palette.font-sm;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    if State.jobs.length == 0: Empty {
+                        message: "no background jobs";
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Live request ticker ───────────────────────────────────────────────
+    Card {
+        title: "live requests";
+        subtitle: "prompts are not captured unless capture_bodies is on";
+        vertical-stretch: 1;
+        HeadRow {
+            HeadCell {
+                text: "time";
+                width: 68px;
+            }
+            HeadCell {
+                text: "alias → backend";
+                width: 210px;
+            }
+            HeadCell {
+                text: "model";
+                width: 170px;
+            }
+            HeadCell { text: "status"; }
+            HeadCell {
+                text: "ttft";
+                width: 68px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "tok/s";
+                width: 60px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "tokens";
+                width: 92px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "cost";
+                width: 82px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "try";
+                width: 34px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "reason";
+                width: 118px;
+            }
+            HeadCell {
+                text: "";
+                width: 58px;
+            }
+        }
+        ListScroll {
+            rows: State.requests.length;
+            VerticalLayout {
+                spacing: 0px;
+                alignment: start;
+                width: parent.width;
+                for r[i] in State.requests: Row {
+                    striped: Math.mod(i, 2) == 1;
+                    Cell {
+                        text: r.time;
+                        width: 68px;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.alias + " → " + r.backend;
+                        width: 210px;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.model;
+                        width: 170px;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.status;
+                        level: r.level;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.ttft;
+                        width: 68px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.tps;
+                        width: 60px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.tokens;
+                        width: 92px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.cost;
+                        width: 82px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.attempts + "";
+                        width: 34px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: r.reason;
+                        width: 118px;
+                    }
+                    Rectangle {
+                        width: 58px;
+                        if r.inflight: Btn {
+                            label: "cancel";
+                            compact: true;
+                            kind: 3;
+                            clicked => {
+                                State.cancel-request(r.id);
+                            }
+                        }
+                    }
+                }
+                if State.requests.length == 0: Empty {
+                    message: "no requests yet — point a client at the base URL above";
+                }
+            }
+        }
+    }
+}

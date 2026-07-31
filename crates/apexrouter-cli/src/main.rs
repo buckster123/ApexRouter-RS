@@ -32,6 +32,10 @@ fn main() -> anyhow::Result<()> {
     // M-01 note: `apexrouter mcp` parses its own `--proxy` by hand and must reach
     // `mcp::run_stdio` *before* clap is involved, so nothing but JSON-RPC can reach stdout.
     // That interception goes here, at the top of `main`.
+    if cmd::mcp::intercept()? {
+        return Ok(());
+    }
+
     let cli = cli::Cli::parse();
     init_tracing(cli.verbose);
     cli.apply_env();

@@ -154,12 +154,27 @@ pub async fn local_model_list(state: &Arc<AppState>, force: bool) -> CoreResult<
 /// conservative reading `budget_from_rig` uses, so the two never disagree about who holds
 /// what.
 ///
+/// Attribution is keyed on the **physical** device (`Gpu::physical_key`), not on the `-dev`
+/// token. An endpoint on `Vulkan0` is holding the silicon, so the same card's `ROCm0`
+/// enumeration reports it held too — otherwise `rig` would show a free ROCm device sitting
+/// on top of a busy Vulkan one, which is the same card.
+///
 /// Every arithmetic step saturates. A driver reporting free > total (ROCm's GTT accounting
 /// does, on this very machine) must not produce an underflowed `u64` the size of the
 /// universe in somebody's "used" bar.
 pub fn annotate_holders(rig: &mut RigSnapshot, running: &[EndpointRecord]) {
     let mut held: BTreeMap<String, Vec<BackendId>> = BTreeMap::new();
     let mut reserved: BTreeMap<String, u64> = BTreeMap::new();
+
+    // `-dev` token -> physical key, so two backends' views of one card share a reservation.
+    let physical = rig.physical_devices();
+    let key_of = |token: &str| -> String {
+        physical
+            .iter()
+            .find(|p| p.views.iter().any(|v| v.device == token))
+            .map(|p| p.key.clone())
+            .unwrap_or_else(|| format!("device:{token}"))
+    };
 
     let fallback = rig
         .gpus
@@ -178,33 +193,37 @@ pub fn annotate_holders(rig: &mut RigSnapshot, running: &[EndpointRecord]) {
 
         if !fit.per_device_mb.is_empty() {
             for (dev, mb) in &fit.per_device_mb {
-                let slot = reserved.entry(dev.clone()).or_default();
+                let key = key_of(dev);
+                let slot = reserved.entry(key.clone()).or_default();
                 *slot = slot.saturating_add(*mb);
-                held.entry(dev.clone()).or_default().push(rec.id.clone());
+                held.entry(key).or_default().push(rec.id.clone());
             }
         } else if !fit.split.devices.is_empty() {
             let n = fit.split.devices.len() as u64;
             let each = total / n.max(1);
             for dev in &fit.split.devices {
-                let slot = reserved.entry(dev.clone()).or_default();
+                let key = key_of(dev);
+                let slot = reserved.entry(key.clone()).or_default();
                 *slot = slot.saturating_add(each);
-                held.entry(dev.clone()).or_default().push(rec.id.clone());
+                held.entry(key).or_default().push(rec.id.clone());
             }
         } else if let Some(dev) = fallback.clone() {
-            let slot = reserved.entry(dev.clone()).or_default();
+            let key = key_of(&dev);
+            let slot = reserved.entry(key.clone()).or_default();
             *slot = slot.saturating_add(total);
-            held.entry(dev).or_default().push(rec.id.clone());
+            held.entry(key).or_default().push(rec.id.clone());
         }
     }
 
     for gpu in &mut rig.gpus {
-        let mut holders = held.remove(&gpu.device).unwrap_or_default();
+        let key = key_of(&gpu.device);
+        let mut holders = held.get(&key).cloned().unwrap_or_default();
         holders.sort();
         holders.dedup();
         gpu.held_by = holders;
         // A reservation can exceed free VRAM when a driver lies about free; clamping would
         // hide that, so the number is left alone and only kept from overflowing.
-        gpu.reserved_mb = reserved.remove(&gpu.device).unwrap_or(0);
+        gpu.reserved_mb = reserved.get(&key).copied().unwrap_or(0);
     }
 }
 
@@ -304,6 +323,7 @@ mod tests {
             backend: GpuBackend::Vulkan,
             vram_total_mb: total,
             vram_free_mb: free,
+            pci_bus_id: None,
             driver: None,
             is_software: software,
             seen_by_builds: vec![],

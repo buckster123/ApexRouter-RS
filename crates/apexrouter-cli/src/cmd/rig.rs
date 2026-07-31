@@ -4,7 +4,16 @@
 //!
 //! Free and total are printed **side by side and never subtracted**: a ROCm device on this
 //! box reports free (12877 MiB) greater than total (11397 MiB) because of GTT accounting,
-//! and a "used = total − free" column would underflow into a 4-billion-MiB lie.
+//! and a "used = total − free" column would underflow into a 4-billion-MiB lie. The only
+//! sanctioned way to ask is `Gpu::vram_used_mb`, which returns `None` rather than a lie, and
+//! this renderer prints `—` when it does.
+//!
+//! **One card is one row.** `RigSnapshot::gpus` is a list of *enumerations*, so the single
+//! Radeon 840M on this box appears twice — `ROCm0` from `~/llama.cpp/build`, `Vulkan0` from
+//! `build-vulkan`. The GPUS table is keyed on the physical device and names every backend
+//! that can reach it; the BACKEND VIEWS table below it carries the per-backend VRAM, which
+//! legitimately differs (11397 MiB to ROCm, 20992 MiB to Vulkan, same silicon). Presenting
+//! one GPU as two is how a 31 GiB budget looked reasonable.
 //!
 //! A build that will not run — `build-rocm` with a missing `libhipblas.so.3` — is listed
 //! with no backends and no devices, because "installed and broken" is exactly what the
@@ -41,28 +50,32 @@ pub async fn run(ctx: &Ctx, args: &RigArgs) -> anyhow::Result<()> {
         render::print_offline_notice();
     }
 
-    let rows = rig
-        .gpus
+    // One row per piece of silicon. `rig.gpus` is one row per *enumeration*, and a laptop
+    // with one iGPU and two llama.cpp builds has two of those.
+    let physical = rig.physical_devices();
+    let rows = physical
         .iter()
-        .map(|g| {
+        .map(|p| {
             vec![
-                g.device.clone(),
-                g.name.clone(),
-                backend_name(&g.backend),
-                render::human_mib(g.vram_free_mb),
-                render::human_mib(g.vram_total_mb),
-                render::human_mib(g.reserved_mb),
-                if g.is_software {
+                p.name.clone(),
+                p.pci_bus_id.clone().unwrap_or_else(|| "—".to_string()),
+                p.backends()
+                    .iter()
+                    .map(backend_name)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                p.device_tokens().join(","),
+                if p.is_software {
                     "software".to_string()
                 } else {
-                    String::new()
+                    "hardware".to_string()
                 },
-                g.seen_by_builds
+                p.seen_by_builds()
                     .iter()
                     .map(|b| b.as_str())
                     .collect::<Vec<_>>()
                     .join(","),
-                g.held_by
+                p.held_by()
                     .iter()
                     .map(|b| b.as_str())
                     .collect::<Vec<_>>()
@@ -72,7 +85,34 @@ pub async fn run(ctx: &Ctx, args: &RigArgs) -> anyhow::Result<()> {
         .collect();
     render::print_table(
         &[
-            "DEVICE", "NAME", "BACKEND", "FREE", "TOTAL", "RESERVED", "KIND", "SEEN BY", "HELD BY",
+            "GPU", "PCI", "BACKENDS", "DEVICES", "KIND", "SEEN BY", "HELD BY",
+        ],
+        rows,
+    );
+
+    render::print_blank();
+    // The per-backend readings. They disagree about the same card on purpose.
+    let rows = rig
+        .gpus
+        .iter()
+        .map(|g| {
+            vec![
+                g.device.clone(),
+                backend_name(&g.backend),
+                render::human_mib(g.vram_free_mb),
+                render::human_mib(g.vram_total_mb),
+                // `total - free` is not a subtraction we are allowed to do blind: ROCm's
+                // GTT accounting reports free > total on this very box.
+                g.vram_used_mb()
+                    .map_or_else(|| "— (gtt)".to_string(), render::human_mib),
+                render::human_mib(g.reserved_mb),
+                g.name.clone(),
+            ]
+        })
+        .collect();
+    render::print_table(
+        &[
+            "DEVICE", "BACKEND", "FREE", "TOTAL", "USED", "RESERVED", "NAME",
         ],
         rows,
     );
@@ -146,6 +186,7 @@ mod tests {
             backend: GpuBackend::Rocm,
             vram_total_mb: total,
             vram_free_mb: free,
+            pci_bus_id: None,
             driver: None,
             is_software: false,
             seen_by_builds: Vec::new(),
@@ -164,6 +205,8 @@ mod tests {
         let total = render::human_mib(g.vram_total_mb);
         assert_eq!(free, "12.6 GiB");
         assert_eq!(total, "11.1 GiB");
+        // The USED column asks the only type that can refuse to answer, and it refuses.
+        assert_eq!(g.vram_used_mb(), None);
         // And the guard that matters: any "used" figure is saturating, never wrapping.
         assert_eq!(g.vram_total_mb.saturating_sub(g.vram_free_mb), 0);
     }

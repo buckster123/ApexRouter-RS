@@ -1,0 +1,256 @@
+// OWNER: unit U-02 (crates/apexrouter-slint/src/**, except build.rs). Do not edit outside
+// that unit.
+//
+// Every row model the Rust side builds. Kebab-case here maps to snake_case in the generated
+// Rust struct (`base-url` -> `base_url`), and every one of these is `Send`, so a background
+// task can build a `Vec<Row>` off the UI thread and hand it over inside
+// `upgrade_in_event_loop`.
+//
+// Deliberate shape: rows carry **already-rendered strings** plus an integer `level`
+// (0 neutral · 1 good · 2 warn · 3 serious · 4 critical · 5 accent). Formatting money,
+// durations and token counts is Rust's job; picking the colour for a level is `Palette`'s.
+// No row carries a `color`, a `ModelRc` or an `image`.
+
+// ── Rig ──────────────────────────────────────────────────────────────────────
+// One row per *physical* device view. `free-mb`/`total-mb` are per-backend: the VRAM
+// budget is computed per backend, so one physical GPU seen by both Vulkan and ROCm shows
+// twice here and is counted once in the budget.
+export struct DeviceRow {
+    device: string,       // the llama.cpp device token, e.g. "Vulkan0"
+    name: string,
+    backend: string,
+    free-mb: int,
+    total-mb: int,
+    frac: float,          // used fraction, 0..1; 0 when the driver over-commits (GTT)
+    detail: string,       // "11397 / 11397 MiB" or "free > total (GTT accounting)"
+    holder: string,       // which backend ids hold it
+    builds: string,
+    software: bool,
+    checked: bool,        // Launch: is this device selected
+    level: int,
+}
+
+export struct BuildRow {
+    id: string,
+    label: string,
+    backends: string,
+    server-path: string,
+    devices: string,
+}
+
+export struct LocalModelRow {
+    id: string,
+    name: string,
+    dir: string,
+    size: string,
+    quant: string,
+    vision: bool,
+    shards: int,
+    path: string,
+    arch: string,
+    ctx-train: string,
+}
+
+// ── Backends and routes ──────────────────────────────────────────────────────
+export struct BackendRow {
+    id: string,
+    label: string,
+    kind: string,
+    protocol: string,
+    health: string,
+    level: int,
+    models: string,
+    slots: string,
+    queue: string,
+    latency: string,
+    price: string,
+    devices: string,
+    tags: string,
+    base-url: string,
+    last-error: string,
+    uptime: string,
+    enabled: bool,
+    stoppable: bool,      // has a supervised endpoint / rented instance behind it
+}
+
+export struct RouteRow {
+    alias: string,
+    targets: string,
+    strategy: string,
+    health: string,
+    level: int,
+    ttft: string,
+    tps: string,
+    cost: string,
+    is-default: bool,
+    description: string,
+}
+
+// One target inside the route editor. `backend` is the selector in its wire form:
+// "id:local-carnice", "tag:cheap" or "glob:vast-*". A bare string is read as an id.
+export struct TargetRow {
+    backend: string,
+    model: string,
+    weight: int,
+    resolves: string,     // what the selector currently matches, for honesty
+    level: int,
+}
+
+// ── Live requests ────────────────────────────────────────────────────────────
+export struct RequestRow {
+    id: string,
+    time: string,
+    alias: string,
+    backend: string,
+    model: string,
+    status: string,
+    level: int,
+    ttft: string,
+    tps: string,
+    tokens: string,
+    cost: string,
+    attempts: int,
+    reason: string,
+    inflight: bool,
+}
+
+// ── Fleet ────────────────────────────────────────────────────────────────────
+export struct InstanceRow {
+    id: string,
+    label: string,
+    gpu: string,
+    status: string,
+    level: int,
+    uptime: string,
+    accrued: string,
+    dph: string,
+    geo: string,
+    disk: string,
+    tunnel: bool,
+    stalled: bool,
+    stall-note: string,
+    orphan: bool,
+}
+
+export struct TunnelRow {
+    instance: string,
+    local-port: int,
+    remote-port: int,
+    ssh: string,
+    up: bool,
+    restarts: int,
+    last-error: string,
+    level: int,
+}
+
+export struct OfferRow {
+    id: string,
+    gpu: string,
+    num-gpus: int,
+    vram: string,
+    dph: string,
+    reliability: string,
+    inet: string,
+    geo: string,
+    disk: string,
+    cuda: string,
+    rentable: bool,
+}
+
+// ── Catalog ──────────────────────────────────────────────────────────────────
+export struct RecipeRow {
+    id: string,
+    label: string,
+    kind: string,
+    description: string,
+    stale: bool,
+    stale-why: string,
+    updated: string,
+}
+
+export struct ProfileRow {
+    id: string,
+    label: string,
+    gpus: string,
+    max-dph: string,
+    geo: string,
+    image-type: string,
+}
+
+export struct HfFileRow {
+    label: string,
+    quant: string,
+    size: string,
+    files: int,
+    mmproj: bool,
+}
+
+// ── Providers ────────────────────────────────────────────────────────────────
+export struct ProviderRow {
+    id: string,
+    base-url: string,
+    source: string,       // WHERE the credential came from — never the value
+    present: bool,
+    models: int,
+    last-ok: string,
+    last-error: string,
+    level: int,
+}
+
+export struct ModelRow {
+    id: string,
+    org: string,
+    ctx: string,
+    vision: bool,
+    tools: bool,
+}
+
+// ── Usage, checks, jobs, alerts ──────────────────────────────────────────────
+export struct UsageRow {
+    key: string,
+    cost: string,
+    prompt: string,
+    completion: string,
+    requests: string,
+    tps: string,
+    frac: float,
+    metered: bool,
+}
+
+export struct CheckRow {
+    id: string,
+    label: string,
+    status: string,
+    level: int,
+    ms: string,
+    detail: string,
+    fix: string,
+}
+
+export struct ProbeRow {
+    name: string,
+    ok: bool,
+    ms: string,
+    detail: string,
+    ttft: string,
+    tps: string,
+    tokens: string,
+}
+
+export struct JobRow {
+    id: string,
+    kind: string,
+    state: string,
+    level: int,
+    pct: float,
+    message: string,
+    started: string,
+}
+
+export struct AlertRow {
+    id: string,
+    level: int,
+    message: string,
+    action: string,
+    at: string,
+}

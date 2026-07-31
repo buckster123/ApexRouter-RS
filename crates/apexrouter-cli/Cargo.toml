@@ -35,3 +35,6 @@ rustix             = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# I-01's migration e2e hashes the legacy tree before and after every run: `~/.vastai-gguf`
+# is another tool's state directory and "we did not write to it" has to be proven, not assumed.
+sha2     = { workspace = true }

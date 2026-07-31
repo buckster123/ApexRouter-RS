@@ -275,6 +275,7 @@ fn rig_with(build: &LlamaBuild, total_mb: u64, free_mb: u64) -> RigSnapshot {
             backend: GpuBackend::Vulkan,
             vram_total_mb: total_mb,
             vram_free_mb: free_mb,
+            pci_bus_id: None,
             driver: Some("radv".to_owned()),
             is_software: false,
             seen_by_builds: vec![build.id.clone()],
@@ -1041,6 +1042,8 @@ fn a_device_budget_is_a_plain_value_we_can_reason_about() {
         }],
         margin_mb: 512,
         host_ram_free_mb: 10_000,
+        backend: Some(GpuBackend::Vulkan),
+        notes: vec![],
     };
     assert_eq!(b.total_usable_mb(), 19_000 - 12_000 - 512);
 }

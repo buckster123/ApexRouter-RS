@@ -1,7 +1,8 @@
 //! OWNER: unit C-14 (core/usage.rs, core/pricing.rs). Do not edit outside that unit.
 //!
 //! The usage log. Legacy field names are preserved **exactly**, so `cost.py` keeps working,
-//! and `[compat] mirror_usage_log` appends every row to `~/.vastai-gguf/usage.log` too.
+//! and `[compat] mirror_usage_log` — **off by default** — appends every row to
+//! `~/.vastai-gguf/usage.log` too.
 //!
 //! Reading is deliberately lenient: unknown keys survive via `flatten`, `epoch` is optional,
 //! and the legacy `%Y-%m-%dT%H:%M:%SZ` local-time-with-a-lying-`Z` timestamps parse. **No
@@ -73,8 +74,12 @@ pub struct UsageWriter {
 impl UsageWriter {
     /// Open (creating if needed) the usage log and, when configured, the legacy mirror.
     ///
-    /// The mirror is enabled only while `~/.vastai-gguf` actually exists — the config default
-    /// is "on", and a machine that never ran LocalRouter must not grow that directory.
+    /// **The mirror is off unless it was asked for.** `[compat] mirror_usage_log` defaults to
+    /// `false`, because `~/.vastai-gguf` belongs to the old Python tool and merely starting
+    /// this daemon must not append to a file we do not own; `apexrouter migrate` offers to
+    /// switch it on, which is the transition case it exists for. Even when it *is* on, the
+    /// mirror is opened only while `~/.vastai-gguf` already exists — a machine that never ran
+    /// LocalRouter must not grow that directory either.
     ///
     /// # Errors
     /// Returns [`Error::Io`] when `$STATE` cannot be created or `usage.jsonl` cannot be
@@ -797,6 +802,86 @@ mod tests {
         tempfile::tempdir().expect("tempdir")
     }
 
+    /// Every environment variable [`Paths::resolve`] consults, so a test can neutralise the
+    /// lot and leave the process exactly as it found it.
+    const ENV_KEYS: [&str; 6] = [
+        "HOME",
+        "APEXROUTER_HOME",
+        "APEXROUTER_LOCALROUTER_DIR",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+    ];
+
+    /// `std::env` is process-global; the tests here that redirect it serialise on this.
+    fn env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// A [`Paths`] whose state root **and** whose legacy `~/.vastai-gguf` both live inside
+    /// `home`, a tempdir standing in for `$HOME`.
+    ///
+    /// Both are asserted before the value is handed back: if another test's environment
+    /// raced us, this fails here rather than anywhere near the real `~/.vastai-gguf`.
+    fn test_paths(home: &Path) -> Paths {
+        let guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ENV_KEYS.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        for k in ENV_KEYS {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("HOME", home);
+        std::env::set_var("APEXROUTER_HOME", home.join("state"));
+        std::env::set_var("APEXROUTER_LOCALROUTER_DIR", home.join("no-localrouter"));
+        let resolved = Paths::resolve();
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        drop(guard);
+
+        let paths = resolved.expect("Paths::resolve");
+        assert!(
+            paths.state().starts_with(home),
+            "state {} escaped the tempdir {}",
+            paths.state().display(),
+            home.display()
+        );
+        assert!(
+            paths.legacy().vastai_gguf.starts_with(home),
+            "legacy dir {} escaped the tempdir {}",
+            paths.legacy().vastai_gguf.display(),
+            home.display()
+        );
+        paths
+    }
+
+    /// Every file under `root` that is **not** inside `skip`, as path → bytes.
+    fn tree_outside(root: &Path, skip: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            if dir.starts_with(skip) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path) {
+                    out.insert(path, bytes);
+                }
+            }
+        }
+        out
+    }
+
     fn row(provider: &str, model: &str, cost: f64) -> UsageRecord {
         UsageRecord {
             timestamp: "2026-07-30T10:00:00.000Z".into(),
@@ -965,6 +1050,69 @@ mod tests {
             .collect();
         assert_eq!(keys, LEGACY_FIELDS, "exactly the legacy columns");
         assert_eq!(v["provider"], "vast-gguf", "the legacy spelling stays");
+    }
+
+    /// FINDING B from MK1-CORE ACCEPTANCE: a default launch appended 15 rows to Andre's real
+    /// `~/.vastai-gguf/usage.log`. Writing into another tool's state directory is opt-in.
+    #[test]
+    fn the_legacy_mirror_is_off_by_default_and_writes_nothing_outside_state() {
+        assert!(
+            !CompatCfg::default().mirror_usage_log,
+            "`[compat] mirror_usage_log` must default to false"
+        );
+
+        let dir = tmp();
+        let home = dir.path();
+        let legacy = home.join(".vastai-gguf");
+        std::fs::create_dir_all(&legacy).expect("legacy dir");
+        std::fs::write(legacy.join("usage.log"), REAL_LEGACY_LOG).expect("legacy fixture");
+
+        let paths = test_paths(home);
+        let before = tree_outside(home, paths.state());
+        assert!(
+            before.contains_key(&legacy.join("usage.log")),
+            "the fixture must be in the snapshot, or this test proves nothing"
+        );
+
+        let w = UsageWriter::open(&paths, &CompatCfg::default()).expect("open");
+        assert!(
+            w.mirror.is_none(),
+            "the default must not even open another tool's file"
+        );
+        for i in 0..3 {
+            w.append(&row("together", &format!("m{i}"), 0.01))
+                .expect("append");
+        }
+
+        assert_eq!(
+            tree_outside(home, paths.state()),
+            before,
+            "nothing outside $STATE may be created or modified"
+        );
+
+        // The rows are not lost — they are in our own log, which is inside $STATE.
+        assert!(paths.usage_log().starts_with(paths.state()));
+        let ours = std::fs::read_to_string(paths.usage_log()).expect("read ours");
+        assert_eq!(ours.lines().count(), 3);
+
+        // Positive control: opted in, the legacy file does grow — so the assertion above is
+        // testing the toggle and not merely a path that never worked.
+        let opted_in = CompatCfg {
+            mirror_usage_log: true,
+            ..CompatCfg::default()
+        };
+        let w = UsageWriter::open(&paths, &opted_in).expect("open");
+        assert_eq!(
+            w.mirror.as_deref(),
+            Some(legacy.join("usage.log").as_path())
+        );
+        w.append(&row("together", "m", 0.01)).expect("append");
+        let mirrored = std::fs::read_to_string(legacy.join("usage.log")).expect("read mirror");
+        assert_eq!(
+            mirrored.lines().count(),
+            REAL_LEGACY_LOG.lines().count() + 1,
+            "opting in appends exactly one row"
+        );
     }
 
     #[test]

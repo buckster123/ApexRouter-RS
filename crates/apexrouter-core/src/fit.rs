@@ -25,10 +25,28 @@
 //!
 //! Every one of those steps appends a line to [`FitPlan::why`], because a number nobody can
 //! explain is a number nobody should trust.
+//!
+//! # A budget is per **backend**, and is never a sum across backends
+//!
+//! One `llama-server` process uses one compute backend. A budget is therefore over the
+//! devices of the backend that process will actually use, and adding two backends' readings
+//! together is not a rounding error, it is inventing hardware.
+//!
+//! The measured case (MK1-CORE acceptance, finding A): this laptop's single Radeon 840M is
+//! `ROCm0` — 11397 MiB, from `~/llama.cpp/build` — and `Vulkan0` — 20992 MiB, from
+//! `build-vulkan`. Summing them produced a ~31 GiB budget and a split that put half the load
+//! on a device the Vulkan process cannot address, under-reserving the device it *does* use by
+//! half. Over-optimism is the dangerous direction: it green-lights a model that does not fit
+//! and the spawn OOMs.
+//!
+//! [`BackendScope`] is how a caller says which backend it means, and
+//! [`VramBudget::backend`] is the answer travelling with the budget. Reservations are
+//! attributed by **physical device** (`Gpu::physical_key`), so an endpoint holding the
+//! silicon through ROCm still shows up against the Vulkan budget for the same card.
 
 use apexrouter_protocol::{
-    DesiredState, DeviceBudget, EndpointRecord, FitInput, FitPlan, FitVerdict, GgufMeta, Gpu,
-    KvType, NglPlan, RigSnapshot, SplitMode, SplitPlan, VramBudget,
+    BuildId, DesiredState, DeviceBudget, EndpointRecord, FitInput, FitPlan, FitVerdict, GgufMeta,
+    Gpu, GpuBackend, KvType, LlamaBuild, NglPlan, RigSnapshot, SplitMode, SplitPlan, VramBudget,
 };
 use std::collections::BTreeMap;
 
@@ -102,8 +120,13 @@ pub fn fit(input: &FitInput) -> FitPlan {
 
     // ---- what we are allowed to spend -----------------------------------------------
     let gpu_backed = !input.budget.devices.is_empty();
+    let spendable = single_backend_devices(&input.budget, &mut why);
     let usable_mb = if gpu_backed {
-        input.budget.total_usable_mb()
+        spendable
+            .iter()
+            .map(|d| d.free_mb.saturating_sub(d.reserved_mb))
+            .fold(0u64, u64::saturating_add)
+            .saturating_sub(input.budget.margin_mb)
     } else {
         input
             .budget
@@ -112,8 +135,12 @@ pub fn fit(input: &FitInput) -> FitPlan {
     };
     if gpu_backed {
         why.push(format!(
-            "budget {usable_mb} MiB usable = Σ(free − reserved) over {} device(s) − {} MiB margin",
-            input.budget.devices.len(),
+            "budget {usable_mb} MiB usable = Σ(free − reserved) over {} {}device(s) − {} MiB margin",
+            spendable.len(),
+            match input.budget.backend.as_ref() {
+                Some(b) => format!("{} ", backend_label(b)),
+                None => String::new(),
+            },
             input.budget.margin_mb
         ));
     } else {
@@ -122,6 +149,8 @@ pub fn fit(input: &FitInput) -> FitPlan {
             input.budget.host_ram_free_mb, input.budget.margin_mb
         ));
     }
+    // Whatever the budget builder had to drop, said out loud rather than left implied.
+    why.extend(input.budget.notes.iter().cloned());
 
     // ---- context ---------------------------------------------------------------------
     let ctx = match input.want_ctx {
@@ -234,8 +263,11 @@ pub fn fit(input: &FitInput) -> FitPlan {
     };
 
     // ---- how it lands on the devices ----------------------------------------------------
+    //
+    // The *spendable* devices, not every device in the budget: a placement across two
+    // backends is not a placement any one process could honour.
     let devices = if input.split.devices.is_empty() {
-        input.budget.device_names()
+        spendable.iter().map(|d| d.device.clone()).collect()
     } else {
         input.split.devices.clone()
     };
@@ -277,36 +309,79 @@ pub fn fit(input: &FitInput) -> FitPlan {
     }
 }
 
-/// Build a **live** budget from the rig, subtracting what running endpoints already hold.
+/// Which backend's devices a budget may be spent on.
+///
+/// One `llama-server` process uses ONE compute backend, so this is not decoration: it is the
+/// difference between a budget and a fiction. Prefer [`BackendScope::Build`] — the build is
+/// what actually gets exec'd, so a budget scoped by it cannot disagree with the spawn.
+#[derive(Clone, Copy, Debug)]
+pub enum BackendScope<'a> {
+    /// The build this endpoint will launch with. Its enumerated accelerator is the scope.
+    Build(&'a BuildId),
+    /// An explicit backend, for a caller that has already resolved one.
+    Backend(&'a GpuBackend),
+    /// Nobody said. Inferred, in order: the backend of the first device named in `devices`,
+    /// else the build [`crate::discover::choose_build`] would pick, else the backend of the
+    /// first non-software GPU on the rig. Never a sum over all of them.
+    Auto,
+}
+
+/// Build a **live**, single-backend budget from the rig, minus what running endpoints hold.
+///
+/// # Scope before selection
+///
+/// `scope` picks the backend; `devices` then narrows within it. An empty `devices` selects
+/// every non-software GPU **of that backend**; a non-empty one selects exactly those `-dev`
+/// tokens, in the order given. A named device that the rig does not have, or that belongs to
+/// another backend, is dropped and a line explaining it lands in [`VramBudget::notes`] —
+/// silently ignoring it is how the ROCm0/Vulkan0 double-count shipped in the first place.
+///
+/// The resulting [`VramBudget::backend`] states which backend the endpoint must launch with
+/// for the arithmetic to hold. A budget with no devices at all (a CPU-only rig, a broken
+/// build that enumerates nothing) carries `backend: None` and is judged against host RAM.
+///
+/// # Reservations are attributed by physical device
 ///
 /// Subtracts `weights + kv + compute` of every `EndpointRecord` whose
 /// `desired == DesiredState::Running`, which is what makes `InsufficientVram` fire before a
-/// second launch OOMs the first.
+/// second launch OOMs the first. A reservation is attributed by its `per_device_mb` when it
+/// has one, else spread evenly over its `split.devices`, else charged whole to the first
+/// selected device — the conservative reading, since an endpoint with no recorded placement
+/// is most likely on the primary GPU.
 ///
-/// An empty `devices` selects every non-software GPU on the rig; a non-empty one selects
-/// exactly those `-dev` tokens, **in the order given**, and silently drops names the rig does
-/// not have. A running endpoint's reservation is attributed by its `per_device_mb` when it has
-/// one, else spread evenly over its `split.devices`, else charged whole to the first selected
-/// device — the conservative reading, since an endpoint with no recorded placement is most
-/// likely on the primary GPU. `Gpu::reserved_mb` from the snapshot is respected as a floor, so
-/// a holder the caller did not pass in `running` still cannot be double-spent.
+/// Attribution is keyed on `Gpu::physical_key`, not on the `-dev` token: an endpoint holding
+/// `ROCm0` is holding the *silicon*, so it is subtracted from `Vulkan0`'s budget too when
+/// they are the same card. `Gpu::reserved_mb` from the snapshot is respected as a floor, so a
+/// holder the caller did not pass in `running` still cannot be double-spent.
 pub fn budget_from_rig(
     rig: &RigSnapshot,
+    scope: BackendScope<'_>,
     devices: &[String],
     margin_mb: u64,
     running: &[EndpointRecord],
 ) -> VramBudget {
-    let selected: Vec<&Gpu> = if devices.is_empty() {
-        rig.gpus.iter().filter(|g| !g.is_software).collect()
-    } else {
-        devices
-            .iter()
-            .filter_map(|want| rig.gpus.iter().find(|g| &g.device == want))
-            .collect()
+    let mut notes: Vec<String> = Vec::new();
+    let backend = resolve_backend(rig, scope, devices);
+    let selected = select_devices(rig, backend.as_ref(), devices, &mut notes);
+
+    // `-dev` token -> physical key, so a reservation on ROCm0 also weighs on Vulkan0's
+    // budget when they are the same silicon. A token this rig does not have keys on itself:
+    // it can then match nothing, which is the same as being ignored, as before.
+    let mut physical: BTreeMap<String, String> = BTreeMap::new();
+    for device in rig.physical_devices() {
+        for view in &device.views {
+            physical.insert(view.device.clone(), device.key.clone());
+        }
+    }
+    let key_of = |token: &str| -> String {
+        physical
+            .get(token)
+            .cloned()
+            .unwrap_or_else(|| format!("device:{token}"))
     };
 
-    let mut reserved: BTreeMap<&str, u64> = BTreeMap::new();
-    let fallback = selected.first().copied().map(|g| g.device.as_str());
+    let mut reserved: BTreeMap<String, u64> = BTreeMap::new();
+    let fallback = selected.first().copied().map(|g| g.device.clone());
     for rec in running
         .iter()
         .filter(|r| r.desired == DesiredState::Running)
@@ -320,34 +395,253 @@ pub fn budget_from_rig(
             .saturating_add(plan.compute_mb);
         if !plan.per_device_mb.is_empty() {
             for (device, mb) in &plan.per_device_mb {
-                let slot = reserved.entry(device.as_str()).or_default();
+                let slot = reserved.entry(key_of(device)).or_default();
                 *slot = slot.saturating_add(*mb);
             }
         } else if !plan.split.devices.is_empty() {
             for (device, mb) in even_shares(total, &plan.split.devices) {
-                let slot = reserved.entry(device).or_default();
+                let slot = reserved.entry(key_of(device)).or_default();
                 *slot = slot.saturating_add(mb);
             }
-        } else if let Some(device) = fallback {
-            let slot = reserved.entry(device).or_default();
+        } else if let Some(device) = fallback.as_deref() {
+            let slot = reserved.entry(key_of(device)).or_default();
             *slot = slot.saturating_add(total);
         }
     }
 
     VramBudget {
         devices: selected
-            .into_iter()
+            .iter()
             .map(|g| DeviceBudget {
                 device: g.device.clone(),
                 free_mb: g.vram_free_mb,
                 reserved_mb: g
                     .reserved_mb
-                    .max(reserved.get(g.device.as_str()).copied().unwrap_or(0)),
+                    .max(reserved.get(&key_of(&g.device)).copied().unwrap_or(0)),
             })
             .collect(),
         margin_mb,
         host_ram_free_mb: rig.ram_free_mb,
+        backend: if selected.is_empty() { None } else { backend },
+        notes,
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// backend scoping
+// ---------------------------------------------------------------------------------------
+
+/// The one backend this budget is over, or `None` for a rig with no usable accelerator.
+///
+/// Never a set, never a union: the return type is the rule.
+fn resolve_backend(
+    rig: &RigSnapshot,
+    scope: BackendScope<'_>,
+    devices: &[String],
+) -> Option<GpuBackend> {
+    match scope {
+        BackendScope::Backend(b) => Some(b.clone()),
+        // A named build is authoritative even when it enumerated nothing: a build that sees
+        // no devices gets no VRAM, which is the honest reading of `build-rocm` with its
+        // missing `libhipblas.so.3`.
+        BackendScope::Build(id) => backend_of_build(rig, id),
+        BackendScope::Auto => backend_of_first_named(rig, devices)
+            .or_else(|| {
+                crate::discover::choose_build(&rig.builds, None)
+                    .and_then(|c| backend_of_build(rig, &c.chosen))
+            })
+            .or_else(|| {
+                rig.gpus
+                    .iter()
+                    .find(|g| !g.is_software)
+                    .map(|g| g.backend.clone())
+            }),
+    }
+}
+
+/// The accelerator a build computes on: its first non-CPU backend, else the backend of the
+/// first device it enumerated. `None` for a CPU-only or broken build.
+fn backend_of_build(rig: &RigSnapshot, id: &BuildId) -> Option<GpuBackend> {
+    let build: &LlamaBuild = rig.builds.iter().find(|b| &b.id == id)?;
+    build
+        .backends
+        .iter()
+        .find(|b| !matches!(b, GpuBackend::Cpu))
+        .cloned()
+        .or_else(|| backend_of_first_named(rig, &build.devices))
+}
+
+/// The backend of the first `-dev` token that this rig actually has.
+fn backend_of_first_named(rig: &RigSnapshot, devices: &[String]) -> Option<GpuBackend> {
+    devices.iter().find_map(|want| {
+        rig.gpus
+            .iter()
+            .find(|g| &g.device == want && !matches!(g.backend, GpuBackend::Cpu))
+            .map(|g| g.backend.clone())
+    })
+}
+
+/// The devices of `backend` this budget may spend, appending a note for every one dropped.
+///
+/// Nothing is dropped quietly. "Your ROCm0 is the same card as Vulkan0" is exactly the
+/// sentence whose absence made a 31 GiB budget look reasonable.
+fn select_devices<'a>(
+    rig: &'a RigSnapshot,
+    backend: Option<&GpuBackend>,
+    devices: &[String],
+    notes: &mut Vec<String>,
+) -> Vec<&'a Gpu> {
+    let Some(backend) = backend else {
+        if !devices.is_empty() {
+            notes.push(format!(
+                "no compute backend resolved for {} — nothing on this rig can be spent, so the plan is judged against host RAM",
+                devices.join(", ")
+            ));
+        }
+        return Vec::new();
+    };
+
+    let mut selected: Vec<&Gpu> = Vec::new();
+    if devices.is_empty() {
+        selected.extend(
+            rig.gpus
+                .iter()
+                .filter(|g| !g.is_software && &g.backend == backend),
+        );
+    } else {
+        for want in devices {
+            match rig.gpus.iter().find(|g| &g.device == want) {
+                Some(g) if &g.backend == backend => selected.push(g),
+                Some(g) => notes.push(format!(
+                    "{} ({}) dropped: this budget is scoped to {}, and one llama-server process uses one backend",
+                    g.device,
+                    backend_label(&g.backend),
+                    backend_label(backend)
+                )),
+                None => notes.push(format!("`{want}` is not a device on this rig")),
+            }
+        }
+    }
+
+    // Everything of another backend that this budget is NOT allowed to add in, named, with
+    // the physical truth spelled out when it is the very same card.
+    let excluded: Vec<&Gpu> = rig
+        .gpus
+        .iter()
+        .filter(|g| !g.is_software && &g.backend != backend)
+        .filter(|g| !devices.iter().any(|d| d == &g.device))
+        .collect();
+    if !excluded.is_empty() && !selected.is_empty() {
+        let physical = rig.physical_devices();
+        let key_of = |token: &str| -> Option<String> {
+            physical
+                .iter()
+                .find(|p| p.views.iter().any(|v| v.device == token))
+                .map(|p| p.key.clone())
+        };
+        let described: Vec<String> = excluded
+            .iter()
+            .map(|g| {
+                let same = key_of(&g.device)
+                    .and_then(|k| {
+                        selected
+                            .iter()
+                            .find(|s| key_of(&s.device).as_deref() == Some(k.as_str()))
+                            .map(|s| (s.device.clone(), k))
+                    })
+                    .map(|(peer, key)| format!(" — the same physical device as {peer} ({key})"))
+                    .unwrap_or_default();
+                format!(
+                    "{} ({}, {} MiB){same}",
+                    g.device,
+                    backend_label(&g.backend),
+                    g.vram_total_mb
+                )
+            })
+            .collect();
+        notes.push(format!(
+            "scoped to the {} backend; not spendable here: {}",
+            backend_label(backend),
+            described.join("; ")
+        ));
+    }
+    selected
+}
+
+/// The lower-case name of a backend, with the open variant printed as whatever llama.cpp
+/// called it rather than as `Other("…")`.
+fn backend_label(b: &GpuBackend) -> String {
+    match b {
+        GpuBackend::Other(s) => s.to_lowercase(),
+        other => format!("{other:?}").to_lowercase(),
+    }
+}
+
+/// The alphabetic head of a `-dev` token, lower-cased: `"Vulkan0"` -> `"vulkan"`.
+///
+/// Used only to notice that a **caller-supplied** budget mixes backends; a budget from
+/// [`budget_from_rig`] cannot.
+fn token_backend(token: &str) -> String {
+    token
+        .chars()
+        .take_while(|c| !c.is_ascii_digit())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The largest group of devices in one budget that share a backend — the most that any one
+/// `llama-server` process could actually address.
+///
+/// A budget from [`budget_from_rig`] is already single-backend and comes straight back. A
+/// hand-built one from `POST /v1/fit` might not be, and the wrong answer there is the
+/// optimistic one, so the groups are **not** added together: the largest wins and the rest
+/// is reported in `why`. Grouping is by the token's alphabetic head (`Vulkan0` -> `vulkan`),
+/// which is the only backend signal a `DeviceBudget` carries.
+fn single_backend_devices<'a>(
+    budget: &'a VramBudget,
+    why: &mut Vec<String>,
+) -> Vec<&'a DeviceBudget> {
+    let mut groups: Vec<(String, Vec<&DeviceBudget>)> = Vec::new();
+    for d in &budget.devices {
+        let key = token_backend(&d.device);
+        match groups.iter_mut().find(|(k, _)| k == &key) {
+            Some((_, v)) => v.push(d),
+            None => groups.push((key, vec![d])),
+        }
+    }
+    if groups.len() <= 1 {
+        return budget.devices.iter().collect();
+    }
+
+    let usable = |v: &Vec<&DeviceBudget>| -> u64 {
+        v.iter()
+            .map(|d| d.free_mb.saturating_sub(d.reserved_mb))
+            .fold(0u64, u64::saturating_add)
+    };
+    // Largest first, ties broken by name so the choice is reproducible.
+    let Some((winner, devices)) = groups
+        .iter()
+        .max_by(|a, b| usable(&a.1).cmp(&usable(&b.1)).then_with(|| b.0.cmp(&a.0)))
+    else {
+        return budget.devices.iter().collect();
+    };
+    let dropped: Vec<String> = groups
+        .iter()
+        .filter(|(k, _)| k != winner)
+        .flat_map(|(_, v)| v.iter().map(|d| d.device.clone()))
+        .collect();
+    why.push(format!(
+        "WARNING: this budget mixes {} backends ({}); one llama-server process uses one backend, so only the {winner} device(s) are spendable and {} {} ignored — a device seen by two backends is one card, not two",
+        groups.len(),
+        groups
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        dropped.join(", "),
+        if dropped.len() == 1 { "is" } else { "are" }
+    ));
+    devices.clone()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -551,6 +845,21 @@ mod tests {
                 .collect(),
             margin_mb,
             host_ram_free_mb,
+            backend: devices
+                .first()
+                .map(|(d, _, _)| backend_of_token(d))
+                .unwrap_or(None),
+            notes: vec![],
+        }
+    }
+
+    /// The backend a `-dev` token names, for fixtures that hand-build a budget.
+    fn backend_of_token(token: &str) -> Option<GpuBackend> {
+        match token_backend(token).as_str() {
+            "vulkan" => Some(GpuBackend::Vulkan),
+            "cuda" => Some(GpuBackend::Cuda),
+            "rocm" => Some(GpuBackend::Rocm),
+            _ => None,
         }
     }
 
@@ -854,6 +1163,7 @@ mod tests {
                 devices: vec![],
                 margin_mb: 1_024,
                 host_ram_free_mb: 20_000,
+                ..VramBudget::default()
             },
             split: SplitPlan::default(),
             ..log_input()
@@ -866,14 +1176,17 @@ mod tests {
 
     // ---- budget_from_rig -------------------------------------------------------------------
 
+    /// A device whose **backend follows its token**, because a fixture that calls `CUDA0` a
+    /// Vulkan device cannot catch a cross-backend bug.
     fn gpu(device: &str, index: u32, free: u64, reserved: u64) -> Gpu {
         Gpu {
             device: device.into(),
             index,
             name: format!("test {device}"),
-            backend: apexrouter_protocol::GpuBackend::Vulkan,
+            backend: backend_of_token(device).unwrap_or(GpuBackend::Vulkan),
             vram_total_mb: 20_992,
             vram_free_mb: free,
+            pci_bus_id: None,
             driver: None,
             is_software: false,
             seen_by_builds: vec![],
@@ -892,6 +1205,28 @@ mod tests {
             swap_used_mb: 1_000,
             cpu_threads: 12,
             scanned_at_unix: 1_700_000_000,
+        }
+    }
+
+    /// A build that enumerated exactly these devices, on the backend their tokens name.
+    fn build(id: &str, devices: &[&str]) -> LlamaBuild {
+        let mut backends: Vec<GpuBackend> = Vec::new();
+        for d in devices {
+            if let Some(b) = backend_of_token(d) {
+                if !backends.contains(&b) {
+                    backends.push(b);
+                }
+            }
+        }
+        LlamaBuild {
+            id: BuildId::parse(id).expect("valid build id"),
+            server_path: format!("/home/andre/llama.cpp/{id}/bin/llama-server"),
+            label: id.to_owned(),
+            build_info: Some("b9199 (39cf5d619)".into()),
+            backends,
+            devices: devices.iter().map(|d| (*d).to_string()).collect(),
+            flags: apexrouter_protocol::FlagSupport::default(),
+            probed_at_unix: 1_700_000_000,
         }
     }
 
@@ -969,7 +1304,7 @@ mod tests {
             // No fit recorded: nothing to subtract.
             record("c", DesiredState::Running, None),
         ];
-        let b = budget_from_rig(&r, &[], 1_024, &running);
+        let b = budget_from_rig(&r, BackendScope::Auto, &[], 1_024, &running);
         assert_eq!(b.devices.len(), 1);
         assert_eq!(b.devices[0].device, "Vulkan0");
         assert_eq!(b.devices[0].free_mb, 19_519);
@@ -988,12 +1323,12 @@ mod tests {
             DesiredState::Running,
             Some(held(&["Vulkan0"], &[])),
         )];
-        let b = budget_from_rig(&r, &[], 0, &running);
+        let b = budget_from_rig(&r, BackendScope::Auto, &[], 0, &running);
         assert_eq!(b.devices[0].reserved_mb, 4_861 + 594 + 501);
 
         // Not even a device list: charged whole to the first selected device.
         let running = vec![record("a", DesiredState::Running, Some(held(&[], &[])))];
-        let b = budget_from_rig(&r, &[], 0, &running);
+        let b = budget_from_rig(&r, BackendScope::Auto, &[], 0, &running);
         assert_eq!(b.devices[0].reserved_mb, 5_956);
     }
 
@@ -1007,18 +1342,284 @@ mod tests {
             gpu("CUDA0", 0, 24_576, 0),
         ]);
 
-        // Empty selection: every non-software device, in rig order.
-        let all = budget_from_rig(&r, &[], 0, &[]);
-        assert_eq!(all.device_names(), vec!["Vulkan0", "CUDA0"]);
+        // Empty selection: every non-software device **of the scoped backend**, in rig
+        // order. The CUDA card is real hardware and still not spendable by a Vulkan process.
+        let all = budget_from_rig(&r, BackendScope::Auto, &[], 0, &[]);
+        assert_eq!(all.device_names(), vec!["Vulkan0"]);
+        assert_eq!(all.backend, Some(GpuBackend::Vulkan));
 
-        // Explicit selection wins, in the caller's order, and may name a software device.
+        // Explicit selection wins, in the caller's order, and may name a software device —
+        // the scope then follows the first device named.
         let picked = budget_from_rig(
             &r,
+            BackendScope::Auto,
             &["CUDA0".to_string(), "Vulkan1".to_string(), "nope".into()],
             0,
             &[],
         );
-        assert_eq!(picked.device_names(), vec!["CUDA0", "Vulkan1"]);
+        assert_eq!(picked.device_names(), vec!["CUDA0"]);
+        assert_eq!(picked.backend, Some(GpuBackend::Cuda));
+        let notes = picked.notes.join("\n");
+        assert!(notes.contains("Vulkan1"), "{notes}");
+        assert!(
+            notes.contains("`nope` is not a device on this rig"),
+            "{notes}"
+        );
+    }
+
+    // ---- FINDING A: one card seen twice is one card -----------------------------------------
+    //
+    // MK1-CORE acceptance, on the real machine: `~/llama.cpp/build` enumerates the single
+    // Radeon 840M as `ROCm0` (11397 MiB) and `build-vulkan` enumerates the same silicon as
+    // `Vulkan0` (20992 MiB). The solver summed them into ~31 GiB and split the load across
+    // both, under-reserving the device the process actually uses by half.
+
+    /// The rig this laptop really is: one GPU, two builds, two backends, two enumerations.
+    fn one_card_two_backends() -> RigSnapshot {
+        let mut vulkan = gpu("Vulkan0", 0, 19_626, 0);
+        vulkan.name = "AMD Radeon 840M Graphics (RADV KRACKAN1)".into();
+        vulkan.vram_total_mb = 20_992;
+        vulkan.pci_bus_id = Some("0000:04:00.0".into());
+        let mut rocm = gpu("ROCm0", 0, 12_821, 0);
+        rocm.name = "AMD Radeon 840M Graphics".into();
+        rocm.vram_total_mb = 11_397;
+        rocm.pci_bus_id = Some("0000:04:00.0".into());
+
+        let mut r = rig(vec![vulkan, rocm]);
+        r.builds = vec![
+            build("build-vulkan", &["Vulkan0"]),
+            build("build", &["ROCm0"]),
+        ];
+        r
+    }
+
+    #[test]
+    fn a_single_card_seen_by_two_backends_is_never_summed() {
+        let r = one_card_two_backends();
+        // The presentation layer agrees it is one card.
+        assert_eq!(r.physical_devices().len(), 1);
+
+        for (scope, want_device, want_free, want_backend) in [
+            (
+                BackendScope::Build(&BuildId::parse("build-vulkan").expect("id")),
+                "Vulkan0",
+                19_626u64,
+                GpuBackend::Vulkan,
+            ),
+            (
+                BackendScope::Build(&BuildId::parse("build").expect("id")),
+                "ROCm0",
+                12_821,
+                GpuBackend::Rocm,
+            ),
+        ] {
+            let b = budget_from_rig(&r, scope, &[], 1_024, &[]);
+            assert_eq!(
+                b.device_names(),
+                vec![want_device],
+                "a budget must be over ONE backend's devices"
+            );
+            assert_eq!(b.backend, Some(want_backend));
+            assert_eq!(b.total_usable_mb(), want_free - 1_024);
+            // The sum that used to happen. 19626 + 12821 - 1024 = 31423.
+            assert_ne!(b.total_usable_mb(), 19_626 + 12_821 - 1_024);
+            assert!(
+                b.notes.iter().any(|n| n.contains("same physical device")),
+                "the exclusion must say WHY: {:?}",
+                b.notes
+            );
+        }
+
+        // Auto — the default launch, the path the bug shipped on — picks the build
+        // `choose_build` would pick and budgets over that one backend only.
+        let auto = budget_from_rig(&r, BackendScope::Auto, &[], 1_024, &[]);
+        assert_eq!(auto.devices.len(), 1, "{:?}", auto.device_names());
+        assert!(auto.total_usable_mb() <= 19_626 - 1_024);
+
+        // And the solver refuses to add them even if a caller hands it both by hand.
+        let hand_built = VramBudget {
+            devices: vec![
+                DeviceBudget {
+                    device: "Vulkan0".into(),
+                    free_mb: 19_626,
+                    reserved_mb: 0,
+                },
+                DeviceBudget {
+                    device: "ROCm0".into(),
+                    free_mb: 12_821,
+                    reserved_mb: 0,
+                },
+            ],
+            margin_mb: 1_024,
+            host_ram_free_mb: 9_000,
+            ..VramBudget::default()
+        };
+        let plan = fit(&FitInput {
+            budget: hand_built,
+            ..log_input()
+        });
+        let joined = plan.why.join("\n");
+        assert!(joined.contains("WARNING"), "{joined}");
+        assert!(joined.contains("mixes 2 backends"), "{joined}");
+        // 19626 - 1024 usable, not 31423.
+        assert_eq!(
+            plan.headroom_mb,
+            19_626 - 1_024 - (plan.weights_mb + plan.kv_mb + plan.compute_mb) as i64
+        );
+    }
+
+    #[test]
+    fn a_genuine_four_card_rig_does_sum_across_its_four_cards() {
+        let mut gpus: Vec<Gpu> = (0..4)
+            .map(|i| {
+                let mut g = gpu(&format!("CUDA{i}"), i, 81_559, 0);
+                g.name = "NVIDIA H100 PCIe".into();
+                g.vram_total_mb = 81_559;
+                g.pci_bus_id = Some(format!("0000:{:02x}:00.0", 0x07 + i * 3));
+                g
+            })
+            .collect();
+        // The same four cards are also visible to a Vulkan build. Still four cards.
+        gpus.extend((0..4).map(|i| {
+            let mut g = gpu(&format!("Vulkan{i}"), i, 81_559, 0);
+            g.name = "NVIDIA H100 PCIe".into();
+            g.vram_total_mb = 81_559;
+            g.pci_bus_id = Some(format!("0000:{:02x}:00.0", 0x07 + i * 3));
+            g
+        }));
+        let mut r = rig(gpus);
+        r.builds = vec![
+            build("build-cuda", &["CUDA0", "CUDA1", "CUDA2", "CUDA3"]),
+            build(
+                "build-vulkan",
+                &["Vulkan0", "Vulkan1", "Vulkan2", "Vulkan3"],
+            ),
+        ];
+        assert_eq!(r.physical_devices().len(), 4, "four cards, eight rows");
+
+        let b = budget_from_rig(
+            &r,
+            BackendScope::Build(&BuildId::parse("build-cuda").expect("id")),
+            &[],
+            1_024,
+            &[],
+        );
+        assert_eq!(
+            b.device_names(),
+            vec!["CUDA0", "CUDA1", "CUDA2", "CUDA3"],
+            "four real cards on one backend DO add up"
+        );
+        assert_eq!(b.total_usable_mb(), 81_559 * 4 - 1_024);
+        assert_eq!(b.backend, Some(GpuBackend::Cuda));
+
+        // Which is 4×, not 8×: the Vulkan enumerations of the same silicon are excluded.
+        assert_ne!(b.total_usable_mb(), 81_559 * 8 - 1_024);
+    }
+
+    #[test]
+    fn a_reservation_on_one_backend_is_charged_to_the_same_card_on_the_other() {
+        let r = one_card_two_backends();
+        // Something is running on Vulkan0, holding 5956 MiB of the one physical GPU.
+        let running = vec![record(
+            "a",
+            DesiredState::Running,
+            Some(held(&["Vulkan0"], &[("Vulkan0", 5_956)])),
+        )];
+        let rocm = budget_from_rig(
+            &r,
+            BackendScope::Build(&BuildId::parse("build").expect("id")),
+            &[],
+            0,
+            &running,
+        );
+        assert_eq!(
+            rocm.devices[0].reserved_mb, 5_956,
+            "the silicon is held, whichever backend is holding it"
+        );
+        assert_eq!(rocm.total_usable_mb(), 12_821 - 5_956);
+    }
+
+    #[test]
+    fn a_build_that_enumerates_nothing_gets_no_vram() {
+        // `build-rocm` on this box: installed, and broken by a missing libhipblas.so.3.
+        let mut r = one_card_two_backends();
+        r.builds.push(build("build-rocm", &[]));
+        let b = budget_from_rig(
+            &r,
+            BackendScope::Build(&BuildId::parse("build-rocm").expect("id")),
+            &[],
+            1_024,
+            &[],
+        );
+        assert!(b.devices.is_empty(), "{:?}", b.device_names());
+        assert_eq!(b.backend, None);
+        // And the plan is then judged against host RAM, with -ngl left to llama.cpp --fit.
+        let plan = fit(&FitInput {
+            budget: b,
+            ..log_input()
+        });
+        assert_eq!(plan.ngl, NglPlan::Auto);
+    }
+
+    #[test]
+    fn an_explicit_backend_scope_beats_the_rig_order() {
+        let r = one_card_two_backends();
+        let b = budget_from_rig(&r, BackendScope::Backend(&GpuBackend::Rocm), &[], 0, &[]);
+        assert_eq!(b.device_names(), vec!["ROCm0"]);
+        // Naming a device of another backend is refused, loudly, not quietly obeyed.
+        let b = budget_from_rig(
+            &r,
+            BackendScope::Backend(&GpuBackend::Rocm),
+            &["Vulkan0".to_string()],
+            0,
+            &[],
+        );
+        assert!(b.devices.is_empty());
+        assert!(
+            b.notes.iter().any(|n| n.contains("one backend")),
+            "{:?}",
+            b.notes
+        );
+    }
+
+    /// The GTT trap: ROCm reports free (12821) greater than total (11397) on this very
+    /// machine. `total - free` must be unable to produce a number at all.
+    #[test]
+    fn a_used_figure_can_never_underflow() {
+        let r = one_card_two_backends();
+        let rocm = r
+            .gpus
+            .iter()
+            .find(|g| g.device == "ROCm0")
+            .expect("the ROCm view");
+        assert!(rocm.vram_free_mb > rocm.vram_total_mb, "the live reading");
+        assert!(rocm.reports_gtt_overcommit());
+        // The only sanctioned way to ask cannot express the lie.
+        assert_eq!(rocm.vram_used_mb(), None);
+        // The Vulkan view of the same card can answer, and answers sanely.
+        let vulkan = r
+            .gpus
+            .iter()
+            .find(|g| g.device == "Vulkan0")
+            .expect("the Vulkan view");
+        assert_eq!(vulkan.vram_used_mb(), Some(20_992 - 19_626));
+        assert!(!vulkan.reports_gtt_overcommit());
+
+        // And it holds for every reading a driver could produce, not just this one.
+        for (total, free) in [(0u64, u64::MAX), (11_397, 12_821), (u64::MAX, 0), (7, 7)] {
+            let mut g = gpu("ROCm0", 0, free, 0);
+            g.vram_total_mb = total;
+            match g.vram_used_mb() {
+                Some(used) => assert!(used <= total, "used {used} > total {total}"),
+                None => assert!(free > total),
+            }
+        }
+
+        // The budget arithmetic that consumes those numbers saturates too: a device whose
+        // reservations exceed its free VRAM contributes zero, never 2^64.
+        let b = budget(&[("Vulkan0", 100, 9_999)], 4_096, 0);
+        assert_eq!(b.total_usable_mb(), 0);
+        assert_eq!(b.largest_usable_mb(), 0);
     }
 
     #[test]
@@ -1033,7 +1634,7 @@ mod tests {
             DesiredState::Running,
             Some(held(&["CUDA0", "CUDA1"], &[])),
         )];
-        let b = budget_from_rig(&r, &[], 512, &running);
+        let b = budget_from_rig(&r, BackendScope::Auto, &[], 512, &running);
         let total = 4_861 + 594 + 501;
         assert_eq!(b.devices[0].reserved_mb, total / 2);
         // max(snapshot 2000, computed half) — the snapshot floor wins here.
@@ -1043,7 +1644,7 @@ mod tests {
     #[test]
     fn a_budget_from_the_rig_feeds_straight_back_into_fit() {
         let r = rig(vec![gpu("Vulkan0", 0, 19_519, 0)]);
-        let b = budget_from_rig(&r, &["Vulkan0".to_string()], 1_024, &[]);
+        let b = budget_from_rig(&r, BackendScope::Auto, &["Vulkan0".to_string()], 1_024, &[]);
         let first = fit(&FitInput {
             budget: b,
             ..log_input()
@@ -1052,7 +1653,13 @@ mod tests {
 
         // Now that endpoint is running; a second copy no longer fits comfortably.
         let running = vec![record("a", DesiredState::Running, Some(first.clone()))];
-        let b2 = budget_from_rig(&r, &["Vulkan0".to_string()], 1_024, &running);
+        let b2 = budget_from_rig(
+            &r,
+            BackendScope::Auto,
+            &["Vulkan0".to_string()],
+            1_024,
+            &running,
+        );
         let second = fit(&FitInput {
             budget: b2,
             ..log_input()
@@ -1073,7 +1680,13 @@ mod tests {
             record("b", DesiredState::Running, Some(first.clone())),
             record("c", DesiredState::Running, Some(first.clone())),
         ];
-        let b3 = budget_from_rig(&r, &["Vulkan0".to_string()], 1_024, &running);
+        let b3 = budget_from_rig(
+            &r,
+            BackendScope::Auto,
+            &["Vulkan0".to_string()],
+            1_024,
+            &running,
+        );
         let third = fit(&FitInput {
             budget: b3,
             ..log_input()

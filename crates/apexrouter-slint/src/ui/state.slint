@@ -1,0 +1,373 @@
+// OWNER: unit U-02 (crates/apexrouter-slint/src/**, except build.rs). Do not edit outside
+// that unit.
+//
+// The entire Rust <-> UI contract, in one global.
+//
+// Screens read `State.x` and call `State.y()` directly instead of having every property
+// threaded down through AppWindow — with eight write-capable screens that plumbing would
+// be most of the file and all of the bugs. Rust reaches it with
+// `ui.global::<State>().set_x(...)` / `.on_y(...)`.
+//
+// Naming: kebab-case here, snake_case in Rust (`base-url` -> `set_base_url`).
+//
+// Every `callback` on this global is a WRITE unless its name starts with `load-` or
+// `refresh-`. This app is not a viewer.
+
+import {
+    DeviceRow, BuildRow, LocalModelRow, BackendRow, RouteRow, TargetRow, RequestRow,
+    InstanceRow, TunnelRow, OfferRow, RecipeRow, ProfileRow, HfFileRow, ProviderRow,
+    ModelRow, UsageRow, CheckRow, ProbeRow, JobRow, AlertRow
+} from "types.slint";
+
+export global State {
+    // ── Shell ─────────────────────────────────────────────────────────────
+    // 0 dashboard · 1 routes · 2 backends · 3 launch · 4 fleet · 5 catalog
+    // · 6 providers · 7 usage+doctor
+    in-out property <int> screen: 0;
+    in-out property <bool> connected: false;
+    in-out property <bool> busy: false;
+    in-out property <string> toast;
+    in-out property <int> toast-level: 0;
+    in-out property <string> control-url;
+    in-out property <string> version;
+    in-out property <string> served-by;
+    in-out property <bool> stale: false;
+    callback dismiss-toast();
+    callback refresh-all();
+
+    // ── Router bar ────────────────────────────────────────────────────────
+    in-out property <string> base-url;
+    in-out property <string> api-key-line: "OPENAI_API_KEY=not-needed";
+    in-out property <int> inflight: 0;
+    in-out property <string> req-per-min;
+    in-out property <string> tok-per-s;
+    in-out property <string> spend-24h;
+    in-out property <bool> spend-metered: false;
+    in-out property <string> uptime;
+    in-out property <string> default-alias;
+    in-out property <[string]> aliases;
+    in-out property <int> default-alias-index: 0;
+    in-out property <bool> table-valid: true;
+    in-out property <string> table-error;
+    // WRITE: re-points `default` in one click.
+    callback set-default-alias(string);
+    callback reload-config();
+
+    // ── Rig strip ─────────────────────────────────────────────────────────
+    in-out property <[DeviceRow]> devices;
+    in-out property <[BuildRow]> builds;
+    in-out property <string> ram;
+    in-out property <float> ram-frac: 0.0;
+    in-out property <string> swap;
+    in-out property <float> swap-frac: 0.0;
+    in-out property <string> cpu-threads;
+    in-out property <string> device-filter;
+    callback rescan-rig();
+    callback filter-by-device(string);
+
+    // ── Dashboard ─────────────────────────────────────────────────────────
+    in-out property <[BackendRow]> backends;
+    in-out property <[RequestRow]> requests;
+    in-out property <[AlertRow]> alerts;
+    in-out property <[JobRow]> jobs;
+    callback cancel-request(string);
+    callback cancel-job(string);
+    callback alert-act(string, string);
+
+    // ── Routes ────────────────────────────────────────────────────────────
+    in-out property <[RouteRow]> routes;
+    in-out property <string> route-sel;
+    in-out property <bool> route-editing: false;
+    in-out property <string> re-alias;
+    in-out property <[string]> strategies: ["first-healthy", "round-robin", "least-busy", "cheapest"];
+    in-out property <int> re-strategy: 0;
+    in-out property <bool> re-failover: true;
+    in-out property <bool> re-honor-retry: true;
+    in-out property <int> re-attempts: 2;
+    in-out property <bool> re-is-default: false;
+    in-out property <string> re-description;
+    in-out property <string> re-require-tags;
+    in-out property <string> re-exclude-tags;
+    in-out property <string> re-min-ctx;
+    in-out property <string> re-max-cost;
+    in-out property <bool> re-require-vision: false;
+    in-out property <bool> re-require-tools: false;
+    in-out property <[TargetRow]> re-targets;
+    in-out property <string> re-new-backend;
+    in-out property <string> re-new-model;
+    in-out property <int> re-new-weight: 1;
+    in-out property <string> route-test-result;
+    in-out property <int> route-test-level: 0;
+    in-out property <[string]> route-issues;
+    callback route-select(string);
+    callback route-new();
+    callback route-save();
+    callback route-delete();
+    callback route-test();
+    callback route-validate();
+    callback route-make-default();
+    callback target-add();
+    callback target-move(int, int);
+    callback target-remove(int);
+    callback target-edit(int, string, string, int);
+
+    // ── Backends ──────────────────────────────────────────────────────────
+    in-out property <string> backend-sel;
+    // The selected row, exploded. Slint models have no `find`, and a `for` loop with a
+    // visibility guard would make the detail pane's height depend on its own contents.
+    in-out property <string> sel-label;
+    in-out property <string> sel-kind;
+    in-out property <string> sel-protocol;
+    in-out property <string> sel-base-url;
+    in-out property <string> sel-health;
+    in-out property <int> sel-level: 0;
+    in-out property <string> sel-models;
+    in-out property <string> sel-devices;
+    in-out property <string> sel-tags;
+    in-out property <string> sel-slots;
+    in-out property <string> sel-queue;
+    in-out property <string> sel-latency;
+    in-out property <string> sel-price;
+    in-out property <string> sel-uptime;
+    in-out property <string> sel-last-error;
+    in-out property <bool> sel-enabled: true;
+    in-out property <bool> sel-stoppable: false;
+    in-out property <[string]> log-lines;
+    in-out property <bool> log-follow: true;
+    in-out property <string> log-filter;
+    in-out property <int> log-hidden: 0;
+    in-out property <string> log-source;
+    in-out property <int> bind-alias-index: 0;
+    in-out property <string> node-url;
+    in-out property <string> node-label;
+    in-out property <string> node-models;
+    in-out property <string> node-tags;
+    callback backend-select(string);
+    callback backend-probe(string);
+    callback backend-set-enabled(string, bool);
+    callback backend-drain(string);
+    callback backend-bind(string, string);
+    callback backend-stop(string);
+    callback backend-restart(string);
+    callback backend-destroy(string);
+    callback backend-register();
+    callback backend-forget(string);
+    callback log-open(string);
+    callback log-clear();
+    callback log-filter-changed(string);
+
+    // ── Launch ────────────────────────────────────────────────────────────
+    in-out property <bool> launch-open: false;
+    in-out property <int> launch-tab: 0;   // 0 local · 1 vLLM · 2 rent
+
+    // Local llama.cpp
+    in-out property <[LocalModelRow]> local-models;
+    in-out property <int> local-model-index: -1;
+    in-out property <int> build-index: 0;
+    in-out property <[string]> build-names;
+    in-out property <[string]> kv-types: ["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "f32"];
+    in-out property <[string]> split-modes: ["none", "layer", "row", "tensor"];
+    in-out property <[string]> sampling-modes: ["thinking", "coding", "nonthinking", "raw"];
+    in-out property <[string]> tristates: ["auto", "on", "off"];
+    in-out property <int> ll-ctx: 8192;
+    in-out property <int> ll-parallel: 1;
+    in-out property <int> ll-kv: 0;
+    in-out property <int> ll-split-mode: 1;
+    in-out property <string> ll-main-gpu;
+    in-out property <string> ll-tensor-split;
+    in-out property <int> ll-mode: 0;
+    in-out property <int> ll-flash: 0;
+    in-out property <string> ll-alias;
+    in-out property <string> ll-host: "127.0.0.1";
+    in-out property <string> ll-port;
+    in-out property <string> ll-extra;
+    in-out property <string> ll-mmproj;
+
+    // The live fit readout. Re-run on every stepper move.
+    in-out property <string> fit-verdict: "—";
+    in-out property <int> fit-level: 0;
+    in-out property <float> fit-weights-frac: 0.0;
+    in-out property <float> fit-kv-frac: 0.0;
+    in-out property <float> fit-compute-frac: 0.0;
+    in-out property <string> fit-caption;
+    in-out property <string> fit-budget;
+    in-out property <[string]> fit-why;
+
+    callback local-model-select(int);
+    callback device-toggle(int, bool);
+    callback fit-refresh();
+    callback launch-local();
+    callback launch-local-recipe();
+    callback load-local-models();
+
+    // vLLM
+    in-out property <string> vl-bin: "vllm";
+    in-out property <string> vl-model;
+    in-out property <int> vl-tp: 1;
+    in-out property <int> vl-ctx: 8192;
+    in-out property <string> vl-quant;
+    in-out property <string> vl-kv-dtype;
+    in-out property <string> vl-gpu-util;
+    in-out property <int> vl-max-seqs: 0;
+    in-out property <bool> vl-eager: false;
+    in-out property <bool> vl-trust: false;
+    in-out property <bool> vl-chunked: true;
+    in-out property <string> vl-alias;
+    in-out property <string> vl-host: "127.0.0.1";
+    in-out property <string> vl-port;
+    in-out property <string> vl-extra;
+    callback launch-vllm();
+    callback launch-vllm-recipe();
+
+    // Rent — the money path. Nothing here spends without `rent-confirm`.
+    in-out property <[ProfileRow]> profiles;
+    in-out property <[string]> profile-names;
+    in-out property <[string]> recipe-names;
+    in-out property <int> rent-profile-index: -1;
+    in-out property <[OfferRow]> offers;
+    in-out property <int> offer-index: -1;
+    in-out property <[string]> gpu-vocabulary;
+    in-out property <[string]> runtimes: ["llama.cpp", "vLLM"];
+    in-out property <int> rent-runtime: 0;
+    in-out property <string> rent-image;
+    in-out property <int> rent-disk-gb: 60;
+    in-out property <int> rent-port: 8000;
+    in-out property <string> rent-onstart;
+    in-out property <string> rent-hf-repo;
+    in-out property <string> rent-hf-quant;
+    in-out property <string> rent-max-dph;
+    in-out property <string> rent-hours: "1";
+    in-out property <string> rent-alias;
+    in-out property <bool> rent-expose: false;
+    in-out property <bool> rent-tunnel: true;
+    in-out property <bool> rent-confirm: false;
+    in-out property <string> rent-dph-line: "—";
+    in-out property <string> rent-total-line: "—";
+    in-out property <string> rent-credit-line: "—";
+    in-out property <string> rent-burndown-line: "—";
+    in-out property <string> rent-fit-line;
+    in-out property <int> rent-cost-level: 0;
+    in-out property <string> rent-search-note;
+    callback offers-search();
+    callback offer-select(int);
+    callback rent-profile-select(int);
+    callback rent-cost-refresh();
+    callback rent-go();
+
+    // The drawer becomes the boot view. No separate "watch boot" screen.
+    in-out property <bool> boot-active: false;
+    in-out property <string> boot-backend;
+    in-out property <string> boot-phase;
+    in-out property <int> boot-level: 0;
+    in-out property <float> boot-pct: 0.0;
+    in-out property <string> boot-elapsed;
+    in-out property <[string]> boot-log;
+    callback boot-destroy();
+    callback boot-dismiss();
+
+    // ── Fleet ─────────────────────────────────────────────────────────────
+    in-out property <[InstanceRow]> instances;
+    in-out property <[TunnelRow]> tunnels;
+    in-out property <string> credit: "—";
+    in-out property <string> burn-rate: "—";
+    in-out property <string> burn-down: "—";
+    in-out property <string> spend-7d: "—";
+    in-out property <[CheckRow]> diagnose-rows;
+    in-out property <string> diagnose-of;
+    callback instance-destroy(string);
+    callback instance-tunnel(string, bool);
+    callback instance-restart-download(string);
+    callback instance-diagnose(string);
+    callback instance-reconcile(string);
+    callback instance-bind(string, string);
+    callback refresh-fleet();
+
+    // ── Catalog ───────────────────────────────────────────────────────────
+    in-out property <[RecipeRow]> recipes;
+    in-out property <string> recipe-sel;
+    in-out property <string> rc-id;
+    in-out property <string> rc-label;
+    in-out property <string> rc-description;
+    in-out property <string> rc-body;
+    in-out property <string> rc-alias;
+    in-out property <[string]> rc-issues;
+    callback recipe-select(string);
+    callback recipe-new();
+    callback recipe-save();
+    callback recipe-duplicate();
+    callback recipe-delete();
+    callback recipe-validate();
+    callback recipe-run();
+
+    in-out property <string> profile-sel;
+    in-out property <string> pf-id;
+    in-out property <string> pf-label;
+    in-out property <string> pf-gpu-names;
+    in-out property <int> pf-min-gpus: 1;
+    in-out property <int> pf-max-gpus: 1;
+    in-out property <string> pf-max-dph;
+    in-out property <string> pf-min-reliability: "0.98";
+    in-out property <int> pf-min-inet: 200;
+    in-out property <int> pf-min-disk: 60;
+    in-out property <string> pf-min-cuda;
+    in-out property <[string]> geos: ["any", "eu-nordic", "eu", "us"];
+    in-out property <int> pf-geo: 0;
+    in-out property <[string]> image-types: ["prebuilt", "builder", "vllm"];
+    in-out property <int> pf-image-type: 0;
+    callback profile-select(string);
+    callback profile-new();
+    callback profile-save();
+    callback profile-delete();
+
+    // HF: repo + quant as fields, with an escape hatch to the web UI for browsing.
+    in-out property <string> hf-repo;
+    in-out property <string> hf-quant;
+    in-out property <string> hf-dest;
+    in-out property <[HfFileRow]> hf-files;
+    in-out property <int> hf-file-index: -1;
+    in-out property <[JobRow]> downloads;
+    callback load-hf-files();
+    callback hf-download();
+    callback hf-cancel(string);
+    callback open-web-ui();
+
+    // ── Providers ─────────────────────────────────────────────────────────
+    in-out property <[ProviderRow]> providers;
+    in-out property <string> provider-sel;
+    in-out property <string> pv-base-url;
+    in-out property <string> pv-key;
+    in-out property <string> pv-key-env;
+    in-out property <string> pv-key-file;
+    in-out property <string> pv-source;
+    in-out property <[ModelRow]> provider-models;
+    in-out property <[CheckRow]> provider-checks;
+    in-out property <string> pv-model-filter;
+    callback provider-select(string);
+    callback provider-save();
+    callback provider-test();
+    callback load-provider-models();
+    callback provider-activate(string);
+    callback provider-recipe(string);
+    callback provider-filter-changed(string);
+
+    // ── Usage / Doctor ────────────────────────────────────────────────────
+    in-out property <[string]> usage-windows: ["1h", "24h", "7d", "30d"];
+    in-out property <int> usage-window: 1;
+    in-out property <[string]> usage-groupings: ["provider", "model", "backend", "alias", "day"];
+    in-out property <int> usage-by: 0;
+    in-out property <[UsageRow]> usage-rows;
+    in-out property <string> usage-total;
+    in-out property <bool> usage-metered: false;
+    in-out property <string> usage-tokens;
+    in-out property <string> usage-requests;
+    callback load-usage();
+
+    in-out property <[CheckRow]> checks;
+    in-out property <[ProbeRow]> probes;
+    in-out property <string> smoke-alias;
+    in-out property <bool> doctor-running: false;
+    callback load-checks();
+    callback run-check(string);
+    callback run-diagnose();
+    callback run-smoke();
+}

@@ -1,0 +1,356 @@
+// OWNER: unit U-02. Screen 7 — Usage / Doctor.
+//
+// Usage is a bar row rather than the web UI's stacked inline-SVG chart (docs/SLINT.md).
+// Every money figure carries its metered-vs-approximate badge, because a guess that
+// looks like a measurement is the one number that can cost real money.
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, KV, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip, CostBadge } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, Empty } from "../components/table.slint";
+import { Btn, Field, Toggle, Chooser, Labeled } from "../components/widgets.slint";
+import { BarRow } from "../components/meter.slint";
+
+export component DoctorScreen inherits HorizontalLayout {
+    spacing: Palette.gap;
+
+    // ── Usage ─────────────────────────────────────────────────────────────
+    Card {
+        title: "usage";
+        horizontal-stretch: 2;
+
+        HorizontalLayout {
+            spacing: Palette.gap;
+            vertical-stretch: 0;
+            Labeled {
+                label: "window";
+                Chooser {
+                    options: State.usage-windows;
+                    current <=> State.usage-window;
+                    changed => {
+                        State.load-usage();
+                    }
+                }
+            }
+            Labeled {
+                label: "group by";
+                Chooser {
+                    options: State.usage-groupings;
+                    current <=> State.usage-by;
+                    changed => {
+                        State.load-usage();
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: end;
+                Btn {
+                    label: "reload";
+                    icon: "↻";
+                    clicked => {
+                        State.load-usage();
+                    }
+                }
+            }
+            Rectangle { }
+            VerticalLayout {
+                alignment: end;
+                CostBadge {
+                    amount: State.usage-total;
+                    metered: State.usage-metered;
+                }
+            }
+        }
+
+        KV {
+            key: "tokens";
+            value: State.usage-tokens;
+            mono: true;
+        }
+        KV {
+            key: "requests";
+            value: State.usage-requests;
+            mono: true;
+        }
+
+        Hairline { }
+
+        ListScroll {
+            rows: State.usage-rows.length;
+            VerticalLayout {
+                spacing: 0px;
+                alignment: start;
+                width: parent.width;
+                for u in State.usage-rows: VerticalLayout {
+                    spacing: 0px;
+                    BarRow {
+                        label: u.key;
+                        value: u.cost;
+                        frac: u.frac;
+                        level: u.metered ? 5 : 2;
+                    }
+                    HorizontalLayout {
+                        padding-left: 158px;
+                        spacing: 14px;
+                        Text {
+                            text: "prompt " + u.prompt;
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                        }
+                        Text {
+                            text: "completion " + u.completion;
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                        }
+                        Text {
+                            text: u.requests + " req";
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                        }
+                        Text {
+                            text: u.tps;
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                        }
+                        Rectangle { }
+                        Badge {
+                            label: u.metered ? "metered" : "approx";
+                            level: u.metered ? 1 : 2;
+                            icon: u.metered ? "=" : "~";
+                        }
+                    }
+                }
+                if State.usage-rows.length == 0: Empty {
+                    message: "no usage in this window";
+                }
+            }
+        }
+    }
+
+    // ── Doctor ────────────────────────────────────────────────────────────
+    VerticalLayout {
+        horizontal-stretch: 3;
+        spacing: Palette.gap;
+
+        Card {
+            title: "checks";
+            subtitle: State.checks.length + " in the registry";
+            vertical-stretch: 2;
+            HorizontalLayout {
+                spacing: Palette.gap;
+                vertical-stretch: 0;
+                Btn {
+                    label: "run all";
+                    kind: 1;
+                    icon: "▶";
+                    enabled: !State.doctor-running;
+                    clicked => {
+                        State.run-diagnose();
+                    }
+                }
+                Btn {
+                    label: "reload registry";
+                    clicked => {
+                        State.load-checks();
+                    }
+                }
+                if State.doctor-running: Badge {
+                    label: "running";
+                    level: 5;
+                    icon: "◐";
+                }
+                Rectangle { }
+            }
+            ListScroll {
+                rows: State.checks.length;
+                row-height: 42px;
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: start;
+                    width: parent.width;
+                    for c in State.checks: Rectangle {
+                        height: 40px;
+                        background: Palette.surface-lo;
+                        border-radius: Palette.radius-sm;
+                        VerticalLayout {
+                            padding: 4px;
+                            padding-left: Palette.pad-sm;
+                            padding-right: Palette.pad-sm;
+                            spacing: 1px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Badge {
+                                    label: c.status;
+                                    level: c.level;
+                                }
+                                Text {
+                                    text: c.label;
+                                    color: Palette.ink;
+                                    font-size: Palette.font-sm;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    text: c.id;
+                                    color: Palette.muted;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                    vertical-alignment: center;
+                                }
+                                Rectangle { }
+                                Text {
+                                    text: c.ms;
+                                    color: Palette.muted;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                    vertical-alignment: center;
+                                }
+                                Btn {
+                                    label: "run";
+                                    compact: true;
+                                    clicked => {
+                                        State.run-check(c.id);
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 10px;
+                                Text {
+                                    text: c.detail;
+                                    color: Palette.ink-2;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                    overflow: elide;
+                                }
+                                Rectangle { }
+                                if c.fix != "": Text {
+                                    text: "fix: " + c.fix;
+                                    color: Palette.warn;
+                                    font-size: Palette.font-sm;
+                                    font-family: Palette.mono;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+                    if State.checks.length == 0: Empty {
+                        message: "press “reload registry” to list the checks";
+                    }
+                }
+            }
+        }
+
+        Card {
+            title: "smoke";
+            subtitle: "models · warm-up · tool call · throughput — TTFT and tok/s read from `timings`";
+            vertical-stretch: 1;
+            HorizontalLayout {
+                spacing: Palette.gap;
+                vertical-stretch: 0;
+                Labeled {
+                    label: "alias";
+                    Field {
+                        value <=> State.smoke-alias;
+                        mono: true;
+                        placeholder: State.default-alias;
+                    }
+                }
+                VerticalLayout {
+                    alignment: end;
+                    Btn {
+                        label: "run the four probes";
+                        kind: 1;
+                        icon: "▶";
+                        enabled: !State.doctor-running;
+                        clicked => {
+                            State.run-smoke();
+                        }
+                    }
+                }
+                Rectangle { }
+            }
+            HeadRow {
+                HeadCell { text: "probe"; }
+                HeadCell {
+                    text: "ms";
+                    width: 62px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "ttft";
+                    width: 70px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "tok/s";
+                    width: 62px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "tokens";
+                    width: 62px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "detail";
+                    width: 250px;
+                }
+            }
+            ListScroll {
+                rows: State.probes.length;
+                VerticalLayout {
+                    spacing: 0px;
+                    alignment: start;
+                    width: parent.width;
+                    for p[i] in State.probes: Row {
+                        striped: Math.mod(i, 2) == 1;
+                        HorizontalLayout {
+                            spacing: 5px;
+                            Badge {
+                                label: p.ok ? "pass" : "fail";
+                                level: p.ok ? 1 : 4;
+                            }
+                            Cell { text: p.name; }
+                        }
+                        Cell {
+                            text: p.ms;
+                            width: 62px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: p.ttft;
+                            width: 70px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: p.tps;
+                            width: 62px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: p.tokens;
+                            width: 62px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: p.detail;
+                            width: 250px;
+                            mono: true;
+                        }
+                    }
+                    if State.probes.length == 0: Empty {
+                        message: "no smoke run yet";
+                    }
+                }
+            }
+        }
+    }
+}

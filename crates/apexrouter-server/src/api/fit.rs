@@ -20,8 +20,8 @@
 use crate::api::rig::{find_model, local_model_list, model_not_found, rig_snapshot};
 use crate::api::{ApiError, ApiResult};
 use crate::state::AppState;
-use apexrouter_core::fit::{budget_from_rig, fit};
-use apexrouter_protocol::{FitInput, FitPlan, KvType, SplitMode, SplitPlan};
+use apexrouter_core::fit::{budget_from_rig, fit, BackendScope};
+use apexrouter_protocol::{BuildId, FitInput, FitPlan, KvType, SplitMode, SplitPlan};
 use axum::extract::{Query, State};
 use axum::routing::{get, post};
 use axum::Json;
@@ -45,9 +45,15 @@ pub struct FitQuery {
     /// KV element type, spelled exactly as the `-ctk`/`-ctv` flag value.
     #[serde(default)]
     pub kv: Option<String>,
-    /// Comma-separated `-dev` tokens. Empty selects every non-software GPU.
+    /// Comma-separated `-dev` tokens. Empty selects every non-software GPU **of the scoped
+    /// backend** — a budget is never a sum across backends.
     #[serde(default)]
     pub devices: Option<String>,
+    /// The build this would launch with, e.g. `build-vulkan`. It selects the backend, and
+    /// therefore which of a device's several enumerations the budget is over. Omitted means
+    /// "the build `endpoint start` would pick".
+    #[serde(default)]
+    pub build: Option<String>,
     /// `-sm` value: `none`, `layer`, `row` or `tensor`.
     #[serde(default)]
     pub split_mode: Option<String>,
@@ -120,7 +126,32 @@ pub async fn build_input(state: &Arc<AppState>, q: &FitQuery) -> Result<FitInput
     let rig = rig_snapshot(state, false).await?;
     let running = state.store.list_endpoints().unwrap_or_default();
     let cfg = state.cfg.load_full();
-    let budget = budget_from_rig(&rig, &devices, cfg.endpoints.vram_margin_mb, &running);
+    // One `llama-server` process uses one compute backend, so the budget is over one
+    // backend's devices. `?build=` names it; without one the solver scopes to the build
+    // `endpoint start` would pick, so a `GET` verdict and a launch refusal still agree.
+    let build = q
+        .build
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            BuildId::parse(s).map_err(|e| {
+                ApiError::bad_request("invalid_build", format!("`{s}` is not a build id: {e}"))
+                    .with_param("build")
+            })
+        })
+        .transpose()?;
+    let scope = match build.as_ref() {
+        Some(id) => BackendScope::Build(id),
+        None => BackendScope::Auto,
+    };
+    let budget = budget_from_rig(
+        &rig,
+        scope,
+        &devices,
+        cfg.endpoints.vram_margin_mb,
+        &running,
+    );
 
     Ok(FitInput {
         weights_bytes: model.total_bytes,
@@ -239,6 +270,8 @@ mod tests {
             }],
             margin_mb: 1024,
             host_ram_free_mb: 8192,
+            backend: Some(apexrouter_protocol::GpuBackend::Vulkan),
+            notes: vec![],
         }
     }
 

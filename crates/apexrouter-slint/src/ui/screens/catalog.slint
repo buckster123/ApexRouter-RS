@@ -1,0 +1,517 @@
+// OWNER: unit U-02. Screen 5 — Catalog: recipes, search profiles, and downloads.
+//
+// "Dynamic recipe building in the GUI" means all six verbs: new · edit · duplicate ·
+// delete · validate · run. The recipe body is edited as its own JSON because a `Recipe`
+// is a tagged union over four spec types and a fixed form would quietly forbid three of
+// them; label, description and the run alias get real fields.
+//
+// HF *browsing* is the one deferral (docs/SLINT.md): repo + quant are fields here, and
+// the "open the web UI" button hands the search off to the surface that has it.
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, KV, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, PaneScroll, Empty } from "../components/table.slint";
+import { Btn, Field, Area, Toggle, Chooser, Stepper, Labeled } from "../components/widgets.slint";
+
+export component CatalogScreen inherits HorizontalLayout {
+    spacing: Palette.gap;
+
+    // ── Recipes ───────────────────────────────────────────────────────────
+    VerticalLayout {
+        horizontal-stretch: 2;
+        spacing: Palette.gap;
+
+        Card {
+            title: "recipes";
+            subtitle: State.recipes.length + " saved";
+            vertical-stretch: 1;
+            HorizontalLayout {
+                spacing: 5px;
+                vertical-stretch: 0;
+                Btn {
+                    label: "new";
+                    icon: "+";
+                    kind: 1;
+                    compact: true;
+                    clicked => {
+                        State.recipe-new();
+                    }
+                }
+                Btn {
+                    label: "duplicate";
+                    compact: true;
+                    enabled: State.recipe-sel != "";
+                    clicked => {
+                        State.recipe-duplicate();
+                    }
+                }
+                Rectangle { }
+            }
+            ListScroll {
+                rows: State.recipes.length;
+                row-height: 38px;
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: start;
+                    width: parent.width;
+                    for r in State.recipes: Rectangle {
+                        height: 36px;
+                        border-radius: Palette.radius-sm;
+                        background: r.id == State.recipe-sel ? Palette.accent-dim
+                            : (rta.has-hover ? Palette.surface-hi : Palette.clear);
+                        rta := TouchArea {
+                            clicked => {
+                                State.recipe-select(r.id);
+                            }
+                        }
+                        VerticalLayout {
+                            padding-left: Palette.pad-sm;
+                            padding-right: Palette.pad-sm;
+                            spacing: 0px;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: r.label;
+                                    color: Palette.ink;
+                                    font-size: Palette.font-sm;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Badge {
+                                    label: r.kind;
+                                    level: 0;
+                                    icon: "▣";
+                                }
+                                Rectangle { }
+                                if r.stale: Badge {
+                                    label: "stale";
+                                    level: 2;
+                                }
+                            }
+                            Text {
+                                text: r.stale ? r.stale-why : r.id;
+                                color: r.stale ? Palette.warn : Palette.muted;
+                                font-size: Palette.font-sm;
+                                font-family: Palette.mono;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                    if State.recipes.length == 0: Empty {
+                        message: "no recipes — press new, or “save as recipe” from Launch";
+                    }
+                }
+            }
+        }
+
+        Card {
+            title: "search profiles";
+            vertical-stretch: 1;
+            HorizontalLayout {
+                spacing: 5px;
+                vertical-stretch: 0;
+                Btn {
+                    label: "new";
+                    icon: "+";
+                    kind: 1;
+                    compact: true;
+                    clicked => {
+                        State.profile-new();
+                    }
+                }
+                Rectangle { }
+            }
+            ListScroll {
+                rows: State.profiles.length;
+                row-height: 30px;
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: start;
+                    width: parent.width;
+                    for p in State.profiles: Row {
+                        selected: p.id == State.profile-sel;
+                        clicked => {
+                            State.profile-select(p.id);
+                        }
+                        Cell {
+                            text: p.label;
+                            mono: true;
+                        }
+                        Cell {
+                            text: p.gpus;
+                            width: 120px;
+                        }
+                        Cell {
+                            text: p.max-dph;
+                            width: 66px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        Cell {
+                            text: p.geo;
+                            width: 74px;
+                        }
+                    }
+                    if State.profiles.length == 0: Empty {
+                        message: "no profiles — a profile is a saved market query";
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Editors ───────────────────────────────────────────────────────────
+    VerticalLayout {
+        horizontal-stretch: 3;
+        spacing: Palette.gap;
+
+        Card {
+            title: State.rc-id == "" ? "recipe editor" : "recipe · " + State.rc-id;
+            vertical-stretch: 2;
+            HorizontalLayout {
+                spacing: Palette.gap;
+                Labeled {
+                    label: "id";
+                    Field {
+                        value <=> State.rc-id;
+                        mono: true;
+                        placeholder: "carnice-9b-vulkan";
+                    }
+                }
+                Labeled {
+                    label: "label";
+                    Field {
+                        value <=> State.rc-label;
+                        placeholder: "Carnice 9B on the iGPU";
+                    }
+                }
+                Labeled {
+                    label: "run as alias";
+                    Field {
+                        value <=> State.rc-alias;
+                        mono: true;
+                        placeholder: "auto";
+                    }
+                }
+            }
+            Labeled {
+                label: "description";
+                Field {
+                    value <=> State.rc-description;
+                }
+            }
+            Labeled {
+                label: "kind — the tagged spec, verbatim";
+                Area {
+                    vertical-stretch: 1;
+                    min-height: 150px;
+                    value <=> State.rc-body;
+                    placeholder: "{ \"kind\": \"local\", \"build\": \"…\", \"model_path\": \"…\", … }";
+                }
+            }
+            if State.rc-issues.length > 0: Banner {
+                message: "validation";
+                level: 2;
+                for line in State.rc-issues: Text {
+                    text: line;
+                    color: Palette.ink-2;
+                    font-size: Palette.font-sm;
+                    font-family: Palette.mono;
+                    wrap: word-wrap;
+                }
+            }
+            HorizontalLayout {
+                spacing: Palette.gap;
+                Btn {
+                    label: "save";
+                    kind: 1;
+                    icon: "✓";
+                    clicked => {
+                        State.recipe-save();
+                    }
+                }
+                Btn {
+                    label: "validate";
+                    clicked => {
+                        State.recipe-validate();
+                    }
+                }
+                Btn {
+                    label: "run";
+                    icon: "▶";
+                    clicked => {
+                        State.recipe-run();
+                    }
+                }
+                Rectangle { }
+                Btn {
+                    label: "delete";
+                    kind: 2;
+                    icon: "✕";
+                    enabled: State.recipe-sel != "";
+                    clicked => {
+                        State.recipe-delete();
+                    }
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Palette.gap;
+            vertical-stretch: 2;
+
+            Card {
+                title: State.pf-id == "" ? "profile editor" : "profile · " + State.pf-id;
+                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "id";
+                        Field {
+                            value <=> State.pf-id;
+                            mono: true;
+                        }
+                    }
+                    Labeled {
+                        label: "label";
+                        Field {
+                            value <=> State.pf-label;
+                        }
+                    }
+                }
+                Labeled {
+                    label: "gpu names";
+                    hint: "comma separated; the live vocabulary comes from vast.ai";
+                    Field {
+                        value <=> State.pf-gpu-names;
+                        mono: true;
+                        placeholder: "RTX 4090, H100 NVL";
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "gpus min";
+                        Stepper {
+                            value <=> State.pf-min-gpus;
+                            minimum: 1;
+                            maximum: 16;
+                        }
+                    }
+                    Labeled {
+                        label: "gpus max";
+                        Stepper {
+                            value <=> State.pf-max-gpus;
+                            minimum: 1;
+                            maximum: 16;
+                        }
+                    }
+                    Labeled {
+                        label: "max $/hr";
+                        Field {
+                            value <=> State.pf-max-dph;
+                            mono: true;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "min reliability";
+                        Field {
+                            value <=> State.pf-min-reliability;
+                            mono: true;
+                        }
+                    }
+                    Labeled {
+                        label: "min inet ↓";
+                        Stepper {
+                            value <=> State.pf-min-inet;
+                            minimum: 0;
+                            maximum: 10000;
+                            step: 50;
+                        }
+                    }
+                    Labeled {
+                        label: "min disk GB";
+                        Stepper {
+                            value <=> State.pf-min-disk;
+                            minimum: 0;
+                            maximum: 4000;
+                            step: 10;
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "min cuda";
+                        Field {
+                            value <=> State.pf-min-cuda;
+                            mono: true;
+                            placeholder: "12.4";
+                        }
+                    }
+                    Labeled {
+                        label: "geo";
+                        Chooser {
+                            options: State.geos;
+                            current <=> State.pf-geo;
+                        }
+                    }
+                    Labeled {
+                        label: "image type";
+                        Chooser {
+                            options: State.image-types;
+                            current <=> State.pf-image-type;
+                        }
+                    }
+                }
+                Rectangle { }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Btn {
+                        label: "save";
+                        kind: 1;
+                        icon: "✓";
+                        clicked => {
+                            State.profile-save();
+                        }
+                    }
+                    Rectangle { }
+                    Btn {
+                        label: "delete";
+                        kind: 2;
+                        icon: "✕";
+                        enabled: State.profile-sel != "";
+                        clicked => {
+                            State.profile-delete();
+                        }
+                    }
+                }
+            }
+
+            // ── HF download ───────────────────────────────────────────────
+            Card {
+                title: "hugging face";
+                subtitle: "repo + quant; browsing lives in the web UI";
+                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: 5px;
+                    Field {
+                        horizontal-stretch: 2;
+                        value <=> State.hf-repo;
+                        mono: true;
+                        placeholder: "unsloth/Qwen3-30B-A3B-GGUF";
+                    }
+                    Btn {
+                        label: "list files";
+                        compact: true;
+                        clicked => {
+                            State.load-hf-files();
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 5px;
+                    Field {
+                        value <=> State.hf-quant;
+                        mono: true;
+                        placeholder: "quant, e.g. UD-Q4_K_XL";
+                    }
+                    Field {
+                        value <=> State.hf-dest;
+                        mono: true;
+                        placeholder: "dest (default ~/models/<repo>)";
+                    }
+                }
+                ListScroll {
+                    rows: State.hf-files.length;
+                    VerticalLayout {
+                        spacing: 0px;
+                        alignment: start;
+                        width: parent.width;
+                        for f[i] in State.hf-files: Row {
+                            striped: Math.mod(i, 2) == 1;
+                            selected: i == State.hf-file-index;
+                            clicked => {
+                                State.hf-file-index = i;
+                                State.hf-quant = f.quant;
+                            }
+                            Cell {
+                                text: f.label;
+                                mono: true;
+                            }
+                            if f.mmproj: Badge {
+                                label: "mmproj";
+                                level: 5;
+                            }
+                            Cell {
+                                text: f.files + " files";
+                                width: 66px;
+                                numeric: true;
+                            }
+                            Cell {
+                                text: f.size;
+                                width: 78px;
+                                numeric: true;
+                                mono: true;
+                            }
+                        }
+                        if State.hf-files.length == 0: Empty {
+                            message: "no files listed — sizes come from paths-info, not siblings";
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 5px;
+                    Btn {
+                        label: "download";
+                        kind: 1;
+                        icon: "↓";
+                        clicked => {
+                            State.hf-download();
+                        }
+                    }
+                    Btn {
+                        label: "open web UI";
+                        kind: 3;
+                        clicked => {
+                            State.open-web-ui();
+                        }
+                    }
+                    Rectangle { }
+                }
+                VerticalLayout {
+                    spacing: 2px;
+                    for j in State.downloads: HorizontalLayout {
+                        spacing: 6px;
+                        Badge {
+                            label: j.state;
+                            level: j.level;
+                        }
+                        Text {
+                            text: j.message;
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Rectangle { }
+                        Btn {
+                            label: "cancel";
+                            compact: true;
+                            kind: 3;
+                            clicked => {
+                                State.hf-cancel(j.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

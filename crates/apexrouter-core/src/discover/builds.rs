@@ -154,6 +154,10 @@ pub async fn discover_builds(cfg: &EndpointsCfg, cache: &Path) -> Result<Vec<Lla
 ///
 /// A binary that enumerates nothing and exits non-zero is an `Err`; one that enumerates
 /// nothing and exits cleanly returns an empty list, the honest answer for a CPU-only build.
+///
+/// Each returned [`Gpu`] carries the PCI address of the silicon behind it when
+/// [`crate::discover::physical`] can align the enumeration with `/sys/bus/pci/devices`.
+/// That is what lets two builds' views of one card be recognised as one card.
 pub async fn probe_devices(server: &Path) -> Result<Vec<Gpu>> {
     let out = run_probe(server, &["--list-devices"], DEVICES_TIMEOUT).await?;
     let saw_header = out
@@ -164,7 +168,12 @@ pub async fn probe_devices(server: &Path) -> Result<Vec<Gpu>> {
     if !saw_header && (out.status != 0 || out.timed_out) {
         return Err(probe_failed(server, "--list-devices", &out));
     }
-    Ok(parse_devices(&out.stdout, &build_id_for(server)?))
+    let mut gpus = parse_devices(&out.stdout, &build_id_for(server)?);
+    crate::discover::physical::attach_pci_ids(
+        &mut gpus,
+        &crate::discover::physical::scan_pci_gpus(),
+    );
+    Ok(gpus)
 }
 
 /// `llama-server --help`, cached in `$CACHE` keyed by `(path, mtime, size)`.
@@ -492,6 +501,8 @@ fn parse_devices(stdout: &str, seen_by: &BuildId) -> Vec<Gpu> {
             backend,
             vram_total_mb: total_mb,
             vram_free_mb: free_mb,
+            // Filled by `physical::attach_pci_ids`: `--list-devices` prints no bus id.
+            pci_bus_id: None,
             driver: None,
             is_software: SOFTWARE_MARKERS.iter().any(|m| lower.contains(m)),
             seen_by_builds: vec![seen_by.clone()],

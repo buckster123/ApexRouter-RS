@@ -1011,6 +1011,7 @@ mod tests {
                 backend: GpuBackend::Vulkan,
                 vram_total_mb: 16_384,
                 vram_free_mb: 12_000,
+                pci_bus_id: None,
                 driver: None,
                 is_software: false,
                 seen_by_builds: vec![],

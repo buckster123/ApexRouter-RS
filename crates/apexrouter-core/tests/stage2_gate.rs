@@ -402,6 +402,78 @@ async fn real_machine_enumerates_devices_and_marks_software_ones() {
     }
 }
 
+/// **The GTT underflow, made impossible rather than merely avoided.**
+///
+/// ROCm on this box reports `free` (12821 MiB) greater than `total` (11397 MiB), so
+/// `total - free` is an underflowed `u64` the size of the universe rather than a small
+/// number. `Gpu::vram_used_mb() -> Option<u64>` is the one sanctioned way to ask, and it
+/// returns `None` on that reading — a type that cannot express the lie.
+///
+/// This test is the enforcement: **no production line anywhere in the workspace may put
+/// those two fields on either side of a subtraction.** It scans every `crates/*/src/**.rs`
+/// down to its `#[cfg(test)]` boundary, and the only permitted hit is the `checked_sub`
+/// inside `vram_used_mb` itself.
+#[test]
+fn nothing_in_the_workspace_subtracts_free_vram_from_total_vram() {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root")
+        .join("crates");
+    let mut files = Vec::new();
+    walk(&root, &mut files);
+    assert!(files.len() > 20, "the scan found nothing to scan");
+
+    let mut offenders: Vec<String> = Vec::new();
+    let mut sanctioned = 0usize;
+    for file in &files {
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        // Test modules live at the end of every file in this codebase and are allowed to
+        // assert about the trap; production code is everything above the boundary.
+        let production = match text.find("#[cfg(test)]") {
+            Some(at) => &text[..at],
+            None => &text[..],
+        };
+        for (n, line) in production.lines().enumerate() {
+            if !(line.contains("vram_total_mb") && line.contains("vram_free_mb")) {
+                continue;
+            }
+            if !(line.contains('-') || line.contains("sub")) {
+                continue; // a comparison or a struct literal, not arithmetic
+            }
+            if line.contains("checked_sub") {
+                sanctioned += 1;
+                continue;
+            }
+            offenders.push(format!("{}:{}: {}", file.display(), n + 1, line.trim()));
+        }
+    }
+    assert_eq!(
+        sanctioned, 1,
+        "exactly one sanctioned subtraction — `Gpu::vram_used_mb` — was expected"
+    );
+    assert!(
+        offenders.is_empty(),
+        "`total - free` underflows on this machine's ROCm device; use `Gpu::vram_used_mb()`:\n{}",
+        offenders.join("\n")
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // 3. model discovery + the GGUF header
 // ---------------------------------------------------------------------------------------
@@ -547,26 +619,104 @@ async fn real_machine_fit_then_argv_for_carnice_on_vulkan() {
     let meta: GgufMeta = model.gguf.clone().expect("Carnice's header");
 
     // --- a live rig, assembled the way the daemon will ---------------------------------
-    let gpus = probe_devices(&vulkan_bin).await.expect("probe_devices");
+    //
+    // Every build, not just the Vulkan one: `scan_rig` merges devices across builds by
+    // `-dev` token, so on this box the one Radeon 840M arrives as TWO rows — `Vulkan0` from
+    // `build-vulkan` and `ROCm0` from `build`. That is the shape MK1-CORE finding A was
+    // measured on, and probing only one build is exactly why the unit tests missed it.
+    let mut gpus: Vec<apexrouter_core::protocol::Gpu> = Vec::new();
+    for b in &builds {
+        for gpu in probe_devices(Path::new(&b.server_path))
+            .await
+            .unwrap_or_default()
+        {
+            match gpus.iter_mut().find(|g| g.device == gpu.device) {
+                Some(existing) => existing.seen_by_builds.push(b.id.clone()),
+                None => gpus.push(gpu),
+            }
+        }
+    }
     let rig = RigSnapshot {
         gpus,
         builds: builds.clone(),
         ram_free_mb: mem_available_mb(),
         ..RigSnapshot::default()
     };
-    let budget: VramBudget = fit::budget_from_rig(&rig, &[], 1_024, &[]);
+    eprintln!("\n=== live rig ===");
+    for g in &rig.gpus {
+        eprintln!(
+            "  {} {:?} {} — {} MiB total, {} MiB free, pci={:?}, used={:?}",
+            g.device,
+            g.backend,
+            g.name,
+            g.vram_total_mb,
+            g.vram_free_mb,
+            g.pci_bus_id,
+            g.vram_used_mb()
+        );
+    }
+    let physical = rig.physical_devices();
+    for p in &physical {
+        eprintln!(
+            "  physical {} — {} — backends {:?} via {:?}",
+            p.key,
+            p.name,
+            p.backends(),
+            p.device_tokens()
+        );
+    }
+    // One laptop, one iGPU. However many builds enumerate it.
+    let amd: Vec<_> = physical
+        .iter()
+        .filter(|p| p.name.to_lowercase().contains("radeon"))
+        .collect();
+    assert!(
+        amd.len() <= 1,
+        "the 840M must be ONE physical device, not one per backend: {amd:?}"
+    );
+
+    // --- the budget, scoped to the build that will actually be exec'd ------------------
+    let budget: VramBudget =
+        fit::budget_from_rig(&rig, fit::BackendScope::Build(&build.id), &[], 1_024, &[]);
     eprintln!(
-        "\n=== live budget ===\n  devices={:?} usable={} MiB (margin {} MiB), host MemAvailable={} MiB",
+        "\n=== live budget ===\n  backend={:?} devices={:?} usable={} MiB (margin {} MiB), host MemAvailable={} MiB\n  notes={:?}",
+        budget.backend,
         budget.device_names(),
         budget.total_usable_mb(),
         budget.margin_mb,
         budget.host_ram_free_mb,
+        budget.notes,
     );
     assert_eq!(
         budget.device_names(),
         vec!["Vulkan0".to_owned()],
         "the software-device filter is the documented default"
     );
+    // FINDING A: the budget is the Vulkan device's free VRAM, not that plus every other
+    // backend's reading of the same silicon.
+    let vulkan_free = rig
+        .gpus
+        .iter()
+        .find(|g| g.device == "Vulkan0")
+        .map(|g| g.vram_free_mb)
+        .expect("Vulkan0");
+    assert_eq!(budget.total_usable_mb(), vulkan_free - 1_024);
+    let every_gpu: u64 = rig
+        .gpus
+        .iter()
+        .filter(|g| !g.is_software)
+        .map(|g| g.vram_free_mb)
+        .sum();
+    eprintln!(
+        "  the pre-fix arithmetic — Σ over every backend's enumeration — would have said {} MiB",
+        every_gpu.saturating_sub(1_024)
+    );
+    if rig.gpus.len() > 1 {
+        assert!(
+            budget.total_usable_mb() < every_gpu - 1_024,
+            "a budget that sums across backends is inventing hardware"
+        );
+    }
 
     // --- solve -------------------------------------------------------------------------
     let input = FitInput {

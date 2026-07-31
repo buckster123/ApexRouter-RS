@@ -1,0 +1,306 @@
+// OWNER: unit U-02. Screen 6 — Providers.
+//
+// The key field is write-only. The list shows the credential's **source** — env var,
+// file, managed store — and whether one is present, never the value (§9.2). A key typed
+// here goes to `credentials.toml` at 0600 and never to `config.toml`; that is the
+// daemon's job, and this screen's job is to never learn the difference.
+
+import { Palette } from "../palette.slint";
+import { State } from "../state.slint";
+import { Card, Banner, KV, Hairline } from "../components/card.slint";
+import { Dot, Badge, Chip } from "../components/badge.slint";
+import { HeadCell, Cell, HeadRow, Row, ListScroll, PaneScroll, Empty } from "../components/table.slint";
+import { Btn, Field, Toggle, Chooser, Labeled } from "../components/widgets.slint";
+
+export component ProvidersScreen inherits HorizontalLayout {
+    spacing: Palette.gap;
+
+    Card {
+        title: "providers";
+        horizontal-stretch: 2;
+        min-width: 340px;
+
+        HeadRow {
+            HeadCell {
+                text: "id";
+                width: 110px;
+            }
+            HeadCell { text: "credential source"; }
+            HeadCell {
+                text: "models";
+                width: 62px;
+                numeric: true;
+            }
+            HeadCell {
+                text: "last ok";
+                width: 78px;
+            }
+        }
+        ListScroll {
+            rows: State.providers.length;
+            VerticalLayout {
+                spacing: 0px;
+                alignment: start;
+                width: parent.width;
+                for p[i] in State.providers: Row {
+                    striped: Math.mod(i, 2) == 1;
+                    selected: p.id == State.provider-sel;
+                    clicked => {
+                        State.provider-select(p.id);
+                    }
+                    Cell {
+                        text: p.id;
+                        width: 110px;
+                        mono: true;
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        Cell {
+                            text: p.source;
+                            mono: true;
+                        }
+                        Badge {
+                            label: p.present ? "key present" : "no key";
+                            level: p.present ? 1 : 2;
+                            icon: p.present ? "🔑" : "○";
+                        }
+                    }
+                    Cell {
+                        text: p.models + "";
+                        width: 62px;
+                        numeric: true;
+                        mono: true;
+                    }
+                    Cell {
+                        text: p.last-ok;
+                        width: 78px;
+                        level: p.level;
+                        mono: true;
+                    }
+                }
+                if State.providers.length == 0: Empty {
+                    message: "no managed providers configured";
+                }
+            }
+        }
+    }
+
+    VerticalLayout {
+        horizontal-stretch: 3;
+        spacing: Palette.gap;
+
+        Card {
+            title: State.provider-sel == "" ? "provider" : State.provider-sel;
+            vertical-stretch: 0;
+
+            if State.provider-sel == "": Empty {
+                message: "pick a provider to set its key, test it, or activate a model";
+            }
+
+            if State.provider-sel != "": VerticalLayout {
+                spacing: Palette.gap;
+                KV {
+                    key: "credential source";
+                    value: State.pv-source;
+                    mono: true;
+                }
+                Labeled {
+                    label: "base url";
+                    Field {
+                        value <=> State.pv-base-url;
+                        mono: true;
+                        placeholder: "https://api.together.xyz/v1";
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Labeled {
+                        label: "api key";
+                        hint: "written to credentials.toml at 0600 — never read back";
+                        Field {
+                            value <=> State.pv-key;
+                            password: true;
+                            mono: true;
+                            placeholder: "•••• (leave blank to keep the current key)";
+                        }
+                    }
+                    Labeled {
+                        label: "or env var";
+                        Field {
+                            value <=> State.pv-key-env;
+                            mono: true;
+                            placeholder: "TOGETHER_API_KEY";
+                        }
+                    }
+                    Labeled {
+                        label: "or file";
+                        Field {
+                            value <=> State.pv-key-file;
+                            mono: true;
+                            placeholder: "~/.config/apexrouter/together.key";
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Palette.gap;
+                    Btn {
+                        label: "save";
+                        kind: 1;
+                        icon: "✓";
+                        clicked => {
+                            State.provider-save();
+                        }
+                    }
+                    Btn {
+                        label: "test";
+                        icon: "◎";
+                        clicked => {
+                            State.provider-test();
+                        }
+                    }
+                    Btn {
+                        label: "load catalogue";
+                        clicked => {
+                            State.load-provider-models();
+                        }
+                    }
+                    Rectangle { }
+                }
+                if State.provider-checks.length > 0: VerticalLayout {
+                    spacing: 2px;
+                    for c in State.provider-checks: HorizontalLayout {
+                        spacing: 6px;
+                        Badge {
+                            label: c.status;
+                            level: c.level;
+                        }
+                        Text {
+                            text: c.label;
+                            color: Palette.ink-2;
+                            font-size: Palette.font-sm;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: c.detail;
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                        Rectangle { }
+                        Text {
+                            text: c.ms;
+                            color: Palette.muted;
+                            font-size: Palette.font-sm;
+                            font-family: Palette.mono;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+
+        Card {
+            title: "live catalogue";
+            subtitle: State.provider-models.length + " models, grouped by org";
+            vertical-stretch: 1;
+            HorizontalLayout {
+                spacing: Palette.gap;
+                vertical-stretch: 0;
+                Field {
+                    value <=> State.pv-model-filter;
+                    mono: true;
+                    placeholder: "filter";
+                    edited(v) => {
+                        State.provider-filter-changed(v);
+                    }
+                }
+                Rectangle { }
+            }
+            HeadRow {
+                HeadCell {
+                    text: "org";
+                    width: 130px;
+                }
+                HeadCell { text: "model"; }
+                HeadCell {
+                    text: "ctx";
+                    width: 78px;
+                    numeric: true;
+                }
+                HeadCell {
+                    text: "caps";
+                    width: 120px;
+                }
+                HeadCell {
+                    text: "";
+                    width: 190px;
+                }
+            }
+            ListScroll {
+                rows: State.provider-models.length;
+                VerticalLayout {
+                    spacing: 0px;
+                    alignment: start;
+                    width: parent.width;
+                    for m[i] in State.provider-models: Row {
+                        striped: Math.mod(i, 2) == 1;
+                        Cell {
+                            text: m.org;
+                            width: 130px;
+                            mono: true;
+                        }
+                        Cell {
+                            text: m.id;
+                            mono: true;
+                        }
+                        Cell {
+                            text: m.ctx;
+                            width: 78px;
+                            numeric: true;
+                            mono: true;
+                        }
+                        HorizontalLayout {
+                            width: 120px;
+                            spacing: 4px;
+                            if m.vision: Badge {
+                                label: "vision";
+                                level: 5;
+                                icon: "👁";
+                            }
+                            if m.tools: Badge {
+                                label: "tools";
+                                level: 5;
+                                icon: "⚒";
+                            }
+                            Rectangle { }
+                        }
+                        HorizontalLayout {
+                            width: 190px;
+                            spacing: 4px;
+                            Btn {
+                                label: "activate";
+                                kind: 1;
+                                compact: true;
+                                clicked => {
+                                    State.provider-activate(m.id);
+                                }
+                            }
+                            Btn {
+                                label: "save as recipe";
+                                compact: true;
+                                clicked => {
+                                    State.provider-recipe(m.id);
+                                }
+                            }
+                        }
+                    }
+                    if State.provider-models.length == 0: Empty {
+                        message: "press “load catalogue” — the list is live, not cached from config";
+                    }
+                }
+            }
+        }
+    }
+}

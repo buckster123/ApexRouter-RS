@@ -38,8 +38,15 @@ pub async fn run(ctx: &Ctx, args: &FitArgs) -> anyhow::Result<()> {
         Serving::Offline(store) => store.list_endpoints().unwrap_or_default(),
         _ => Vec::new(),
     };
-    let budget =
-        solver::budget_from_rig(&rig, &devices, ctx.cfg.endpoints.vram_margin_mb, &running);
+    // Scope: the build `endpoint start` would pick. `--devices` narrows within that
+    // backend; it cannot widen across backends, because one process uses one backend.
+    let budget = solver::budget_from_rig(
+        &rig,
+        solver::BackendScope::Auto,
+        &devices,
+        ctx.cfg.endpoints.vram_margin_mb,
+        &running,
+    );
 
     let gguf = model.gguf.clone().ok_or_else(|| {
         anyhow::anyhow!(

@@ -690,6 +690,11 @@ impl LocalProvisioner {
     /// Solve the fit against a **live** budget: this rig's free VRAM, minus what every
     /// running endpoint already reserved.
     ///
+    /// The budget is scoped to `spec.build`, because that is the binary about to be exec'd
+    /// and one `llama-server` process uses one compute backend. Scoping it any other way is
+    /// how the same physical GPU, enumerated as `ROCm0` by one build and `Vulkan0` by
+    /// another, got its VRAM counted twice.
+    ///
     /// Returns `None` — with a warning — when the weights cannot be read as GGUF. A model we
     /// cannot measure is not a model we refuse to start; it is one we start without a VRAM
     /// promise, and say so.
@@ -715,10 +720,12 @@ impl LocalProvisioner {
         let running = self.store.list_endpoints()?;
         let budget = fit_solver::budget_from_rig(
             rig,
+            fit_solver::BackendScope::Build(&spec.build),
             &spec.split.devices,
             cfg.endpoints.vram_margin_mb,
             &running,
         );
+        warnings.extend(budget.notes.iter().cloned());
         Ok(Some(fit_solver::fit(&FitInput {
             weights_bytes,
             gguf,

@@ -1,0 +1,196 @@
+// OWNER: unit U-02. Bars: VRAM, the fit budget, the usage row.
+//
+// Every bar track declares its own `min-width`/`preferred-width`/`horizontal-stretch`
+// explicitly. Without that, a fill rectangle bound to `parent.width` makes the track's
+// layout info depend on its own children and Slint reports a binding loop.
+
+import { Palette } from "../palette.slint";
+
+// A single-value bar with an optional caption above it.
+export component Meter inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <float> frac: 0.0;
+    in property <int> level: 5;
+    in property <length> bar-height: 6px;
+    spacing: 3px;
+
+    if root.label != "" || root.value != "": HorizontalLayout {
+        spacing: Palette.gap;
+        Text {
+            text: root.label;
+            color: Palette.ink-2;
+            font-size: Palette.font-sm;
+            overflow: elide;
+        }
+        Rectangle { }
+        Text {
+            text: root.value;
+            color: Palette.muted;
+            font-size: Palette.font-sm;
+            font-family: Palette.mono;
+        }
+    }
+
+    Rectangle {
+        height: root.bar-height;
+        min-width: 0px;
+        preferred-width: 0px;
+        horizontal-stretch: 1;
+        background: Palette.surface-hi;
+        border-radius: root.bar-height / 2;
+        clip: true;
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width * clamp(root.frac, 0.0, 1.0);
+            height: parent.height;
+            background: Palette.level-color(root.level);
+        }
+    }
+}
+
+// The Launch drawer's stacked budget bar: weights · KV · compute · headroom.
+// Every segment is a fraction of the same budget, so a bar that stops short of the right
+// edge is honest about the slack; an over-subscribed plan clamps here and says WON'T FIT
+// in the verdict beside it.
+export component StackedMeter inherits VerticalLayout {
+    in property <float> weights: 0.0;
+    in property <float> kv: 0.0;
+    in property <float> compute: 0.0;
+    in property <string> caption;
+    spacing: 4px;
+
+    Rectangle {
+        height: 12px;
+        min-width: 0px;
+        preferred-width: 0px;
+        horizontal-stretch: 1;
+        background: Palette.surface-hi;
+        border-radius: Palette.radius-sm;
+        border-width: Palette.hair;
+        border-color: Palette.hairline;
+        clip: true;
+        Rectangle {
+            x: 0;
+            y: 0;
+            width: parent.width * clamp(root.weights, 0.0, 1.0);
+            height: parent.height;
+            background: Palette.accent;
+        }
+        Rectangle {
+            x: parent.width * clamp(root.weights, 0.0, 1.0);
+            y: 0;
+            width: parent.width * clamp(root.kv, 0.0, 1.0);
+            height: parent.height;
+            background: Palette.good;
+        }
+        Rectangle {
+            x: parent.width * clamp(root.weights + root.kv, 0.0, 1.0);
+            y: 0;
+            width: parent.width * clamp(root.compute, 0.0, 1.0);
+            height: parent.height;
+            background: Palette.warn;
+        }
+    }
+
+    HorizontalLayout {
+        spacing: Palette.gap;
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            background: Palette.accent;
+            border-radius: 2px;
+        }
+        Text {
+            text: "weights";
+            color: Palette.muted;
+            font-size: Palette.font-sm;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            background: Palette.good;
+            border-radius: 2px;
+        }
+        Text {
+            text: "kv";
+            color: Palette.muted;
+            font-size: Palette.font-sm;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            background: Palette.warn;
+            border-radius: 2px;
+        }
+        Text {
+            text: "compute";
+            color: Palette.muted;
+            font-size: Palette.font-sm;
+            vertical-alignment: center;
+        }
+        Rectangle { }
+        Text {
+            text: root.caption;
+            color: Palette.ink-2;
+            font-size: Palette.font-sm;
+            font-family: Palette.mono;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// One row of the hand-rolled usage chart. Slint gets a bar row where the web UI gets a
+// stacked inline-SVG chart — an honest deferral, recorded in docs/SLINT.md.
+export component BarRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> value;
+    in property <float> frac: 0.0;
+    in property <int> level: 5;
+    in property <length> label-width: 150px;
+    spacing: Palette.gap;
+    height: Palette.row-h;
+
+    Text {
+        text: root.label;
+        color: Palette.ink-2;
+        font-size: Palette.font-sm;
+        width: root.label-width;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Rectangle {
+        min-width: 40px;
+        preferred-width: 40px;
+        horizontal-stretch: 1;
+        background: Palette.clear;
+        Rectangle {
+            y: (parent.height - 10px) / 2;
+            x: 0;
+            width: parent.width;
+            height: 10px;
+            background: Palette.surface-hi;
+            border-radius: 3px;
+            clip: true;
+            Rectangle {
+                x: 0;
+                y: 0;
+                width: parent.width * clamp(root.frac, 0.0, 1.0);
+                height: parent.height;
+                background: Palette.level-color(root.level);
+            }
+        }
+    }
+    Text {
+        text: root.value;
+        color: Palette.ink;
+        font-size: Palette.font-sm;
+        font-family: Palette.mono;
+        width: 110px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+}
