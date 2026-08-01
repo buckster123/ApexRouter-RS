@@ -191,3 +191,52 @@ on 48 GB consumer metal** — the gap is exactly MTP-sized (×1.4-2.2 ⇒ 46-73 
 - **`apexrouter vast log <id>` failed with `could not parse …/log: expected value at
   line 1 column 1`** while the instance was mid-pull — the endpoint got a non-JSON body
   and surfaced a parse error instead of the body or a clean refusal. Small, real, filed.
+
+---
+
+## R2a — 1× RTX 5090, the 256k question — 2026-08-01
+
+**Box:** instance `46457080`, offer `46391330`, Belgium (datacenter: EPYC 9354, Genoa
+board, static IP, 128 threads, drv 570.211). $0.4944/hr incl. disk. Preceded by a
+$0.01 abort: a "verified" Korea 5090 on an i5-12400F/H610M that never started —
+host-class (cpu/mobo) must be visible pre-rent, `reliability2` sees none of it.
+
+**The ladder (Qwen3.6-27B, llama.cpp master + b8991 `pull/22673/head`):**
+
+| Config | VRAM | tok/s (proxy-measured) |
+|---|---|---|
+| Q6_K · 1×256k · q8_0 KV · plain | 30,796 / 32,607 MiB | **59.5** |
+| Q6_K-MTP · 1×256k · q8_0 KV | **OOM** (MTP ctx buffers) | — |
+| Q6_K-MTP · 1×256k · **q4_0 KV** | 28,484 MiB (4.1 GB free) | **103-105 prose · 106.7 tools** (acc 80.5/82%) |
+| Q4_K_M · 2×256k · q8_0 KV | **OOM** (KV alone asked 17.4 GB) | — |
+| Q4_K_M · **2×256k** · q4_0 KV | 26,328 MiB (6.3 GB free) | **~58/slot** (agg 115) |
+
+**KV scaling law, measured:** ~29-30 KiB/token at q8_0, ~34 incl. overhead at 512k —
+the hybrid SSM/attention stack (the `ssm_conv1d` tensors) makes 256k a consumer-card
+context. Halving to q4_0 KV is the fitting lever; its recall cost is unmeasured (queued).
+
+**R2a verdicts:** a single 5090 carries the ApexOS requirement grid: **one Q6 slot at
+256k doing 107 tok/s on tool-calls (MTP), or two Q4 slots at 256k doing 58 each — with
+embedder (and klein-Q4) headroom in both postures.** The 3090-pair remains the budget
+path; the 5090 is the single-card answer.
+
+**The money finding (the expensive lesson): metered bandwidth.** Credit $7.23 → $3.41.
+Box-hours were ~$0.60; the remaining ~$3.2 is ~84 GB of model downloads on a host that
+meters inbound at a datacenter-typical ~$35-40/TB. `Offer.inet_down_cost` was **in the
+row we held at rent time** and no surface rendered it: not the offers table, not the
+rent quote, not `vast ls`. The rent quote must add `est. download = payload × 
+inet_down_cost` and the offers table needs a `$/TB` column — this is precisely the
+silent-cost class the product exists to kill. (Also: the fat-glob double download
+became a *money* bug here, not just a time bug.)
+
+**pkill trilogy, completed:** (1) `pkill -f llama-server` over ssh kills the ssh shell
+(documented in `stall.rs`); (2) bracketing the pattern is not enough when *the same
+compound command* contains the literal string later (the launch path) — pkill matches
+the whole remote command line; (3) `sed -i` can never patch the running script (bash
+holds the old inode) — the boot-run *always* exec's unpatched args; patch, then
+relaunch. The image refresh obsoletes all three by fixing the script at build time.
+
+**Curiosity for the llama.cpp watchers:** upstream tag `b8991` currently resolves to
+master's tip (`beb42ff`) — build-number tags appear re-pointed or frozen; `pull/22673/
+head` (`2dff7ff`) is the only stable name for the MTP tree. Recorded so nobody trusts
+b-tags for pinning again.
