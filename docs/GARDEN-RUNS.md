@@ -240,3 +240,47 @@ relaunch. The image refresh obsoletes all three by fixing the script at build ti
 master's tip (`beb42ff`) — build-number tags appear re-pointed or frozen; `pull/22673/
 head` (`2dff7ff`) is the only stable name for the MTP tree. Recorded so nobody trusts
 b-tags for pinning again.
+
+---
+
+## Locked recipes & the forward file (checkpoint 2026-08-01, post-R2a)
+
+**The mission this ledger serves:** find the optimal fully-offline model for ApexOS.
+**Current champion: Qwen3.6-27B, unsloth quants** — native vision, hybrid SSM stack
+(256k on consumer VRAM), MTP heads (×1.7-1.8 on agentic traffic). The local field moves
+fast; challengers on file: Qwen3.5-122B-A10B (Tier C), Qwen3.6-35B-A3B (throughput),
+and **PrismML Bonsai-27B ternary** (`github.com/PrismML-Eng/Bonsai-demo`, built *from*
+Qwen3.6-27B; 1.58-bit reportedly holds up, 1-bit ~60-vs-70% on benches but tool-calls
+fine; **custom runtime, not llama.cpp-mainline — queued as its own cell, a 1× 3090 fits
+it and would be the fun test**).
+
+**Locked host doctrine (what survived five failures):**
+1. `verified: true`, **EU/Asia geo**, rel ≥ 0.995 — and read `cpu_name`/`mobo_name`
+   before renting: an i5 on an H610M "verified" board is still a lemon.
+2. **Driver band `12.8 ≤ cuda_max_good < 13.0`** (570.x) — below vast's CDI-broken
+   580/CUDA-13.0 cohort, above the GeForce forward-compat wall.
+3. **Check `inet_down_cost` — unmetered or bust** for model-pulling runs; datacenter
+   $38/TB turned $0.60 of box-hours into a $3.80 leg. Home boxes are usually free.
+4. DOWN ≥ 800 Mbps, exact-filename downloads only, one quant per run.
+
+**Locked machines:** ★ `machine_id 10212` (host 51345) — Threadripper PRO / WRX80 /
+2×3090 / PCIe4 ×16 / 128 GB RAM, Poland, ~$0.34/hr, unmetered, flawless through R1/R1b.
+☠ offer `45761361` (Quebec $0.137 2×3090) — containerd disk death, relists anyway.
+
+**Locked llama.cpp refs:** plain models → master (any recent); **MTP → `pull/22673/head`
+only** (`2dff7ff`; b-number tags currently lie — b8991 resolves to master's tip). Builder
+webui workaround: stub `index.html,bundle.js,loading.html,bundle.css` in
+`build/tools/ui/dist` before `cmake --build`.
+
+**Gotchas index for future-me:** the boot-run always executes the *unpatched* launch.sh
+(bash holds the old inode — patch then RELAUNCH, never trust `sed -i` mid-run); never
+put the literal string `llama-server` anywhere in an ssh command that also runs `pkill
+-f llama-serve[r]`; `vast log` is broken exactly when you need it (raw API
+`instances/` → `status_msg` is the truth channel); our `ls`/`watch` phases lag the
+dashboard; `--mmap` does nothing for VRAM at `-ngl 999`; q4_0 KV is the fitting lever
+at 256k+ (recall cost unmeasured — measure before shipping it as default).
+
+**Next cells on the board:** R2b — ★10212, Andre's posture (`-sm none`, LLM whole on
+GPU0, GPU1 free for klein/Wan/embedder budget); 6000 Ada dream preview (bandwidth-check
+the host first); Bonsai-27B on 1×3090; the 122B-A10B when a 96 GB rig or the ternary
+treatment lands. Credit at checkpoint: **$3.41** (top-up promised before next round).
