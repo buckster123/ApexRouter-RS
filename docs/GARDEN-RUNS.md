@@ -351,3 +351,59 @@ Creative co-residency (klein/Wan on GPU1's remaining budget) awaits the ComfyUI 
 — GPU1 as configured retains ~2.5 GB; the *studio* posture swaps the worker for klein+Wan.
 Swarm note for the mandala system (wip): A3B at 172-214/slot on 5090-class silicon is
 fan-out fuel — well-defined delegated tasks at ~thruput/cost no big model matches.
+
+---
+
+## R4 — the 122B on modded silicon, and the China playbook — 2026-08-01
+
+**Box:** instance `46509449`, **★ machine `140330` / host `113492`** — Supermicro
+X11DPG-OT dual-socket, Xeon Gold 6133 (80 threads to slot), 515 GB host RAM, 1.9 GB/s
+NVMe, **2× RTX 4090 modded to 49,140 MiB each**, watercooled (27-29 °C), Guangdong.
+$0.8361/hr incl. disk. Driver 580.159 — the CDI-corpse driver — **created its container
+fine**: the 580-cohort curse is host-config, not driver law; the band rule stays as a
+default, not a ban.
+
+**The numbers (llama.cpp b8991, `draft-mtp` n-max 2, UD-Q4_K_M 78.3 GB, 64k ctx q8 KV,
+VRAM 39.2 + 39.6 GB, ~9 GB headroom per card):**
+
+| Cell | Result |
+|---|---|
+| prose 1× | **99-102 tok/s** (acc 80%) |
+| tools 1× | **100-107 tok/s** (acc 87%) |
+| route test through proxy+tunnel | 80 tok/s |
+
+**A 122B MoE at triple the dense-27B's speed, on ~€2k of modded consumer cards.** The
+garden's brain-tier is rentable at 84¢/hr today and ownable by mortals tomorrow.
+
+**Field test (operator-driven):** a stock hermes-agent pointed at 8888 worked zero-config
+(the promise held). Unconstrained creative-coding at 64k produced `~/Projects/
+NeuralSymphony` — CerebroCortex memories → music (types=instruments, salience=dynamics,
+links=harmony, Suno render): idea-quality exceptional *because grounded in the discovered
+environment*; execution buggy and context-starved (hermes hit compaction spirals on pass
+two). **Doctrine: 122B agentic coding wants 128k minimum, 256k preferred** — this box has
+the headroom; rematch queued.
+
+**The China playbook (paid for in hours):** huggingface.co is hard-blocked (Errno 101) —
+`HF_ENDPOINT=https://hf-mirror.com` works but throttles per-connection (18 MB/s → 5-8,
+and `hf_transfer` made it *worse*, 40 Mbit wedge); **aria2c -x8 straight off the mirror
+= 4-6×**, resuming hf's `.incomplete` files after mapping them to shards **by etag ↔
+filename-hash, proven via HEAD** (never guess the mapping). github.com is throttled-not-
+blocked (retry loops win). **ModelScope answers in 1.6 s from inside — first choice next
+CN run.** Vast's ssh-proxy reverse-listener never bound for this box (endless port-29448
+failures): **direct host:port SSH is the CN doctrine**, and the daemon's `tunnel up` +
+the UI Tunnel button both fail on the proxy path — the tunnel verb needs a direct-port
+fallback (instance row carries ip + mapped port).
+
+**More tooling findings:** `snapshot.instances` is `[]` while `/v1/vast/instances`
+reports the fleet — the Fleet & cost page renders the snapshot, so rented boxes flash
+(the panel's own fetch) then blank (next snapshot stomps it). Same root as the rent-job
+gap: rentals never feed daemon state. — The rent pre-check tests membership in the
+profile's **top-N-by-price**, so a constraint-satisfying offer loses to cheaper stock
+boxes (the modded 96 GB rig was unrentable until a CN-scoped profile put it in-list);
+and these hosts **re-mint ask ids per search snapshot**, so rent-by-id races: `--auto`
+with a discriminating profile is the doctrine, and favorites must key `machine_id`. —
+Sixth pkill act: the kill pattern and the relaunch text must not share a command line.
+
+**Economics:** park-don't-destroy measured across our five hosts at **$0.12-0.19/GB/mo**
+→ $3-6/week holds 100-150 GB of models + builds. `vast park`/`wake` verb pair filed
+(stop reserves disk, not GPUs — restart contends). This box parks tonight per operator.
