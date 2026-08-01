@@ -312,3 +312,42 @@ Topology: GPU0, CPU affinity 0-23, no NUMA. Whole run **$0.11**; credit $18.37 �
    but the 8B does 1 text/s on CPU — background-trickle only. Tier-A gardens carry
    **embeddinggemma-300M** on CPU; the 8B earns GPU residency only where spare VRAM
    exists (5090-class postures).
+
+---
+
+## R2c — 2× RTX 5090, the top-x090 colony rig — 2026-08-01
+
+**Box:** instance `46506506`, offer `25673350`, Taiwan (Xeon Platinum 8352V, 72 threads
+to our slot, both GPUs same NUMA node, no NVLink — irrelevant to this posture). $0.8756/hr
++ **metered inbound $9.1/TB, priced *before* renting** (~$0.65 for 74 GB incl. the boot
+run's fat glob) — the Belgium lesson operating as doctrine. Whole run ≈ **$1.00**;
+credit $18.26 → $17.26.
+
+**The posture (Andre's design): each service owns silicon — no splitting.**
+
+| GPU | Resident | VRAM |
+|---|---|---|
+| 0 | thinker — 27B Q6-MTP · 256k · q4 KV | 28.5 / 32.6 GB |
+| 1 | worker — 35B-A3B UD-Q4 · 64k **+** embedder — 8B Q6 | 30.1 / 32.6 GB |
+
+**Under simultaneous load (all three lanes fired at once):**
+
+| Lane | Result |
+|---|---|
+| Thinker via proxy | **97.8-103.8 tok/s** (82% acceptance; ~3% below its solo 107) |
+| Worker (on-box) | **172-214 tok/s** (172 during the embed burst, 214 clean) |
+| Embedder | **69.4 texts/s** on GPU — vs 1.0 texts/s on CPU: the 8B embedder is a GPU resident, full stop |
+
+**R2c verdict — the consumer ladder is complete:**
+
+| Rig (street) | What it runs |
+|---|---|
+| 1× 3090 (~€600 used) | accurate lane 55-59 @128k *or* flex lane ~148; 300M CPU embedder |
+| 2× 3090 (~€1.2k) | one fast MTP slot / two decent, split posture pending (★10212's 2× slot) |
+| 1× 5090 | the whole grid: 107 @256k or 2×256k @58 + embedder room |
+| **2× 5090** | **the colony: 100+ thinker @256k, 200+ worker, 70/s embeddings — simultaneously** |
+
+Creative co-residency (klein/Wan on GPU1's remaining budget) awaits the ComfyUI arc (R3)
+— GPU1 as configured retains ~2.5 GB; the *studio* posture swaps the worker for klein+Wan.
+Swarm note for the mandala system (wip): A3B at 172-214/slot on 5090-class silicon is
+fan-out fuel — well-defined delegated tasks at ~thruput/cost no big model matches.
