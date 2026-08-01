@@ -284,3 +284,31 @@ at 256k+ (recall cost unmeasured — measure before shipping it as default).
 GPU0, GPU1 free for klein/Wan/embedder budget); 6000 Ada dream preview (bandwidth-check
 the host first); Bonsai-27B on 1×3090; the 122B-A10B when a 96 GB rig or the ternary
 treatment lands. Credit at checkpoint: **$3.41** (top-up promised before next round).
+
+---
+
+## R2b — 1× RTX 3090 on ★10212, the used-market card alone — 2026-08-01
+
+**Box:** instance `46503103`, the star's 1× slot (its 2× slot was rented out), $0.1916/hr
+incl. disk, inbound ~$0.13/TB (effectively unmetered — home-box pricing confirmed).
+Topology: GPU0, CPU affinity 0-23, no NUMA. Whole run **$0.11**; credit $18.37 → $18.26
+(topped up by operator between runs).
+
+| Cell | Config | VRAM | Result |
+|---|---|---|---|
+| B1 edge | MTP-Q5_K_M · 128k · q8 KV | **OOM** | as predicted (19.8+3.8+bufs > 24) |
+| **B1** | MTP-Q5_K_M · 128k · **q4 KV** | 22.3 GB | **54.9 prose / 58.8 tools tok/s** (acc 70.5/79.6%) |
+| B3′ | + Qwen3-Embedding-8B Q6 on **CPU** (12 threads), port 8001 | +0 GPU | **1.0 texts/s** (dim 4096) — and the LLM held 59.1 during it: co-hab is clean, the 8B is just too heavy for CPU |
+| **B4** | 35B-A3B UD-Q4_K_M · 32k · q4 KV · plain | 21.6 GB | **146-149 tok/s**, and **~148/slot at 2× too** (MoE batching ≈ free); pp 900+ |
+
+**R2b verdicts:**
+
+1. **One used 3090 clears the ≥50 target**: Q5+MTP at 55-59 with 128k ctx (q4 KV — the
+   operator-blessed pinch setting). The entry rig is real.
+2. **The flex-model doctrine, measured**: 27B-Q5+MTP for the accuracy/coding lane;
+   **35B-A3B for everything lighter at ~148 tok/s regardless of slot count** — on the
+   same card, swap-not-cohab (both want ~22 GB).
+3. **Embedder placement rule**: CPU co-hab is architecturally clean (zero LLM impact)
+   but the 8B does 1 text/s on CPU — background-trickle only. Tier-A gardens carry
+   **embeddinggemma-300M** on CPU; the 8B earns GPU residency only where spare VRAM
+   exists (5090-class postures).
