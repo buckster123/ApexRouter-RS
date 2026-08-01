@@ -17,7 +17,9 @@
 
 use crate::error::{Error, Result};
 use crate::paths::Paths;
-use apexrouter_protocol::{Alias, Backend, BackendId, EndpointRecord, RouteFile, TunnelStatus};
+use apexrouter_protocol::{
+    Alias, Backend, BackendId, EndpointRecord, FavoriteHost, RouteFile, TunnelStatus,
+};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs::{self, File, OpenOptions, Permissions};
@@ -303,6 +305,18 @@ impl Store {
     /// `$STATE/tunnels.json`, atomically.
     pub fn save_tunnels(&self, t: &[TunnelStatus]) -> Result<()> {
         self.write_json(&self.paths.tunnels_file(), &t)
+    }
+
+    /// `$STATE/favorites.json`. Absent file = no verdicts, not an error.
+    pub fn load_favorites(&self) -> Result<Vec<FavoriteHost>> {
+        Ok(self
+            .read_json::<Vec<FavoriteHost>>(&self.paths.favorites_file())?
+            .unwrap_or_default())
+    }
+
+    /// `$STATE/favorites.json`, atomically.
+    pub fn save_favorites(&self, f: &[FavoriteHost]) -> Result<()> {
+        self.write_json(&self.paths.favorites_file(), &f)
     }
 
     /// The path set this store is bound to.

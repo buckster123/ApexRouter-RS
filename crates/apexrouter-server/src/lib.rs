@@ -41,6 +41,7 @@ pub mod api;
 pub mod assets;
 #[allow(unused)]
 pub mod auth;
+pub mod fleet;
 #[allow(unused)]
 pub mod jobs;
 #[allow(unused)]
@@ -303,6 +304,7 @@ pub async fn run(state: Arc<AppState>, shutdown: ShutdownHandle) -> anyhow::Resu
     // ---- 9. the pollers ----------------------------------------------------------------
     tokio::spawn(prober::health_prober(Arc::clone(&state)));
     tokio::spawn(watcher::config_watcher(Arc::clone(&state)));
+    tokio::spawn(fleet::vast_fleet_poller(Arc::clone(&state)));
     spawn_sighup_reloader(Arc::clone(&state), shutdown.clone());
 
     let proxy_app = proxy_app(&state);

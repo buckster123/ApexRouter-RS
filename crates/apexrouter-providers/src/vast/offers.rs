@@ -320,8 +320,23 @@ pub fn cheapest(result: &OfferSearchResult) -> Option<&Offer> {
 /// `verified` is not re-checked: `00c` records that the API accepts the filter but does not
 /// echo the field back on the offer, so there is nothing local to test.
 pub fn offer_matches(q: &OfferQuery, o: &Offer) -> bool {
-    if o.rented == Some(true) || o.rentable == Some(false) {
-        return false;
+    constraint_failures(q, o).is_empty()
+}
+
+/// Every constraint this offer fails, each in the operator's units.
+///
+/// The same predicate as [`offer_matches`] — literally: that function is this one's
+/// emptiness check — but able to *name* what failed. The R4 refusal ("offer N is not in
+/// what the profile matches right now") was true and useless: the offer satisfied every
+/// constraint and had merely fallen out of the top-N-by-price window. When an explicit
+/// offer is re-checked, this list is the difference between a real refusal and that bug.
+pub fn constraint_failures(q: &OfferQuery, o: &Offer) -> Vec<String> {
+    let mut fails = Vec::new();
+    if o.rented == Some(true) {
+        fails.push("already rented".to_owned());
+    }
+    if o.rentable == Some(false) {
+        fails.push("not rentable".to_owned());
     }
     if !q.gpu_names.is_empty()
         && !q
@@ -329,36 +344,64 @@ pub fn offer_matches(q: &OfferQuery, o: &Offer) -> bool {
             .iter()
             .any(|n| n.trim().eq_ignore_ascii_case(o.gpu_name.trim()))
     {
-        return false;
+        fails.push(format!(
+            "gpu `{}` is not one of {:?}",
+            o.gpu_name, q.gpu_names
+        ));
     }
     if o.num_gpus < q.num_gpus_min || o.num_gpus > q.num_gpus_max {
-        return false;
+        fails.push(format!(
+            "{} GPUs is outside {}..={}",
+            o.num_gpus, q.num_gpus_min, q.num_gpus_max
+        ));
     }
     if let Some(max) = q.max_dph {
         // Money: a non-finite price is never "under the cap".
         if !o.dph_total.is_finite() || o.dph_total > max {
-            return false;
+            fails.push(format!(
+                "${:.4}/hr is above the ${max:.4}/hr cap",
+                o.dph_total
+            ));
         }
     }
     if !at_least(o.reliability2, q.min_reliability) {
-        return false;
+        fails.push(format!(
+            "reliability {} is below {}",
+            o.reliability2.unwrap_or_default(),
+            q.min_reliability.unwrap_or_default()
+        ));
     }
     if !at_least(o.inet_down, q.min_inet_down) {
-        return false;
+        fails.push(format!(
+            "inet_down {:.0} Mbps is below {:.0}",
+            o.inet_down.unwrap_or_default(),
+            q.min_inet_down.unwrap_or_default()
+        ));
     }
     if !at_least(o.disk_space, q.min_disk_gb.map(f64::from)) {
-        return false;
+        fails.push(format!(
+            "disk {:.0} GB is below {}",
+            o.disk_space.unwrap_or_default(),
+            q.min_disk_gb.unwrap_or_default()
+        ));
     }
     if !at_least(o.cuda_max_good, q.min_cuda) {
-        return false;
+        fails.push(format!(
+            "cuda_max_good {} is below {}",
+            o.cuda_max_good.unwrap_or_default(),
+            q.min_cuda.unwrap_or_default()
+        ));
     }
     if !matches!(q.geo, GeoFilter::Any) {
         match o.geolocation.as_deref() {
             Some(g) if q.geo.matches(g) => {}
-            _ => return false,
+            other => fails.push(format!(
+                "location {} does not satisfy the geo filter",
+                other.map_or_else(|| "(unknown)".to_owned(), |g| format!("`{g}`"))
+            )),
         }
     }
-    true
+    fails
 }
 
 /// The widened query and the sentence that describes it, or `None` when there is nothing
@@ -559,6 +602,9 @@ mod tests {
         }
         async fn instance(&self, _id: InstanceId) -> Result<Option<VastInstance>> {
             Ok(None)
+        }
+        async fn set_target_state(&self, _id: InstanceId, _running: bool) -> Result<()> {
+            panic!("P-03 tests never park or wake an instance");
         }
         async fn destroy(&self, _id: InstanceId) -> Result<()> {
             panic!("P-03 tests never destroy an instance");

@@ -970,6 +970,40 @@ pub enum VastCmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Remember a physical host as proven good (or, with `--burn`, as a lemon).
+    Star {
+        /// The `machine_id` (stable across ask re-mints — offer ids are not).
+        machine_id: u64,
+        /// Record a burn instead of a star: never auto-picked again.
+        #[arg(long)]
+        burn: bool,
+        /// Why, in your words ("flawless through R1", "containerd disk death").
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// Forget a host verdict.
+    Unstar {
+        /// The `machine_id`.
+        machine_id: u64,
+    },
+    /// Every remembered host verdict.
+    Favorites(JsonFlag),
+    /// Stop a box but keep its disk: GPUs released, models and builds held for a fast wake.
+    Park {
+        /// Instance id.
+        id: u64,
+        /// Required. Parking still bills storage; the confirm shows the weekly figure.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Restart a parked box. **Resumes the hourly bill.**
+    Wake {
+        /// Instance id.
+        id: u64,
+        /// Required. There is no interactive prompt.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// `apexrouter vast offers …`.
@@ -990,6 +1024,9 @@ pub struct VastOffersArgs {
     /// Ceiling on `dph_total`.
     #[arg(long, value_name = "USD")]
     pub max_price: Option<f64>,
+    /// Only offers on this physical machine (`machine_id`).
+    #[arg(long, value_name = "MACHINE")]
+    pub machine: Option<u64>,
     /// Row cap.
     #[arg(long, default_value_t = 20)]
     pub limit: u32,
@@ -1006,6 +1043,10 @@ pub struct VastRentArgs {
     /// Take the cheapest offer the profile matches.
     #[arg(long, conflicts_with = "offer_id")]
     pub auto: bool,
+    /// Pin one physical machine (`machine_id` — what ★ favorites store). Ask ids re-mint;
+    /// machine ids do not. Combines with `--auto` to take that machine's cheapest ask.
+    #[arg(long, value_name = "MACHINE")]
+    pub machine: Option<u64>,
     /// Which search profile describes the hardware.
     #[arg(long, value_name = "P")]
     pub profile: String,
@@ -1655,14 +1696,18 @@ impl Command {
                 ProviderCmd::Set(a) => a.json,
             },
             Command::Vast { cmd } => match cmd {
-                VastCmd::Account(a) | VastCmd::GpuNames(a) => a.json,
+                VastCmd::Account(a) | VastCmd::GpuNames(a) | VastCmd::Favorites(a) => a.json,
                 VastCmd::Offers(a) => a.json,
                 VastCmd::Rent(a) => a.json,
                 VastCmd::Ls { json, .. } | VastCmd::Diagnose { json, .. } => *json,
                 VastCmd::Watch { .. }
                 | VastCmd::Log { .. }
                 | VastCmd::RestartDownload { .. }
-                | VastCmd::Destroy { .. } => false,
+                | VastCmd::Destroy { .. }
+                | VastCmd::Star { .. }
+                | VastCmd::Unstar { .. }
+                | VastCmd::Park { .. }
+                | VastCmd::Wake { .. } => false,
             },
             Command::Tunnel { cmd } => match cmd {
                 TunnelCmd::Status(a) => a.json,

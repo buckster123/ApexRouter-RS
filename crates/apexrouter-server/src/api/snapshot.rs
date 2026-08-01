@@ -173,13 +173,15 @@ pub async fn build(state: &Arc<AppState>) -> Snapshot {
             .unwrap_or_default(),
         endpoints: state.store.list_endpoints().unwrap_or_default(),
         rig: state.supervisor.rig().await.unwrap_or_default(),
-        // Stage 5 fills this in: the rented fleet and the approvals queue.
-        instances: vec![],
+        // The fleet CACHE, not a live probe: fed by the fleet poller and by every handler
+        // that read the fleet anyway. Serving `[]` here while `/v1/vast/instances` had rows
+        // is what blanked the Fleet & cost page (GARDEN-RUNS.md, R4).
+        instances: state.fleet_cache().instances,
         tunnels: state.store.load_tunnels().unwrap_or_default(),
         providers: providers(&cfg, state),
         recipes: catalog.recipes,
         profiles: catalog.profiles,
-        totals: totals(&rows, now),
+        totals: totals(&rows, now, &state.fleet_cache()),
         alerts: alerts(state),
         jobs: state.jobs.all(),
     }
@@ -233,17 +235,26 @@ fn rate(rows: &[UsageRecord], now: i64) -> (f32, f32) {
 
 /// Spend and tokens, folded with `CostEstimate::add` inside `aggregate`, so one estimated
 /// row visibly demotes the total instead of the total quietly claiming to be metered.
-fn totals(rows: &[UsageRecord], now: i64) -> Totals {
+///
+/// The vast numbers come from the fleet **cache**: credit as last read, burn as the sum of
+/// `dph_total` over instances that are neither parked nor destroyed. Parked boxes bill
+/// storage, not GPUs — their disk cost is real but is not an hourly GPU burn, and folding
+/// it in here would overstate the number the operator watches most.
+fn totals(rows: &[UsageRecord], now: i64, fleet: &crate::state::FleetCache) -> Totals {
     let d1 = usage::aggregate(rows, Some(now - DAY), GroupBy::Provider);
     let d7 = usage::aggregate(rows, Some(now - 7 * DAY), GroupBy::Provider);
+    // The same parked-aware sum `vast ls` prints and `money.credit` checks against.
+    let burn = apexrouter_providers::checks::burn_per_hour(&fleet.instances);
     Totals {
         spend_24h: d1.total_cost,
         spend_7d: d7.total_cost,
         tokens_24h: d1.total_prompt.saturating_add(d1.total_completion),
-        // Stage 5: credit and burn come from the vast ledger.
-        vast_credit: None,
-        burn_rate_usd_hr: Money::ZERO,
-        burn_down_hours: None,
+        vast_credit: fleet.credit,
+        burn_rate_usd_hr: Money::from_usd(burn),
+        burn_down_hours: match (fleet.credit, burn) {
+            (Some(credit), burn) if burn > 0.0 => Some((credit / burn) as f32),
+            _ => None,
+        },
     }
 }
 

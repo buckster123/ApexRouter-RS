@@ -39,7 +39,7 @@ use apexrouter_protocol::{
     AlertLevel, ArgvPreview, Backend, BackendId, BackendKind, BackendLimits, BootPhase,
     ContainerLaunch, CostEstimate, CredentialSource, EndpointRef, EndpointSpec, Event, Health,
     InstanceId, LedgerRow, LedgerState, LogSource, Money, Offer, PriceModel, PriceSource, Protocol,
-    Provenance, RentRequest, VastInstance,
+    Provenance, RentRequest, VastInstance, VastSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -426,6 +426,230 @@ pub async fn destroy_within(
     Ok(())
 }
 
+/// What a parked box keeps costing per week, when the row prices its own disk
+/// (`storage_cost` $/GB/month × allocated GB, re-based to a week).
+///
+/// `None` when vast did not say — the callers then render the measured band from the
+/// campaign ($0.12–0.19/GB/month) *labelled as an estimate*, never a confident number.
+pub fn weekly_disk_usd(inst: &VastInstance) -> Option<f64> {
+    let per_gb_month = inst.storage_cost.filter(|c| c.is_finite() && *c >= 0.0)?;
+    let gb = inst.disk_space.filter(|g| g.is_finite() && *g > 0.0)?;
+    Some(per_gb_month * gb * 12.0 / 365.25 * 7.0)
+}
+
+/// Park one box: release the GPUs, keep the disk. **Not** a destroy — the instance stays
+/// on the ledger, keeps billing storage, and `wake` can bring it back with its models and
+/// builds intact ($3–6/week holds 100–150 GB; a re-download from CN cost an afternoon).
+///
+/// The state change is verified, not assumed: vast accepting the PUT is not the same as
+/// the box stopping. On a verification timeout the request stands, the error says so, and
+/// the ledger records `Parked` only once the fleet actually reports it.
+///
+/// # Errors
+/// An unknown instance, a refused state change, or a box still not stopped after
+/// `verify_secs`.
+pub async fn park(
+    api: &dyn VastApi,
+    ledger: &Ledger,
+    id: InstanceId,
+    tx: &broadcast::Sender<Event>,
+    verify_secs: u64,
+    poll_min_ms: u64,
+) -> Result<VastInstance> {
+    let inst = api
+        .instance(id)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("vast instance {}", id.0)))?;
+    if inst.phase() == BootPhase::Parked {
+        return Ok(inst);
+    }
+
+    api.set_target_state(id, false).await?;
+
+    let poll = Duration::from_millis(poll_min_ms.max(POLL_FLOOR_MS));
+    let deadline = Instant::now() + Duration::from_secs(verify_secs);
+    let parked = loop {
+        match api.instance(id).await {
+            Ok(Some(now)) if now.phase() == BootPhase::Parked => break now,
+            Ok(None) => {
+                return Err(Error::Other(format!(
+                    "instance {} disappeared while being parked — check the console: \
+                     parking must never destroy",
+                    id.0
+                )))
+            }
+            Ok(Some(_)) => {}
+            Err(e) => {
+                tracing::warn!(instance = id.0, error = %e, "park verification poll failed");
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Other(format!(
+                "instance {} was asked to stop but still is not stopped after \
+                 {verify_secs}s; the request stands — check `apexrouter vast ls`",
+                id.0
+            )));
+        }
+        tokio::time::sleep(poll).await;
+    };
+
+    let weekly = weekly_disk_usd(&parked);
+    ledger.append(&row(
+        id,
+        LedgerState::Parked,
+        Some(&parked),
+        None,
+        weekly.map_or(CostEstimate::Unknown, |w| CostEstimate::Approximate {
+            usd: Money::from_usd(w),
+            source: PriceSource::VastOffer,
+            assumption: format!(
+                "one week of held disk at the instance's storage price ({:.0} GB)",
+                parked.disk_space.unwrap_or_default()
+            ),
+        }),
+        format!(
+            "instance {} parked: GPUs released, disk held{}",
+            id.0,
+            weekly
+                .map(|w| format!(" at ~${w:.2}/week"))
+                .unwrap_or_default()
+        ),
+    ))?;
+
+    if let Ok(backend) = backend_id(id) {
+        let _ = tx.send(Event::BootProgress {
+            backend,
+            phase: BootPhase::Parked,
+            line: weekly.map(|w| format!("disk held at ~${w:.2}/week")),
+        });
+    }
+    broadcast_fleet(api, tx).await;
+    Ok(parked)
+}
+
+/// Wake a parked box. **Resumes the hourly bill**, which is why there is no path to it
+/// without a [`SpendApproval`] — the instance's live `dph_total` is checked against the
+/// approved ceiling exactly as `up` checks it.
+///
+/// A wake that does not reach `running` within `max_boot_secs` is **re-parked**, not
+/// abandoned: the GPUs may have been taken by another renter, and leaving `target_state:
+/// running` behind means the box would silently start billing at 3 a.m. when they free up.
+///
+/// # Errors
+/// An unknown instance, a rate above the approval, a refused state change, or a box that
+/// could not start (re-parked, and the error says so).
+pub async fn wake(
+    api: &dyn VastApi,
+    ledger: &Ledger,
+    id: InstanceId,
+    approval: SpendApproval,
+    tx: &broadcast::Sender<Event>,
+    max_boot_secs: u64,
+    poll_min_ms: u64,
+) -> Result<VastInstance> {
+    let inst = api
+        .instance(id)
+        .await?
+        .ok_or_else(|| Error::NotFound(format!("vast instance {}", id.0)))?;
+    if let Some(dph) = inst.dph_total {
+        if Money::from_usd(dph) > approval.max_usd_per_hour() {
+            return Err(Error::Invalid {
+                what: "vast instance".to_owned(),
+                why: format!(
+                    "instance {} bills {}/hr but the approval covers only {}/hr",
+                    id.0,
+                    Money::from_usd(dph),
+                    approval.max_usd_per_hour()
+                ),
+            });
+        }
+    }
+
+    api.set_target_state(id, true).await?;
+
+    let poll = Duration::from_millis(poll_min_ms.max(POLL_FLOOR_MS));
+    let deadline = Instant::now() + Duration::from_secs(max_boot_secs);
+    let mut last: Option<BootPhase> = None;
+    let woken = loop {
+        match api.instance(id).await {
+            Ok(Some(now)) => {
+                let phase = now.phase();
+                if last.as_ref() != Some(&phase) {
+                    if let Ok(backend) = backend_id(id) {
+                        let _ = tx.send(Event::BootProgress {
+                            backend,
+                            phase: phase.clone(),
+                            line: now.status_note(),
+                        });
+                    }
+                    last = Some(phase.clone());
+                }
+                if phase == BootPhase::Healthy {
+                    break now;
+                }
+                if now.is_terminal() {
+                    return Err(Error::Other(format!(
+                        "instance {} reported `{}` during the wake and will not recover",
+                        id.0,
+                        now.actual_status.as_deref().unwrap_or("terminal")
+                    )));
+                }
+            }
+            Ok(None) => {
+                return Err(Error::NotFound(format!(
+                    "vast instance {} disappeared during the wake",
+                    id.0
+                )))
+            }
+            Err(e) => {
+                tracing::warn!(instance = id.0, error = %e, "wake poll failed; retrying");
+            }
+        }
+        if Instant::now() >= deadline {
+            // Re-park, or the box starts billing unattended whenever GPUs free up.
+            let reparked = api.set_target_state(id, false).await;
+            let _ = tx.send(Event::Alert {
+                level: AlertLevel::Serious,
+                message: match &reparked {
+                    Ok(()) => format!(
+                        "instance {} did not start within {max_boot_secs}s (GPUs likely \
+                         taken) and was parked again",
+                        id.0
+                    ),
+                    Err(e) => format!(
+                        "instance {} did not start within {max_boot_secs}s AND could not \
+                         be re-parked ({e}) — it may start billing when GPUs free up",
+                        id.0
+                    ),
+                },
+                action: Some("apexrouter vast ls".to_owned()),
+                id: format!("vast.wake.{}", id.0),
+            });
+            return Err(Error::Other(format!(
+                "instance {} did not reach running within {max_boot_secs}s; {}",
+                id.0,
+                if reparked.is_ok() {
+                    "it was parked again"
+                } else {
+                    "and re-parking FAILED — check the console"
+                }
+            )));
+        }
+        tokio::time::sleep(poll).await;
+    };
+
+    ledger.append(&row(
+        id,
+        LedgerState::Running,
+        Some(&woken),
+        None,
+        CostEstimate::Unknown,
+        format!("instance {} woken and observed running", id.0),
+    ))?;
+    broadcast_fleet(api, tx).await;
+    Ok(woken)
+}
+
 /// The vast.ai `Provisioner`.
 ///
 /// It deliberately does **not** destroy anything in [`Provisioner::down`]. `down` means "stop
@@ -654,7 +878,6 @@ impl Provisioner for VastProvisioner {
             )));
         }
 
-        let id = backend_id(spec.instance_id)?;
         self.ledger.append(&row(
             spec.instance_id,
             LedgerState::Running,
@@ -664,52 +887,7 @@ impl Provisioner for VastProvisioner {
             format!("instance {} observed running", spec.instance_id.0),
         ))?;
 
-        let base_url = match &spec.tunnel {
-            Some(t) => format!("http://127.0.0.1:{}", t.local_port),
-            None => {
-                let (host, port) =
-                    inst.external_port(spec.launch.port)
-                        .ok_or_else(|| Error::Invalid {
-                            what: "vast instance".to_owned(),
-                            why: format!(
-                                "port {} is not mapped and no tunnel is configured",
-                                spec.launch.port
-                            ),
-                        })?;
-                format!("http://{host}:{port}")
-            }
-        };
-
-        Ok(Backend {
-            id: id.clone(),
-            kind: plan.spec.kind(),
-            protocol: Protocol::OpenAi,
-            label: inst.gpu_name.clone().map_or_else(
-                || format!("vast {}", spec.instance_id.0),
-                |gpu| format!("{gpu} on vast {}", spec.instance_id.0),
-            ),
-            base_url,
-            credential: if spec.launch.expose_public {
-                CredentialSource::Instance
-            } else {
-                CredentialSource::None
-            },
-            tags: tags_for(&inst),
-            models: Vec::new(),
-            limits: BackendLimits::default(),
-            price: inst.dph_total.map(|dph| PriceModel::PerHour {
-                dph: Money::from_usd(dph),
-            }),
-            health: Health::Unknown,
-            provenance: Provenance::Rented,
-            endpoint: Some(EndpointRef {
-                id,
-                kind: plan.spec.kind(),
-            }),
-            enabled: true,
-            devices: Vec::new(),
-            last_error: None,
-        })
+        rented_backend(&inst, &spec)
     }
 
     /// Stop routing to a rented box. **Never destroys it.**
@@ -796,6 +974,64 @@ impl Provisioner for VastProvisioner {
         }
         Ok(out)
     }
+}
+
+/// The `Backend` row a rented instance serves as.
+///
+/// **The one constructor**, used by [`Provisioner::up`] on this type and by the daemon's
+/// rent job when it finishes the chain — two hand-built `Backend`s for the same box would
+/// eventually disagree about the base URL, and the request path would route to the wrong
+/// one. Tunnel-first: with a [`TunnelSpec`] the backend is `http://127.0.0.1:<local>`,
+/// otherwise the instance must map the launch port publicly.
+///
+/// # Errors
+/// A launch port that is neither tunnelled nor mapped, or an instance id no `BackendId`
+/// charset admits.
+pub fn rented_backend(inst: &VastInstance, spec: &VastSpec) -> Result<Backend> {
+    let id = backend_id(spec.instance_id)?;
+    let kind = EndpointSpec::Vast(spec.clone()).kind();
+    let base_url = match &spec.tunnel {
+        Some(t) => format!("http://127.0.0.1:{}", t.local_port),
+        None => {
+            let (host, port) =
+                inst.external_port(spec.launch.port)
+                    .ok_or_else(|| Error::Invalid {
+                        what: "vast instance".to_owned(),
+                        why: format!(
+                            "port {} is not mapped and no tunnel is configured",
+                            spec.launch.port
+                        ),
+                    })?;
+            format!("http://{host}:{port}")
+        }
+    };
+    Ok(Backend {
+        id: id.clone(),
+        kind,
+        protocol: Protocol::OpenAi,
+        label: inst.gpu_name.clone().map_or_else(
+            || format!("vast {}", spec.instance_id.0),
+            |gpu| format!("{gpu} on vast {}", spec.instance_id.0),
+        ),
+        base_url,
+        credential: if spec.launch.expose_public {
+            CredentialSource::Instance
+        } else {
+            CredentialSource::None
+        },
+        tags: tags_for(inst),
+        models: Vec::new(),
+        limits: BackendLimits::default(),
+        price: inst.dph_total.map(|dph| PriceModel::PerHour {
+            dph: Money::from_usd(dph),
+        }),
+        health: Health::Unknown,
+        provenance: Provenance::Rented,
+        endpoint: Some(EndpointRef { id, kind }),
+        enabled: true,
+        devices: Vec::new(),
+        last_error: None,
+    })
 }
 
 /// Force the tunnel-only posture at create time (`ARCHITECTURE.md` §9.5).
@@ -966,6 +1202,10 @@ pub(crate) mod tests {
     pub(crate) struct MockVast {
         statuses: Mutex<Vec<Option<String>>>,
         stuck: Option<Option<String>>,
+        /// One `status_msg` per poll, the last repeating forever. Empty means `None` always.
+        msgs: Mutex<std::collections::VecDeque<Option<String>>>,
+        /// Every `set_target_state` call, in order (`true` = wake, `false` = park).
+        set_state_calls: Mutex<Vec<bool>>,
         errors_before: usize,
         destroy_ok: bool,
         instance_calls: AtomicUsize,
@@ -987,6 +1227,8 @@ pub(crate) mod tests {
             MockVast {
                 statuses: Mutex::new(Vec::new()),
                 stuck: None,
+                msgs: Mutex::new(std::collections::VecDeque::new()),
+                set_state_calls: Mutex::new(Vec::new()),
                 errors_before: 0,
                 destroy_ok: true,
                 instance_calls: AtomicUsize::new(0),
@@ -994,6 +1236,12 @@ pub(crate) mod tests {
                 polls: Mutex::new(Vec::new()),
                 gone_after_destroy: true,
             }
+        }
+
+        /// One `status_msg` per `instance()` answer, the last repeating forever.
+        pub(crate) fn with_msg_script(self, msgs: &[Option<&str>]) -> MockVast {
+            *lock(&self.msgs) = msgs.iter().map(|m| m.map(str::to_owned)).collect();
+            self
         }
 
         /// One `instance()` answer per entry; `None` means "gone from the fleet".
@@ -1041,6 +1289,10 @@ pub(crate) mod tests {
             let polls = lock(&self.polls);
             polls.windows(2).map(|w| w[1] - w[0]).collect()
         }
+
+        pub(crate) fn set_state_calls(&self) -> Vec<bool> {
+            lock(&self.set_state_calls).clone()
+        }
     }
 
     /// A rented box with everything the fleet view renders.
@@ -1048,7 +1300,10 @@ pub(crate) mod tests {
         VastInstance {
             id: InstanceId(id),
             actual_status: status.map(str::to_owned),
+            intended_status: None,
             status_msg: None,
+            machine_id: Some(142_595),
+            storage_cost: Some(0.15),
             ssh_host: Some("ssh5.vast.ai".to_owned()),
             ssh_port: Some(41_234),
             public_ipaddr: Some("203.0.113.7".to_owned()),
@@ -1111,14 +1366,34 @@ pub(crate) mod tests {
             if self.gone_after_destroy && self.destroy_calls.load(Ordering::SeqCst) > 0 {
                 return Ok(None);
             }
+            let msg = {
+                let mut msgs = lock(&self.msgs);
+                if msgs.len() > 1 {
+                    msgs.pop_front().flatten()
+                } else {
+                    msgs.front().cloned().flatten()
+                }
+            };
+            let with_msg = |mut inst: VastInstance| {
+                inst.status_msg = msg.clone();
+                inst
+            };
             if let Some(stuck) = &self.stuck {
-                return Ok(Some(instance(id.0, stuck.as_deref())));
+                return Ok(Some(with_msg(instance(id.0, stuck.as_deref()))));
             }
             match lock(&self.statuses).pop() {
-                Some(Some(status)) => Ok(Some(instance(id.0, Some(&status)))),
+                Some(Some(status)) => Ok(Some(with_msg(instance(id.0, Some(&status))))),
                 Some(None) => Ok(None),
-                None => Ok(Some(instance(id.0, Some("running")))),
+                None => Ok(Some(with_msg(instance(id.0, Some("running"))))),
             }
+        }
+
+        async fn set_target_state(&self, _id: InstanceId, running: bool) -> Result<()> {
+            // The status script drives what `instance()` reports afterwards: a park test
+            // scripts `stopped`, a wake scripts the boot ladder. Recorded so a test can
+            // assert a failed wake re-parked.
+            lock(&self.set_state_calls).push(running);
+            Ok(())
         }
 
         async fn destroy(&self, _id: InstanceId) -> Result<()> {
@@ -1219,6 +1494,9 @@ pub(crate) mod tests {
             inet_up_cost: None,
             cpu_ram: None,
             cpu_cores_effective: None,
+            cpu_name: None,
+            mobo_name: None,
+            host_id: None,
             disk_space: Some(80.0),
             cuda_max_good: Some(12.4),
             driver_version: None,
@@ -1831,5 +2109,150 @@ pub(crate) mod tests {
         // string assertions, never dialled.
         assert!(tests.contains("127.0.0.1"));
         assert!(tests.contains("203.0.113.7"));
+    }
+
+    // ---- park and wake -----------------------------------------------------------------
+
+    /// A fleet with one running, priced, disk-priced box, for the park/wake path.
+    fn parked_fixture(id: u64) -> FixtureVast {
+        FixtureVast::new()
+            .with_instances_json(&format!(
+                r#"{{"instances": [{{"id": {id}, "actual_status": "running",
+                     "dph_total": 0.8361, "disk_space": 150.0, "storage_cost": 0.15,
+                     "gpu_name": "RTX 4090", "num_gpus": 2}}]}}"#
+            ))
+            .expect("fixture fleet")
+    }
+
+    #[tokio::test]
+    async fn parking_verifies_the_stop_and_stays_on_the_ledger() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ledger = ledger(dir.path());
+        let api = parked_fixture(46_509_449);
+        let tx = channel();
+        // Seed an active rental so "parked but active" is observable.
+        rent(&api, &ledger, &request(), approval(0.90), &tx)
+            .await
+            .ok();
+
+        let parked = park(
+            &api,
+            &ledger,
+            InstanceId(46_509_449),
+            &tx,
+            30,
+            1, // poll floor clamps this; the fixture answers instantly
+        )
+        .await
+        .expect("park");
+        assert_eq!(parked.phase(), BootPhase::Parked);
+        assert!(api
+            .calls()
+            .contains(&FixtureCall::SetTargetState(InstanceId(46_509_449), false)));
+
+        let rows = ledger.rows().expect("rows");
+        let last = rows.last().expect("a parked row");
+        assert_eq!(last.state, LedgerState::Parked);
+        assert!(
+            last.note.as_deref().unwrap_or_default().contains("/week"),
+            "the weekly figure is on the record: {:?}",
+            last.note
+        );
+        // Parking is not forgetting: the box still counts as active.
+        assert!(ledger
+            .active()
+            .expect("active")
+            .iter()
+            .any(|r| r.instance_id == Some(InstanceId(46_509_449))));
+    }
+
+    #[tokio::test]
+    async fn parking_an_already_parked_box_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ledger = ledger(dir.path());
+        let api = FixtureVast::new()
+            .with_instances_json(r#"{"instances": [{"id": 7, "actual_status": "stopped"}]}"#)
+            .expect("fleet");
+        let tx = channel();
+
+        park(&api, &ledger, InstanceId(7), &tx, 30, 1)
+            .await
+            .expect("idempotent");
+        assert!(
+            !api.calls()
+                .iter()
+                .any(|c| matches!(c, FixtureCall::SetTargetState(..))),
+            "already parked: no state change is sent"
+        );
+        assert!(ledger.rows().expect("rows").is_empty(), "and no new row");
+    }
+
+    #[tokio::test]
+    async fn waking_requires_the_approval_to_cover_the_live_rate() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ledger = ledger(dir.path());
+        let api = parked_fixture(7);
+        let tx = channel();
+
+        let err = wake(
+            &api,
+            &ledger,
+            InstanceId(7),
+            approval(0.40), // the box bills $0.8361/hr
+            &tx,
+            30,
+            1,
+        )
+        .await
+        .expect_err("above the approval");
+        assert!(err.to_string().contains("approval covers"), "{err}");
+        assert!(
+            !api.calls()
+                .iter()
+                .any(|c| matches!(c, FixtureCall::SetTargetState(..))),
+            "nothing was started"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_reaches_running_and_lands_on_the_ledger() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let ledger = ledger(dir.path());
+        let api = parked_fixture(7);
+        let tx = channel();
+
+        let woken = wake(&api, &ledger, InstanceId(7), approval(0.90), &tx, 30, 1)
+            .await
+            .expect("wake");
+        assert_eq!(woken.phase(), BootPhase::Healthy);
+        assert!(api
+            .calls()
+            .contains(&FixtureCall::SetTargetState(InstanceId(7), true)));
+        let rows = ledger.rows().expect("rows");
+        assert_eq!(rows.last().map(|r| r.state), Some(LedgerState::Running));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_that_cannot_start_is_parked_again_not_left_armed() {
+        // The GPUs went to another renter: the box must not be left with
+        // `target_state: running`, or it starts billing unattended when they free up.
+        let dir = tempfile::tempdir().expect("tmp");
+        let ledger = ledger(dir.path());
+        let api = MockVast::new().stuck(Some("scheduling"));
+        let tx = channel();
+
+        let err = wake(&api, &ledger, InstanceId(7), approval(0.90), &tx, 20, 5_000)
+            .await
+            .expect_err("never reached running");
+        assert!(err.to_string().contains("parked again"), "{err}");
+        assert_eq!(
+            api.set_state_calls(),
+            vec![true, false],
+            "started, then re-parked"
+        );
+        assert!(
+            ledger.rows().expect("rows").is_empty(),
+            "no Running row for a wake that never ran"
+        );
     }
 }

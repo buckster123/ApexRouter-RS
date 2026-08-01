@@ -589,6 +589,7 @@ pub(crate) mod testkit {
             checks: Arc::new(Registry::new()),
             started_at: Instant::now(),
             lock: Arc::new(Mutex::new(lock)),
+            fleet: std::sync::RwLock::new(crate::state::FleetCache::default()),
         })
     }
 

@@ -279,6 +279,9 @@ pub enum BootPhase {
     },
     /// Serving.
     Healthy,
+    /// Stopped on purpose: the GPUs are released, the disk is held and still billing, and a
+    /// wake can bring it back. **Not** `Destroyed` — the box exists and costs money.
+    Parked,
     /// Gave up. Carries the reason, and the caller carries the log tail.
     Failed {
         /// Why.
@@ -290,10 +293,16 @@ pub enum BootPhase {
 
 impl BootPhase {
     /// True when the boot machine will make no further transitions, however it ended.
+    ///
+    /// `Parked` is terminal: a parked box makes no progress until an explicit wake, and
+    /// anything waiting on its boot should stop waiting.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            BootPhase::Healthy | BootPhase::Failed { .. } | BootPhase::Destroyed
+            BootPhase::Healthy
+                | BootPhase::Parked
+                | BootPhase::Failed { .. }
+                | BootPhase::Destroyed
         )
     }
 }

@@ -1656,18 +1656,24 @@ function instanceCard(i, adopted) {
     }),
   );
   add(acts, btn("Tunnel", "⇄", "btn-sm", () => act("/v1/vast/instances/" + i.id + "/tunnel", { method: "POST" }, "tunnel opening")));
+  if (phase.parked) {
+    add(acts, btn("Wake", "▶", "btn-sm", () => act("/v1/vast/instances/" + i.id + "/wake?confirm=true&source=web_ui", { method: "POST" }, "waking — resumes the hourly bill")));
+  } else {
+    add(acts, btn("Park", "⏸", "btn-sm", () => act("/v1/vast/instances/" + i.id + "/park", { method: "POST" }, "parking — GPUs released, disk held")));
+  }
   add(acts, btn("Destroy…", "⛔", "btn-sm btn-danger", () => confirmMoney(destroyInstancePlan(i.id))));
   add(card, acts);
   return card;
 }
 
-/** A `VastInstance`'s phase, as a health-toned badge. */
+/** A `VastInstance`'s phase, as a health-toned badge. Mirrors `VastInstance::phase()`. */
 function instancePhase(i) {
   const st = (i.actual_status || "").toLowerCase();
   if (st === "running") return { tone: "good", icon: "●", label: "Running" };
   if (st === "loading" || st === "pulling") return { tone: "warn", icon: "◐", label: "Pulling", stalled: false };
   if (st === "created" || st === "scheduling" || st === "starting") return { tone: "warn", icon: "◐", label: "Provisioning" };
-  if (st === "stopped" || st === "inactive") return { tone: "unknown", icon: "○", label: "Stopped" };
+  // Parked, not destroyed: the disk is held and still billing storage.
+  if (st === "stopped" || st === "inactive") return { tone: "unknown", icon: "⏸", label: "Parked", parked: true };
   if (st === "exited" || st === "offline" || st === "unknown") return { tone: "critical", icon: "✕", label: pretty(st) };
   return { tone: "unknown", icon: "○", label: st ? pretty(st) : "Reserved" };
 }

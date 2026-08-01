@@ -1555,6 +1555,122 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/CheckResult' }
 
+  /v1/vast/instances/{id}/park:
+    post:
+      operationId: vastParkInstance
+      x-listener: [control]
+      tags: [vast]
+      summary: Stop the box but keep its disk. GPUs released; storage keeps billing.
+      description: >-
+        Not a destroy: the instance stays on the ledger (state `parked`) and `wake`
+        restarts it with models and builds intact. The answer carries the weekly disk
+        figure so every surface renders what the held disk keeps costing.
+      parameters: [{ $ref: '#/components/parameters/InstanceId' }]
+      responses:
+        '200':
+          description: The park receipt.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id: { type: integer, format: int64 }
+                  phase: { $ref: '#/components/schemas/BootPhase' }
+                  disk_gb: { type: number, nullable: true }
+                  weekly_disk_usd:
+                    type: number
+                    nullable: true
+                    description: Null when vast did not price the disk on this row.
+
+  /v1/vast/instances/{id}/wake:
+    post:
+      operationId: vastWakeInstance
+      x-listener: [control]
+      tags: [vast]
+      summary: Restart a parked box. Resumes the hourly bill; gated like a rent.
+      description: >-
+        Without `?confirm=true` the answer is a 409 carrying the instance's rate and the
+        current credit. With it, the live `dph_total` passes through the same
+        SpendApproval gate as a rental before any state changes. Answers 202 with a job:
+        a wake is a boot. A wake that cannot reach `running` within the boot budget is
+        parked again, so the box cannot start billing unattended when GPUs free up.
+      parameters:
+        - { $ref: '#/components/parameters/InstanceId' }
+        - name: confirm
+          in: query
+          schema: { type: boolean }
+        - name: source
+          in: query
+          schema: { type: string }
+      responses:
+        '202':
+          description: The wake job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '409':
+          description: Confirmation required; the body carries the rate and the credit.
+
+  /v1/vast/favorites:
+    get:
+      operationId: listFavorites
+      x-listener: [control]
+      tags: [vast]
+      summary: Every remembered host verdict (star or skull), keyed machine_id.
+      responses:
+        '200':
+          description: Favorite rows.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FavoriteHost' }
+
+  /v1/vast/favorites/{machine_id}:
+    put:
+      operationId: putFavorite
+      x-listener: [control]
+      tags: [vast]
+      summary: Record or update one host verdict. Idempotent upsert.
+      description: >-
+        Keyed on machine_id, never on an offer id: several hosts re-mint ask ids per
+        search snapshot, so an offer id names a listing, not a machine. A skull-marked
+        machine is excluded from anonymous profile searches (with a banner) and warned
+        about when named explicitly.
+      parameters: [{ $ref: '#/components/parameters/MachineId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verdict]
+              properties:
+                verdict: { type: string, enum: [star, skull] }
+                note: { type: string, nullable: true }
+                gpu_name: { type: string, nullable: true }
+                geolocation: { type: string, nullable: true }
+      responses:
+        '200':
+          description: The stored row.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FavoriteHost' }
+    delete:
+      operationId: deleteFavorite
+      x-listener: [control]
+      tags: [vast]
+      summary: Forget one host verdict. Idempotent.
+      parameters: [{ $ref: '#/components/parameters/MachineId' }]
+      responses:
+        '200':
+          description: The verdicts that remain.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/FavoriteHost' }
+
   /v1/tunnels:
     get:
       operationId: listTunnels
@@ -2054,6 +2170,12 @@ components:
       in: path
       required: true
       schema: { type: string }
+    MachineId:
+      name: machine_id
+      in: path
+      required: true
+      description: The physical machine id — stable where offer/ask ids re-mint.
+      schema: { type: integer, format: int64 }
     RequestId:
       name: id
       in: path
@@ -3096,6 +3218,17 @@ components:
         state: { type: string, enum: [starting, up, down, adopted] }
         since_unix: { type: integer, format: int64 }
         last_error: { type: [string, 'null'] }
+    FavoriteHost:
+      type: object
+      description: One remembered host verdict, from $STATE/favorites.json.
+      required: [machine_id, verdict, added_at_unix]
+      properties:
+        machine_id: { type: integer, format: int64 }
+        verdict: { type: string, enum: [star, skull] }
+        note: { type: [string, 'null'], description: 'Why, in the operator''s words.' }
+        gpu_name: { type: [string, 'null'] }
+        geolocation: { type: [string, 'null'] }
+        added_at_unix: { type: integer, format: int64 }
     ApprovalRequest:
       type: object
       required: [id, what, max_usd_per_hour, est_total_usd, requested_at_unix, source]

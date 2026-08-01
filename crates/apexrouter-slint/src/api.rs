@@ -309,6 +309,11 @@ pub fn boot_text(p: &BootPhase) -> (String, i32, f32) {
             pct.map(|p| (p / 100.0).clamp(0.0, 1.0)).unwrap_or(0.8),
         ),
         BootPhase::Healthy => ("healthy".to_string(), 1, 1.0),
+        BootPhase::Parked => (
+            "parked (disk held, still billing storage)".to_string(),
+            2,
+            1.0,
+        ),
         BootPhase::Failed { reason } => (format!("failed: {reason}"), 4, 1.0),
         BootPhase::Destroyed => ("destroyed".to_string(), 0, 1.0),
     }

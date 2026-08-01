@@ -152,6 +152,11 @@ impl Paths {
         self.state.join("tunnels.json")
     }
 
+    /// `$STATE/favorites.json` — starred/burned physical hosts, keyed `machine_id`.
+    pub fn favorites_file(&self) -> PathBuf {
+        self.state.join("favorites.json")
+    }
+
     /// `$STATE/catalog.toml`.
     pub fn catalog_file(&self) -> PathBuf {
         self.state.join("catalog.toml")

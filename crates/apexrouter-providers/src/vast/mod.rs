@@ -20,7 +20,10 @@ pub mod stall;
 
 pub use api::{FixtureCall, FixtureCreate, FixtureVast, VastApi, VastApiHttp};
 pub use boot::watch_boot;
-pub use offers::{gpu_name_vocabulary, profile_to_query, search_unified, QueryOverrides};
+pub use offers::{
+    constraint_failures, gpu_name_vocabulary, offer_matches, profile_to_query, search_unified,
+    QueryOverrides,
+};
 pub use query::build_query;
-pub use rent::{rent, VastProvisioner};
+pub use rent::{park, rent, rented_backend, wake, weekly_disk_usd, VastProvisioner};
 pub use stall::{restart_download, sample_download};

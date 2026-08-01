@@ -45,6 +45,16 @@ use tokio::time::Instant;
 /// with the operator's value instead. A unit test asserts the two numbers have not drifted.
 pub const DEFAULT_POLL_MIN_MS: u64 = 5_000;
 
+/// How long an **identical, fatal-looking** `status_msg` may repeat — with no phase advance —
+/// before the boot is called dead and the watchdog stops the meter.
+///
+/// The R1 lemon sat in `loading/pulling` for the whole boot budget while `status_msg` carried
+/// the containerd I/O error the vast dashboard was showing all along; `vast ls`/`watch`
+/// showed "pending" and the operator paid to wait (GARDEN-RUNS.md). Two minutes of the same
+/// error is a verdict; a *changing* message ("retrying 2/5…") resets the clock, so a host
+/// that is genuinely recovering is never shot mid-retry.
+pub const FATAL_STATUS_SECS: u64 = 120;
+
 /// However low `poll_min_ms` is configured, never poll faster than this. Vast publishes no
 /// rate-limit headers, so the only safe policy is a floor we choose ourselves.
 pub const POLL_FLOOR_MS: u64 = 250;
@@ -82,6 +92,10 @@ pub async fn watch_boot_every(
     let deadline = Instant::now() + Duration::from_secs(max_secs);
     let mut last: Option<BootPhase> = None;
     let mut consecutive_errors: u32 = 0;
+    // The truth channel: when an *identical* fatal-looking status line repeats past
+    // [`FATAL_STATUS_SECS`] with the boot not advancing, the box is dead, not pending.
+    let mut fatal_note: Option<(String, Instant)> = None;
+    let mut last_note: Option<String> = None;
 
     loop {
         let polled_at = Instant::now();
@@ -90,10 +104,19 @@ pub async fn watch_boot_every(
             Ok(Some(inst)) => {
                 consecutive_errors = 0;
                 let phase = inst.phase();
+                let note = inst.status_note();
                 if last.as_ref() != Some(&phase) {
-                    emit_phase(tx, id, &phase, inst.status_msg.clone());
+                    emit_phase(tx, id, &phase, note.clone());
                     last = Some(phase.clone());
+                } else if note.is_some() && note != last_note {
+                    // Same phase, new words: stream them. This is the line the dashboard
+                    // shows and our surfaces historically did not.
+                    let _ = tx.send(Event::LogLine {
+                        source: LogSource::Instance { id },
+                        line: note.clone().unwrap_or_default(),
+                    });
                 }
+                last_note = note.clone();
 
                 // `exited | offline | unknown` never recover. Stop paying to watch.
                 if inst.is_terminal() {
@@ -109,8 +132,37 @@ pub async fn watch_boot_every(
                     });
                     return Ok(phase);
                 }
-                if matches!(phase, BootPhase::Healthy | BootPhase::Destroyed) {
+                if matches!(
+                    phase,
+                    BootPhase::Healthy | BootPhase::Parked | BootPhase::Destroyed
+                ) {
                     return Ok(phase);
+                }
+
+                // The fatal-status clock: starts when a fatal-looking line appears, resets
+                // when the line *changes* (a retry counter is progress) or stops looking
+                // fatal. A healthy or advancing box never reaches the expiry above.
+                if inst.status_looks_fatal() {
+                    match (&fatal_note, &note) {
+                        (Some((seen, since)), Some(now)) if seen == now => {
+                            if since.elapsed() >= Duration::from_secs(FATAL_STATUS_SECS) {
+                                return expire(
+                                    api,
+                                    id,
+                                    format!(
+                                        "the host reported the same error for \
+                                         {FATAL_STATUS_SECS}s while the boot made no \
+                                         progress: {now}"
+                                    ),
+                                    tx,
+                                )
+                                .await;
+                            }
+                        }
+                        _ => fatal_note = note.clone().map(|n| (n, Instant::now())),
+                    }
+                } else {
+                    fatal_note = None;
                 }
             }
             // Gone from the fleet: somebody else destroyed it, or it never existed.
@@ -141,24 +193,25 @@ pub async fn watch_boot_every(
         }
 
         if Instant::now() >= deadline {
-            return expire(api, id, max_secs, tx).await;
+            return expire(api, id, format!("not healthy after {max_secs}s"), tx).await;
         }
     }
 }
 
-/// The deadline expired. Destroy the instance and say so loudly.
+/// The watchdog gave up — deadline expired, or the host repeated the same fatal status
+/// while the boot made no progress. Destroy the instance and say so loudly.
 ///
 /// A destroy that fails is the one case where software cannot stop the meter, so it is a
 /// `Critical` alert carrying the literal command a human has to run.
 async fn expire(
     api: &dyn VastApi,
     id: InstanceId,
-    max_secs: u64,
+    why: String,
     tx: &broadcast::Sender<Event>,
 ) -> Result<BootPhase> {
     tracing::warn!(
         instance = id.0,
-        max_secs,
+        why,
         "boot watchdog expired; destroying the instance so it stops billing"
     );
 
@@ -167,13 +220,13 @@ async fn expire(
             let _ = tx.send(Event::Alert {
                 level: AlertLevel::Serious,
                 message: format!(
-                    "vast instance {} never became healthy within {max_secs}s and was destroyed",
+                    "vast instance {} never became healthy ({why}) and was destroyed",
                     id.0
                 ),
                 action: None,
                 id: format!("vast.watchdog.{}", id.0),
             });
-            format!("boot watchdog: not healthy after {max_secs}s; the instance was destroyed")
+            format!("boot watchdog: {why}; the instance was destroyed")
         }
         Err(e) => {
             let _ = tx.send(Event::Alert {
@@ -187,8 +240,8 @@ async fn expire(
                 id: format!("vast.watchdog.{}", id.0),
             });
             format!(
-                "boot watchdog: not healthy after {max_secs}s and the destroy call failed \
-                 ({e}); the instance may still be billing"
+                "boot watchdog: {why} and the destroy call failed ({e}); the instance may \
+                 still be billing"
             )
         }
     };
@@ -388,6 +441,119 @@ mod tests {
             "a human must be told the exact command"
         );
         assert!(alert.2.contains("still billing"), "{}", alert.2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeating_fatal_status_msg_is_death_not_pending() {
+        // The R1 lemon: `loading` forever, the containerd error sitting in status_msg the
+        // whole time. The old watcher paid the full boot budget to learn nothing.
+        let api = MockVast::new()
+            .stuck(Some("loading"))
+            .with_msg_script(&[Some(
+                "error creating task for container: input/output error",
+            )]);
+        let (tx, mut rx) = channel();
+
+        // Budget far above FATAL_STATUS_SECS: the *status verdict* must fire, not the
+        // deadline.
+        let phase = watch_boot_every(&api, InstanceId(7), 3_600, 5_000, &tx)
+            .await
+            .expect("watch");
+        match &phase {
+            BootPhase::Failed { reason } => {
+                assert!(reason.contains("input/output error"), "{reason}");
+                assert!(reason.contains("no progress"), "{reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(api.destroyed(), "a provably dead boot must stop the meter");
+        // Well before the 3600 s deadline: ~FATAL_STATUS_SECS of polls plus slack.
+        assert!(
+            api.instance_calls() <= (FATAL_STATUS_SECS / 5 + 3) as usize,
+            "took {} polls",
+            api.instance_calls()
+        );
+
+        let alerts: Vec<AlertLevel> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|e| match e {
+                Event::Alert { level, .. } => Some(level),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(alerts, vec![AlertLevel::Serious]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_changing_error_message_is_a_retry_not_a_verdict() {
+        // "retrying 1/5", "retrying 2/5", …: fatal-looking words, but the message keeps
+        // changing — the host is making progress and must not be shot mid-retry.
+        let msgs: Vec<String> = (0..40)
+            .map(|n| format!("pull failed, retrying {n}/40"))
+            .collect();
+        let mut script: Vec<Option<&str>> = msgs.iter().map(|m| Some(m.as_str())).collect();
+        script.push(None);
+        let api = MockVast::new()
+            .with_statuses(&{
+                let mut s = vec![Some("loading"); 40];
+                s.push(Some("running"));
+                s
+            })
+            .with_msg_script(&script);
+        let (tx, _rx) = channel();
+
+        let phase = watch_boot_every(&api, InstanceId(7), 3_600, 5_000, &tx)
+            .await
+            .expect("watch");
+        assert_eq!(phase, BootPhase::Healthy);
+        assert!(
+            !api.destroyed(),
+            "a recovering host must never be destroyed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_status_line_streams_as_a_log_line_without_rebroadcasting_the_phase() {
+        let api = MockVast::new()
+            .with_statuses(&[Some("loading"), Some("loading"), Some("running")])
+            .with_msg_script(&[Some("Extracting 1/9"), Some("Extracting 5/9"), None]);
+        let (tx, mut rx) = channel();
+
+        watch_boot_every(&api, InstanceId(7), 600, 5_000, &tx)
+            .await
+            .expect("watch");
+
+        let mut phases = Vec::new();
+        let mut lines = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                Event::BootProgress { phase, .. } => phases.push(phase),
+                Event::LogLine { line, .. } => lines.push(line),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            phases,
+            vec![BootPhase::Pulling, BootPhase::Healthy],
+            "a new status line must not re-broadcast the phase"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Extracting 5/9")),
+            "the changed line must stream: {lines:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_instance_ends_the_watch_without_destroying_anything() {
+        let api = MockVast::new().with_statuses(&[Some("created"), Some("stopped")]);
+        let (tx, _rx) = channel();
+        let phase = watch_boot_every(&api, InstanceId(7), 600, 5_000, &tx)
+            .await
+            .expect("watch");
+        assert_eq!(phase, BootPhase::Parked);
+        assert!(
+            !api.destroyed(),
+            "parked is an operator's choice, not a defect"
+        );
     }
 
     #[tokio::test(start_paused = true)]

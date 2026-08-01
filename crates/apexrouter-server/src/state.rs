@@ -16,12 +16,30 @@ use apexrouter_core::config::Config;
 use apexrouter_core::lockfile::DaemonLock;
 use apexrouter_core::paths::Paths;
 use apexrouter_core::store::Store;
-use apexrouter_protocol::Event;
+use apexrouter_protocol::{Event, VastInstance};
 use apexrouter_providers::local::LocalProvisioner;
 use arc_swap::ArcSwap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex};
+
+/// The last fleet read: what `GET /v1/snapshot` serves for `instances` and the vast totals.
+///
+/// The snapshot deliberately probes nothing (`api/snapshot.rs` §"nothing in here probes an
+/// upstream"), so a **cache** is the only honest way rented boxes reach it — fed by the
+/// fleet poller and by every handler that already read the fleet for its own reasons. The
+/// Fleet & cost page rendered `[]` between refreshes for exactly as long as this cache did
+/// not exist (GARDEN-RUNS.md, R4 tooling findings).
+#[derive(Clone, Debug, Default)]
+pub struct FleetCache {
+    /// The rented fleet as last observed. Empty means "none seen", which is why `as_of_unix`
+    /// travels with it — an empty fleet at `0` has never been read at all.
+    pub instances: Vec<VastInstance>,
+    /// Credit as last observed. `None` when the account was never readable.
+    pub credit: Option<f64>,
+    /// When this was read, unix seconds. `0` = never.
+    pub as_of_unix: i64,
+}
 
 /// Everything a handler may reach.
 pub struct AppState {
@@ -45,6 +63,8 @@ pub struct AppState {
     pub started_at: Instant,
     /// Held for the process lifetime. Released by process exit.
     pub lock: Arc<Mutex<DaemonLock>>,
+    /// The rented fleet as last observed, for the network-free snapshot.
+    pub fleet: RwLock<FleetCache>,
     /* provider slots filled in Stage 5: vast, hf, together, tunnels */
 }
 
@@ -76,7 +96,28 @@ impl AppState {
             checks,
             started_at: Instant::now(),
             lock: Arc::new(Mutex::new(lock)),
+            fleet: RwLock::new(FleetCache::default()),
         }
+    }
+
+    /// Record a fleet observation for the snapshot to serve.
+    ///
+    /// Called by the fleet poller and by every handler that read the fleet anyway (`ls`,
+    /// rent, destroy), so the cache is at worst one poll interval stale. `credit: None`
+    /// keeps the last known value — not being able to ask is not evidence of `$0.00`.
+    pub fn update_fleet(&self, instances: Vec<VastInstance>, credit: Option<f64>) {
+        if let Ok(mut cache) = self.fleet.write() {
+            cache.instances = instances;
+            if credit.is_some() {
+                cache.credit = credit;
+            }
+            cache.as_of_unix = chrono::Utc::now().timestamp();
+        }
+    }
+
+    /// The last fleet observation.
+    pub fn fleet_cache(&self) -> FleetCache {
+        self.fleet.read().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// The configuration in force right now.

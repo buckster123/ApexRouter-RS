@@ -350,6 +350,9 @@ pub struct VastCfg {
     pub api_key_file: String,
     /// vast publishes no rate limits; never poll faster than this.
     pub poll_min_ms: u64,
+    /// How often the daemon refreshes the fleet cache the snapshot serves. Zero disables
+    /// the poller (the cache is then fed only by handlers that read the fleet anyway).
+    pub fleet_poll_secs: u64,
     /// Auto-destroy a wedged instance after this long.
     pub max_boot_secs: u64,
     /// Local port pool for `ssh -L`.
@@ -369,6 +372,7 @@ impl Default for VastCfg {
             base_url: "https://console.vast.ai/api/v0".to_owned(),
             api_key_file: "~/.config/vastai/vast_api_key".to_owned(),
             poll_min_ms: 5_000,
+            fleet_poll_secs: 60,
             max_boot_secs: 1_800,
             tunnel_port_range: apexrouter_protocol::DEFAULT_TUNNEL_PORT_RANGE,
             tunnels_on_shutdown: "adopt".to_owned(),

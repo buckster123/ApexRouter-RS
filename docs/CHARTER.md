@@ -280,3 +280,23 @@ one for reasoning.
   campaign protocol before any design lock. It binds direction, not implementation; where it
   disagrees with D1–D18, D1–D18 win. The roadmap seeds in "Deliberately out of mk1" (llama.cpp
   router mode / idle-unload, capacity-aware placement) are the mechanisms arc G-A picks up.
+- **2026-08-02** — **`stopped` is `Parked`, never `Destroyed`** (D5/D10-adjacent; the mk1.1
+  honesty batch, driven by the garden campaign's filed defects). A stopped instance holds its
+  disk, bills for it, and can be woken — reading it as `Destroyed` made the fleet view lie
+  about money in the cheap direction. `BootPhase::Parked` and `LedgerState::Parked` are
+  first-class; a parked box stays in `Ledger::active()`; `vast park`/`wake` are verbs on
+  every surface, park quoting the weekly disk figure and **wake gated by the same
+  `SpendApproval` as a rent** (it resumes the hourly bill). A wake that cannot reach
+  `running` within the boot budget is **parked again**, so `target_state: running` can never
+  sit armed waiting to bill at 3 a.m. when GPUs free up.
+  In the same batch, all D10/D16-consistent: the rent job now finishes the chain
+  (tunnel → endpoint record → backend → alias — `auto_tunnel` and `bind_alias` had been
+  write-only for a release); the snapshot serves a fleet **cache** fed by a poller and by
+  every handler that reads the fleet (the Fleet & cost page blanked exactly as long as that
+  cache did not exist); the boot watchdog reads `status_msg` and calls an identical
+  fatal-looking line that repeats for 120 s with no phase advance **dead** (the R1 lemon
+  burned the full boot budget while the dashboard showed the error the whole time); an
+  explicit offer is re-checked **by the profile's constraints**, never by membership in the
+  top-N-by-price window; `ssh` targets prefer the instance's **direct port mapping** over
+  the `sshN.vast.ai` proxy (which never binds on some hosts); and host verdicts
+  (`favorites.json`, ★/☠) key **`machine_id`** because ask ids re-mint per search snapshot.

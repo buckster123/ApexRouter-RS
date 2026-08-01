@@ -51,6 +51,16 @@ pub struct Offer {
     /// Effective CPU cores allocated to this offer.
     #[serde(default)]
     pub cpu_cores_effective: Option<f64>,
+    /// Host CPU model, e.g. `"AMD EPYC 9354"` — an i5 on a "verified" board is still a
+    /// lemon, and this is how you see it before renting (GARDEN.md host doctrine).
+    #[serde(default)]
+    pub cpu_name: Option<String>,
+    /// Host motherboard model, the other half of the host-class read.
+    #[serde(default)]
+    pub mobo_name: Option<String>,
+    /// The hosting account behind the machine.
+    #[serde(default)]
+    pub host_id: Option<u64>,
     /// Disk, GB.
     #[serde(default)]
     pub disk_space: Option<f64>,
@@ -209,12 +219,26 @@ pub struct VastAccount {
 pub struct VastInstance {
     /// The contract id. The create call returns it as `new_contract`, not `id`.
     pub id: InstanceId,
-    /// `"created"`, `"loading"`, `"running"`, `"exited"`, `"offline"`, …
+    /// `"created"`, `"loading"`, `"running"`, `"stopped"`, `"exited"`, `"offline"`, …
     #[serde(default)]
     pub actual_status: Option<String>,
-    /// A human-readable status line, when vast supplies one.
+    /// The state the contract is asked to be in (`"running"` | `"stopped"`), when vast
+    /// reports it. `actual_status: "stopped"` with `intended_status: "stopped"` is a parked
+    /// box; the same status with `intended_status: "running"` is a box that failed to start.
+    #[serde(default)]
+    pub intended_status: Option<String>,
+    /// A human-readable status line, when vast supplies one. **This is the truth channel**:
+    /// a box can sit in `loading` forever while `status_msg` carries the fatal container
+    /// error (GARDEN-RUNS.md, the R1 lemon).
     #[serde(default)]
     pub status_msg: Option<String>,
+    /// The physical machine this contract runs on. Stable across ask re-mints, which is why
+    /// favorites key on it and not on offer ids.
+    #[serde(default)]
+    pub machine_id: Option<u64>,
+    /// Storage price, dollars per GB per month — what a parked box keeps costing.
+    #[serde(default)]
+    pub storage_cost: Option<f64>,
     /// `sshN.vast.ai`. Recycled, which is why we keep a dedicated `known_hosts`.
     #[serde(default)]
     pub ssh_host: Option<String>,
@@ -284,7 +308,9 @@ impl VastInstance {
             Some("created") | Some("scheduling") | Some("starting") => BootPhase::Provisioning,
             Some("loading") | Some("pulling") => BootPhase::Pulling,
             Some("running") => BootPhase::Healthy,
-            Some("stopped") | Some("inactive") => BootPhase::Destroyed,
+            // A stopped box is NOT destroyed: it holds its disk, bills for it, and can be
+            // woken. Reading it as `Destroyed` is how a fleet view lies about money.
+            Some("stopped") | Some("inactive") => BootPhase::Parked,
             Some(terminal @ ("exited" | "offline" | "unknown")) => BootPhase::Failed {
                 reason: self
                     .status_msg
@@ -293,6 +319,36 @@ impl VastInstance {
             },
             Some(_) => BootPhase::Provisioning,
         }
+    }
+
+    /// The `status_msg`, flattened to one line and trimmed, or `None` when it is empty.
+    ///
+    /// **The one place the status line is cleaned**, so `vast ls`, `vast watch`, the boot
+    /// watchdog and both GUIs render the same words.
+    pub fn status_note(&self) -> Option<String> {
+        let msg = self.status_msg.as_deref()?;
+        let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+        if flat.is_empty() {
+            None
+        } else {
+            Some(flat)
+        }
+    }
+
+    /// Whether the status line reads like a host-side failure.
+    ///
+    /// A heuristic, deliberately conservative: it gates *saying more* (surfacing the line,
+    /// counting towards a stuck-boot verdict), never *destroying anything*. The R1 lemon sat
+    /// in `loading` forever while `status_msg` said `error creating task for container` —
+    /// this predicate is what lets a watcher call that dead instead of pending.
+    pub fn status_looks_fatal(&self) -> bool {
+        let Some(note) = self.status_note() else {
+            return false;
+        };
+        let lower = note.to_ascii_lowercase();
+        ["error", "fail", "unable", "cannot", "no such", "denied"]
+            .iter()
+            .any(|marker| lower.contains(marker))
     }
 
     /// `exited | offline | unknown` are TERMINAL — they never reach running, and a watchdog
@@ -426,6 +482,42 @@ pub enum LedgerState {
     OrphanSuspect,
     /// Startup reconciliation matched this row against the live fleet.
     Reconciled,
+    /// Stopped on purpose: GPUs released, disk held and **still billing** storage. A parked
+    /// instance stays in `Ledger::active()` — parking is not forgetting.
+    Parked,
+}
+
+/// A remembered verdict on a physical host.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FavoriteVerdict {
+    /// Proven good: rent it again.
+    Star,
+    /// Burned: never auto-pick it, warn when named explicitly.
+    Skull,
+}
+
+/// One row of `$STATE/favorites.json`.
+///
+/// Keyed on **`machine_id`**, never on an offer id: several hosts re-mint ask ids per
+/// search snapshot (GARDEN-RUNS.md, R4), so an offer id names a listing, not a machine.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FavoriteHost {
+    /// The physical machine.
+    pub machine_id: u64,
+    /// Star or skull.
+    pub verdict: FavoriteVerdict,
+    /// Why, in the operator's words (`"flawless through R1/R1b"`, `"containerd disk death"`).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// GPU model at the time of the verdict, for recognisability.
+    #[serde(default)]
+    pub gpu_name: Option<String>,
+    /// Location at the time of the verdict.
+    #[serde(default)]
+    pub geolocation: Option<String>,
+    /// Unix seconds.
+    pub added_at_unix: i64,
 }
 
 /// What the surfaces send to rent a box.
@@ -539,7 +631,10 @@ mod tests {
         let inst = |status: Option<&str>| VastInstance {
             id: InstanceId(1),
             actual_status: status.map(str::to_owned),
+            intended_status: None,
             status_msg: None,
+            machine_id: None,
+            storage_cost: None,
             ssh_host: None,
             ssh_port: None,
             public_ipaddr: None,
@@ -562,6 +657,9 @@ mod tests {
         assert_eq!(inst(Some("created")).phase(), BootPhase::Provisioning);
         assert_eq!(inst(Some("loading")).phase(), BootPhase::Pulling);
         assert_eq!(inst(Some("running")).phase(), BootPhase::Healthy);
+        // Stopped is parked, never destroyed: the disk is held and still billing.
+        assert_eq!(inst(Some("stopped")).phase(), BootPhase::Parked);
+        assert_eq!(inst(Some("inactive")).phase(), BootPhase::Parked);
         assert!(matches!(
             inst(Some("exited")).phase(),
             BootPhase::Failed { .. }
@@ -575,9 +673,39 @@ mod tests {
         for terminal in ["exited", "offline", "unknown", " EXITED "] {
             assert!(inst(Some(terminal)).is_terminal(), "{terminal}");
         }
-        for live in ["running", "loading", "created"] {
+        for live in ["running", "loading", "created", "stopped"] {
             assert!(!inst(Some(live)).is_terminal(), "{live}");
         }
+    }
+
+    #[test]
+    fn the_status_note_is_flattened_and_the_fatal_heuristic_reads_it() {
+        let with_msg = |msg: Option<&str>| -> VastInstance {
+            serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "actual_status": "loading",
+                "status_msg": msg,
+            }))
+            .expect("de")
+        };
+        assert_eq!(with_msg(None).status_note(), None);
+        assert_eq!(with_msg(Some("  \n ")).status_note(), None);
+        assert_eq!(
+            with_msg(Some("Error response from daemon:\n  failed to create task")).status_note(),
+            Some("Error response from daemon: failed to create task".to_owned())
+        );
+
+        // The R1 lemon's actual words must read as fatal.
+        assert!(with_msg(Some(
+            "error creating task for container: read /var/lib/containerd/io.containerd.meta.db: \
+             input/output error"
+        ))
+        .status_looks_fatal());
+        assert!(with_msg(Some("Unable to find image locally")).status_looks_fatal());
+        // Routine progress must not.
+        assert!(!with_msg(Some("Successfully pulled image")).status_looks_fatal());
+        assert!(!with_msg(Some("Extracting layers 4/9")).status_looks_fatal());
+        assert!(!with_msg(None).status_looks_fatal());
     }
 
     #[test]

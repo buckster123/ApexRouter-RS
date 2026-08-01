@@ -454,7 +454,18 @@ impl Check for VastCredit {
 
 /// Dollars per hour every live instance is costing right now.
 pub fn burn_per_hour(live: &[VastInstance]) -> f64 {
-    live.iter().filter_map(|i| i.dph_total).sum()
+    live.iter()
+        // A parked box bills storage, not GPUs; a destroyed one bills nothing. Folding
+        // either into the hourly burn overstates the number the operator watches most.
+        .filter(|i| {
+            !matches!(
+                i.phase(),
+                apexrouter_protocol::BootPhase::Parked | apexrouter_protocol::BootPhase::Destroyed
+            )
+        })
+        .filter_map(|i| i.dph_total)
+        .filter(|d| d.is_finite())
+        .sum()
 }
 
 /// Turn a balance and a burn rate into a verdict. Pure, so the thresholds are testable.
@@ -1295,6 +1306,9 @@ mod tests {
         }
         async fn instance(&self, id: InstanceId) -> Result<Option<VastInstance>> {
             Ok(self.instances.iter().find(|i| i.id == id).cloned())
+        }
+        async fn set_target_state(&self, _id: InstanceId, _running: bool) -> Result<()> {
+            unreachable!("no test may park or wake an instance")
         }
         async fn destroy(&self, _id: InstanceId) -> Result<()> {
             unreachable!("no test may destroy an instance")

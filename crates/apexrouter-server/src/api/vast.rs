@@ -40,13 +40,13 @@ use apexrouter_core::ledger::Ledger;
 use apexrouter_core::money::{ApprovalError, ApprovalSource, SpendApproval};
 use apexrouter_protocol::{
     AlertLevel, ApprovalRequest, CheckResult, CostEstimate, DownloadHealth, ErrorBody,
-    ErrorEnvelope, Event, InstanceId, JobId, JobRecord, LedgerRow, LedgerState, Money, OfferQuery,
-    OfferSearchResult, PriceSource, ProfileId, RentRequest, TunnelSpec, TunnelStatus, VastAccount,
-    VastInstance,
+    ErrorEnvelope, Event, FavoriteHost, FavoriteVerdict, InstanceId, JobId, JobRecord, LedgerRow,
+    LedgerState, Money, OfferQuery, OfferSearchResult, PriceSource, ProfileId, RentRequest,
+    TunnelSpec, TunnelStatus, VastAccount, VastInstance,
 };
 use apexrouter_providers::vast::{
-    gpu_name_vocabulary, restart_download, sample_download, search_unified, watch_boot,
-    QueryOverrides, VastApi,
+    constraint_failures, gpu_name_vocabulary, profile_to_query, restart_download, sample_download,
+    search_unified, watch_boot, QueryOverrides, VastApi,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -91,8 +91,15 @@ pub fn router() -> axum::Router<Arc<AppState>> {
             "/v1/vast/instances/{id}/tunnel",
             post(tunnel_up).delete(tunnel_down),
         )
+        .route("/v1/vast/instances/{id}/park", post(park_instance))
+        .route("/v1/vast/instances/{id}/wake", post(wake_instance))
         .route("/v1/vast/instances/{id}/diagnose", get(diagnose_instance))
         .route("/v1/tunnels", get(list_tunnels))
+        .route("/v1/vast/favorites", get(list_favorites))
+        .route(
+            "/v1/vast/favorites/{machine_id}",
+            axum::routing::put(put_favorite).delete(delete_favorite),
+        )
         .route("/v1/approvals", get(list_approvals))
         .route("/v1/approvals/{id}/grant", post(grant_approval))
         .route("/v1/approvals/{id}/deny", post(deny_approval))
@@ -168,6 +175,17 @@ pub enum OfferSearchBody {
     Profile {
         /// Which profile.
         profile: ProfileId,
+        /// An explicit offer to re-check **by constraints**. When it is not in the
+        /// profile's price-ordered window, it is fetched by id and judged against the
+        /// profile's actual floors — membership in a top-N-by-price list is not a
+        /// constraint, and treating it as one made a compliant machine unrentable
+        /// (GARDEN-RUNS.md, R4).
+        #[serde(default)]
+        offer_id: Option<u64>,
+        /// Scope the search to one physical machine (`{"machine_id": {"eq": N}}` upstream).
+        /// Machine ids are stable where ask ids re-mint; this is how a ★ host is re-found.
+        #[serde(default)]
+        machine_id: Option<u64>,
     },
     /// A whole [`OfferQuery`], for the browser's re-query button.
     Query(Box<OfferQuery>),
@@ -255,7 +273,11 @@ pub async fn search_offers(
     let api = require_vast()?;
     let result = match body {
         OfferSearchBody::Query(q) => api.search(&q).await.map_err(ApiError::from)?,
-        OfferSearchBody::Profile { profile } => {
+        OfferSearchBody::Profile {
+            profile,
+            offer_id,
+            machine_id,
+        } => {
             let paths = s.paths.clone();
             let wanted = profile.clone();
             let found = tokio::task::spawn_blocking(move || catalog::load(&paths))
@@ -269,12 +291,136 @@ pub async fn search_offers(
                     ApiError::not_found(format!("no search profile `{profile}`"))
                         .with_param("profile")
                 })?;
-            search_unified(api.as_ref(), &found, &QueryOverrides::default())
+            let mut overrides = QueryOverrides::default();
+            if let Some(m) = machine_id {
+                overrides
+                    .extra
+                    .insert("machine_id".to_owned(), serde_json::json!({"eq": m}));
+            }
+            let mut result = search_unified(api.as_ref(), &found, &overrides)
                 .await
-                .map_err(ApiError::from)?
+                .map_err(ApiError::from)?;
+            if let Some(oid) = offer_id {
+                if !result.offers.iter().any(|o| o.id == oid) {
+                    let strict = profile_to_query(&found, &overrides);
+                    let offer = fetch_offer_by_id(api.as_ref(), oid).await?;
+                    let fails = constraint_failures(&strict, &offer);
+                    if fails.is_empty() {
+                        // The only thing "wrong" with it was losing a price contest.
+                        result.relaxations.push(format!(
+                            "offer {oid} is outside `{profile}`'s top-{} by price; every \
+                             constraint checks out",
+                            strict.limit
+                        ));
+                        result.offers.push(offer);
+                    } else {
+                        return Err(ApiError::conflict(format!(
+                            "offer {oid} does not satisfy `{profile}`: {}",
+                            fails.join("; ")
+                        ))
+                        .with_param("offer_id"));
+                    }
+                }
+            }
+            apply_favorites(&s, &mut result, offer_id.is_some() || machine_id.is_some());
+            result
         }
     };
     Ok(Json(result))
+}
+
+/// Fold the operator's host verdicts into a search result.
+///
+/// On an anonymous profile search, offers on a burned machine are **dropped** with a
+/// banner naming them — "auto — cheapest" must never rent the containerd-corpse host that
+/// relists at the lowest price (GARDEN-RUNS.md, ☠ offer 45761361). When the operator
+/// *named* an offer or pinned a machine, nothing is dropped: their explicit choice wins,
+/// with the verdict echoed as a warning banner instead.
+fn apply_favorites(s: &Arc<AppState>, result: &mut OfferSearchResult, explicit: bool) {
+    let favorites = s.store.load_favorites().unwrap_or_default();
+    let burned: HashMap<u64, &FavoriteHost> = favorites
+        .iter()
+        .filter(|f| f.verdict == FavoriteVerdict::Skull)
+        .map(|f| (f.machine_id, f))
+        .collect();
+    if burned.is_empty() {
+        return;
+    }
+    if explicit {
+        for o in &result.offers {
+            if let Some(f) = o.machine_id.and_then(|m| burned.get(&m)) {
+                result.relaxations.push(format!(
+                    "offer {} is on burned machine {}{} — renting it anyway is your call",
+                    o.id,
+                    f.machine_id,
+                    f.note
+                        .as_deref()
+                        .map(|n| format!(" ({n})"))
+                        .unwrap_or_default()
+                ));
+            }
+        }
+        return;
+    }
+    let mut excluded: Vec<u64> = Vec::new();
+    result.offers.retain(|o| match o.machine_id {
+        Some(m) if burned.contains_key(&m) => {
+            excluded.push(m);
+            false
+        }
+        _ => true,
+    });
+    if !excluded.is_empty() {
+        excluded.sort_unstable();
+        excluded.dedup();
+        result.relaxations.push(format!(
+            "excluded {} offer(s) on burned machine(s) {excluded:?}",
+            excluded.len()
+        ));
+    }
+}
+
+/// One offer by id, through the same search endpoint (`{"id": {"eq": N}}` upstream).
+///
+/// A miss is a `404` that explains the re-mint behaviour: several hosts re-issue ask ids
+/// per search snapshot, so "gone" usually means "renamed", and `--auto` or `--machine`
+/// is the answer, not a retry of the dead id.
+async fn fetch_offer_by_id(
+    api: &dyn VastApi,
+    offer_id: u64,
+) -> Result<apexrouter_protocol::Offer, ApiError> {
+    let mut probe = OfferQuery {
+        gpu_names: Vec::new(),
+        num_gpus_min: 1,
+        num_gpus_max: 64,
+        max_dph: None,
+        min_reliability: None,
+        min_inet_down: None,
+        min_disk_gb: None,
+        min_cuda: None,
+        geo: apexrouter_protocol::GeoFilter::Any,
+        verified: None,
+        limit: 4,
+        order: Vec::new(),
+        extra: serde_json::Map::new(),
+    };
+    probe
+        .extra
+        .insert("id".to_owned(), serde_json::json!({"eq": offer_id}));
+    api.search(&probe)
+        .await
+        .map_err(ApiError::from)?
+        .offers
+        .into_iter()
+        .find(|o| o.id == offer_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "offer {offer_id} no longer exists — several hosts re-mint ask ids per \
+                 search snapshot; re-run the search, rent with `--auto`, or pin the host \
+                 with `--machine <machine_id>`"
+            ))
+            .with_param("offer_id")
+        })
 }
 
 /// `GET /v1/vast/instances` — the whole rented fleet, plus a credit re-read broadcast to
@@ -283,6 +429,9 @@ pub async fn list_instances(State(s): State<Arc<AppState>>) -> ApiResult<Vec<Vas
     let api = require_vast()?;
     let instances = api.instances().await.map_err(ApiError::from)?;
     let credit = api.account().await.ok().map(|a| a.credit);
+    // A fresh read feeds the snapshot's cache too — the Fleet & cost page must never show
+    // less than the surface that asked.
+    s.update_fleet(instances.clone(), credit);
     super::emit(
         &s,
         Event::VastFleetChanged {
@@ -385,12 +534,114 @@ pub async fn rent(
         h.progress(Some(5.0), "reserving before billing");
         let id = apexrouter_providers::vast::rent(api.as_ref(), &ledger, &req, approval, &state.tx)
             .await?;
-        h.progress(Some(40.0), format!("instance {} created; booting", id.0));
+        h.progress(Some(30.0), format!("instance {} created; booting", id.0));
         let phase = watch_boot(api.as_ref(), id, max_boot, &state.tx).await?;
-        h.progress(Some(100.0), format!("{phase:?}"));
+        if phase != apexrouter_protocol::BootPhase::Healthy {
+            crate::fleet::poll_once(&state).await;
+            h.progress(Some(100.0), format!("{phase:?}"));
+            return Ok(serde_json::json!({ "instance_id": id, "phase": phase }));
+        }
+
+        // ---- the box is up; finish the chain the request asked for ---------------------
+        //
+        // `auto_tunnel` and `bind_alias` were write-only for a full release: the job ended
+        // right here and the operator hand-ran tunnel/backend/route while a healthy box
+        // billed (GARDEN-RUNS.md, R4 "rentals never feed daemon state"). Every step below
+        // acts against a billing machine, so a failure alerts with the manual command and
+        // fails the job loudly — the box itself is deliberately left alone.
+        let mut tunnel: Option<TunnelSpec> = None;
+        if req.auto_tunnel && !req.launch.expose_public {
+            h.progress(Some(60.0), "opening the ssh tunnel");
+            match ensure_tunnel(&state, api.as_ref(), id, None, None).await {
+                Ok(status) => tunnel = Some(status.spec),
+                Err(e) => {
+                    let why = e.body.message.clone();
+                    let fix = format!("apexrouter tunnel up {}", id.0);
+                    state.alert(
+                        AlertLevel::Serious,
+                        &format!("vast.rent.tunnel.{}", id.0),
+                        format!(
+                            "instance {} is healthy and BILLING but its tunnel failed \
+                             ({why}); run `{fix}`",
+                            id.0
+                        ),
+                    );
+                    anyhow::bail!(
+                        "instance {} is up (and billing) but the tunnel failed: {why}; \
+                         run `{fix}` and bind the route by hand",
+                        id.0
+                    );
+                }
+            }
+        }
+
+        h.progress(Some(80.0), "registering the backend");
+        let inst = api.instance(id).await?.ok_or_else(|| {
+            anyhow::anyhow!("instance {} vanished right after becoming healthy", id.0)
+        })?;
+        let spec = apexrouter_protocol::VastSpec {
+            instance_id: id,
+            runtime: req.launch.runtime,
+            launch: req.launch.clone(),
+            tunnel,
+        };
+        let local_port = spec.tunnel.as_ref().map(|t| t.local_port);
+        let backend = apexrouter_providers::vast::rented_backend(&inst, &spec)?;
+        let backend_id = backend.id.clone();
+        let base_url = backend.base_url.clone();
+        state
+            .store
+            .put_endpoint(&apexrouter_protocol::EndpointRecord {
+                id: backend_id.clone(),
+                spec: apexrouter_protocol::EndpointSpec::Vast(spec),
+                desired: apexrouter_protocol::DesiredState::Running,
+                proc: None,
+                port: local_port,
+                log_path: None,
+                started_at_unix: now_unix(),
+                fit: None,
+                adopted: false,
+                alias_bindings: req.bind_alias.iter().cloned().collect(),
+            })?;
+        // `register_started`, not `register_backend`: a fresh rental must arm the
+        // registry entry even if a drained corpse once held the same id.
+        crate::api::register_started(&state, backend);
+
+        let mut bound = None;
+        if let Some(alias) = &req.bind_alias {
+            h.progress(Some(95.0), format!("binding alias `{alias}`"));
+            match crate::api::bind_alias(&state, alias, &backend_id) {
+                Ok(_) => bound = Some(alias.clone()),
+                Err(report) => {
+                    let why = crate::api::render_issues(&report);
+                    state.alert(
+                        AlertLevel::Serious,
+                        &format!("vast.rent.alias.{}", id.0),
+                        format!(
+                            "instance {} is routable as `{backend_id}` but binding alias \
+                             `{alias}` failed: {why}",
+                            id.0
+                        ),
+                    );
+                    anyhow::bail!(
+                        "instance {} is routable as `{backend_id}` but binding alias \
+                         `{alias}` failed: {why}; fix with `apexrouter route set {alias} \
+                         --target {backend_id}`",
+                        id.0
+                    );
+                }
+            }
+        }
+
+        crate::fleet::poll_once(&state).await;
+        h.progress(Some(100.0), "healthy and wired");
         Ok::<_, anyhow::Error>(serde_json::json!({
             "instance_id": id,
             "phase": phase,
+            "backend": backend_id,
+            "base_url": base_url,
+            "tunnel_local_port": local_port,
+            "alias": bound,
         }))
     });
     Ok((StatusCode::ACCEPTED, Json(job)).into_response())
@@ -500,6 +751,7 @@ pub async fn destroy(
     }
     let fleet = api.instances().await.unwrap_or_default();
     let credit = api.account().await.ok().map(|a| a.credit);
+    s.update_fleet(fleet.clone(), credit);
     super::emit(
         &s,
         Event::VastFleetChanged {
@@ -637,24 +889,38 @@ pub async fn tunnel_up(
     Query(q): Query<TunnelQuery>,
 ) -> ApiResult<TunnelStatus> {
     let api = require_vast()?;
-    let tunnels = require_tunnels()?;
     let id = parse_instance(&id)?;
-    let (host, port) = ssh_endpoint(api.as_ref(), id).await?;
+    Ok(Json(
+        ensure_tunnel(&s, api.as_ref(), id, q.local_port, q.remote_port).await?,
+    ))
+}
+
+/// Bring the instance's tunnel up (idempotent) and persist it — the **one** implementation
+/// behind the `POST …/tunnel` route and the rent job's `auto_tunnel` step.
+pub(crate) async fn ensure_tunnel(
+    s: &Arc<AppState>,
+    api: &dyn VastApi,
+    id: InstanceId,
+    local_port: Option<u16>,
+    remote_port: Option<u16>,
+) -> Result<TunnelStatus, ApiError> {
+    let tunnels = require_tunnels()?;
+    let (host, port) = ssh_endpoint(api, id).await?;
 
     let existing = s.store.load_tunnels().map_err(ApiError::from)?;
     if let Some(up) = existing.iter().find(|t| t.spec.instance_id == id) {
         if up.up {
-            return Ok(Json(up.clone()));
+            return Ok(up.clone());
         }
     }
 
     let spec = TunnelSpec {
         instance_id: id,
-        local_port: match q.local_port {
+        local_port: match local_port {
             Some(p) => p,
-            None => next_local_port(&s, &existing)?,
+            None => next_local_port(s, &existing)?,
         },
-        remote_port: q.remote_port.unwrap_or(CONTAINER_PORT),
+        remote_port: remote_port.unwrap_or(CONTAINER_PORT),
         ssh_host: host,
         ssh_port: port,
     };
@@ -666,7 +932,7 @@ pub async fn tunnel_up(
         .collect();
     all.push(status.clone());
     s.store.save_tunnels(&all).map_err(ApiError::from)?;
-    Ok(Json(status))
+    Ok(status)
 }
 
 /// `DELETE /v1/vast/instances/{id}/tunnel` — kill the child, `ssh -O exit`, unlink the
@@ -686,6 +952,216 @@ pub async fn tunnel_down(
         .filter(|t| t.spec.instance_id != id)
         .collect();
     s.store.save_tunnels(&all).map_err(ApiError::from)?;
+    Ok(Json(all))
+}
+
+// ----------------------------------------------------------------------------------------
+// park and wake
+// ----------------------------------------------------------------------------------------
+
+/// `POST /v1/vast/instances/{id}/park` — stop the box, keep the disk.
+///
+/// No `confirm` gate: parking *reduces* spend, and the stop button must never be hard to
+/// find. The answer carries the weekly disk figure so every surface can render what the
+/// held disk keeps costing.
+pub async fn park_instance(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let api = require_vast()?;
+    let id = parse_instance(&id)?;
+    let ledger = Ledger::open(&s.paths).map_err(ApiError::from)?;
+    let cfg = s.cfg();
+
+    let parked = apexrouter_providers::vast::park(
+        api.as_ref(),
+        &ledger,
+        id,
+        &s.tx,
+        DESTROY_VERIFY_SECS,
+        cfg.vast.poll_min_ms,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    crate::fleet::poll_once(&s).await;
+    Ok(Json(serde_json::json!({
+        "instance_id": id,
+        "phase": parked.phase(),
+        "disk_gb": parked.disk_space,
+        "weekly_disk_usd": apexrouter_providers::vast::weekly_disk_usd(&parked),
+    }))
+    .into_response())
+}
+
+/// `POST /v1/vast/instances/{id}/wake?confirm=true` — restart a parked box.
+///
+/// **Resumes the hourly bill**, so it is gated exactly like a rent: without
+/// `?confirm=true` the answer is a `409` carrying the instance's rate and the credit; with
+/// it, the instance's live `dph_total` goes through `SpendApproval::confirm` (daemon
+/// ceiling, human gate, credit) before any state changes. Answers `202` with a job — a
+/// wake is a boot, and boots take minutes.
+pub async fn wake_instance(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<RentQuery>,
+    Query(c): Query<ConfirmQuery>,
+) -> Result<Response, ApiError> {
+    let api = require_vast()?;
+    let id = parse_instance(&id)?;
+    let cfg = s.cfg();
+    let instance = api
+        .instance(id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("no instance {}", id.0)).with_param("id"))?;
+    let dph = instance
+        .dph_total
+        .unwrap_or(cfg.vast.max_usd_per_hour_ceiling);
+    let credit = api.account().await.ok().map(|a| a.credit);
+
+    if !c.confirm.unwrap_or(false) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": ErrorBody {
+                    kind: "confirmation_required".to_owned(),
+                    message: format!(
+                        "waking instance {} resumes billing at ${dph:.4}/hr — re-send \
+                         with ?confirm=true",
+                        id.0
+                    ),
+                    param: Some("confirm".to_owned()),
+                    code: None,
+                },
+                "instance_id": id,
+                "dph_total": instance.dph_total,
+                "credit": credit,
+                "burn_down_hours": credit.filter(|_| dph > 0.0).map(|c| c / dph),
+            })),
+        )
+            .into_response());
+    }
+
+    let source = approval_source(&s, &q);
+    let approval = SpendApproval::confirm(Money::from_usd(dph), source, &cfg.vast, credit)
+        .map_err(|e| ApiError::conflict(e.to_string()))?;
+
+    let ledger = Ledger::open(&s.paths).map_err(ApiError::from)?;
+    let state = Arc::clone(&s);
+    let max_boot = cfg.vast.max_boot_secs;
+    let poll_min = cfg.vast.poll_min_ms;
+    let job = s.jobs.spawn_with("vast.wake", move |h| async move {
+        h.progress(Some(10.0), format!("starting instance {}", id.0));
+        apexrouter_providers::vast::wake(
+            api.as_ref(),
+            &ledger,
+            id,
+            approval,
+            &state.tx,
+            max_boot,
+            poll_min,
+        )
+        .await?;
+
+        // The persisted tunnel, if this box had one, needs its forward re-established
+        // against the (possibly re-mapped) ssh port.
+        let mut local_port = None;
+        let had_tunnel = state
+            .store
+            .load_tunnels()
+            .ok()
+            .and_then(|all| all.into_iter().find(|t| t.spec.instance_id == id));
+        if let Some(t) = had_tunnel {
+            h.progress(Some(80.0), "re-establishing the tunnel");
+            match ensure_tunnel(&state, api.as_ref(), id, Some(t.spec.local_port), None).await {
+                Ok(status) => local_port = Some(status.spec.local_port),
+                Err(e) => {
+                    let why = e.body.message.clone();
+                    state.alert(
+                        AlertLevel::Serious,
+                        &format!("vast.wake.tunnel.{}", id.0),
+                        format!(
+                            "instance {} is awake and BILLING but its tunnel failed \
+                             ({why}); run `apexrouter tunnel up {}`",
+                            id.0, id.0
+                        ),
+                    );
+                    anyhow::bail!(
+                        "instance {} is awake (and billing) but the tunnel failed: {why}",
+                        id.0
+                    );
+                }
+            }
+        }
+
+        crate::fleet::poll_once(&state).await;
+        h.progress(Some(100.0), "awake");
+        Ok::<_, anyhow::Error>(serde_json::json!({
+            "instance_id": id,
+            "phase": apexrouter_protocol::BootPhase::Healthy,
+            "tunnel_local_port": local_port,
+        }))
+    });
+    Ok((StatusCode::ACCEPTED, Json(job)).into_response())
+}
+
+// ----------------------------------------------------------------------------------------
+// favorites
+// ----------------------------------------------------------------------------------------
+
+/// Body of `PUT /v1/vast/favorites/{machine_id}`.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FavoriteBody {
+    /// Star or skull.
+    pub verdict: FavoriteVerdict,
+    /// Why, in the operator's words.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// GPU model, for recognisability in the list.
+    #[serde(default)]
+    pub gpu_name: Option<String>,
+    /// Location, same reason.
+    #[serde(default)]
+    pub geolocation: Option<String>,
+}
+
+/// `GET /v1/vast/favorites` — every remembered host verdict, from `$STATE/favorites.json`.
+pub async fn list_favorites(State(s): State<Arc<AppState>>) -> ApiResult<Vec<FavoriteHost>> {
+    Ok(Json(s.store.load_favorites().map_err(ApiError::from)?))
+}
+
+/// `PUT /v1/vast/favorites/{machine_id}` — record or update one verdict. Idempotent upsert:
+/// a machine that turned out to be a lemon overwrites its old star.
+pub async fn put_favorite(
+    State(s): State<Arc<AppState>>,
+    Path(machine_id): Path<u64>,
+    Json(body): Json<FavoriteBody>,
+) -> ApiResult<FavoriteHost> {
+    let row = FavoriteHost {
+        machine_id,
+        verdict: body.verdict,
+        note: body.note,
+        gpu_name: body.gpu_name,
+        geolocation: body.geolocation,
+        added_at_unix: now_unix(),
+    };
+    let mut all = s.store.load_favorites().map_err(ApiError::from)?;
+    all.retain(|f| f.machine_id != machine_id);
+    all.push(row.clone());
+    all.sort_by_key(|f| f.machine_id);
+    s.store.save_favorites(&all).map_err(ApiError::from)?;
+    Ok(Json(row))
+}
+
+/// `DELETE /v1/vast/favorites/{machine_id}` — forget one verdict. Idempotent.
+pub async fn delete_favorite(
+    State(s): State<Arc<AppState>>,
+    Path(machine_id): Path<u64>,
+) -> ApiResult<Vec<FavoriteHost>> {
+    let mut all = s.store.load_favorites().map_err(ApiError::from)?;
+    all.retain(|f| f.machine_id != machine_id);
+    s.store.save_favorites(&all).map_err(ApiError::from)?;
     Ok(Json(all))
 }
 
@@ -1019,19 +1495,41 @@ fn accrued_cost(i: &VastInstance) -> CostEstimate {
 }
 
 /// The instance's ssh endpoint, or a `409` explaining that it is not up yet.
+///
+/// **Direct `host:port` first, the `sshN.vast.ai` proxy as the fallback.** Every create
+/// requests `runtype ssh_direc ssh_proxy`, so most boxes map container port 22 to a direct
+/// host port — and on some hosts the proxy's reverse listener simply never binds (endless
+/// port-29448 failures on the R4 box; GARDEN-RUNS.md calls direct-port the CN doctrine).
+/// The proxy is a shared bastion; the direct port is the box itself.
 async fn ssh_endpoint(api: &dyn VastApi, id: InstanceId) -> Result<(String, u16), ApiError> {
     let instance = api
         .instance(id)
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found(format!("no instance {}", id.0)).with_param("id"))?;
-    match (instance.ssh_host.clone(), instance.ssh_port) {
-        (Some(host), Some(port)) => Ok((host, port)),
-        _ => Err(ApiError::conflict(format!(
+    ssh_target(&instance).ok_or_else(|| {
+        ApiError::conflict(format!(
             "instance {} has no ssh endpoint yet (status {})",
             id.0,
             instance.actual_status.as_deref().unwrap_or("unknown")
-        ))),
+        ))
+    })
+}
+
+/// Direct `ip:port` when the row maps container port 22, the proxy otherwise.
+fn ssh_target(instance: &VastInstance) -> Option<(String, u16)> {
+    if let Some((host, port)) = instance.external_port(22) {
+        tracing::debug!(
+            instance = instance.id.0,
+            host,
+            port,
+            "ssh via the direct port"
+        );
+        return Some((host, port));
+    }
+    match (instance.ssh_host.clone(), instance.ssh_port) {
+        (Some(host), Some(port)) => Some((host, port)),
+        _ => None,
     }
 }
 
@@ -1170,6 +1668,18 @@ mod tests {
             Self: 'async_trait,
         {
             Box::pin(async move { Ok(None) })
+        }
+
+        fn set_target_state<'life0, 'async_trait>(
+            &'life0 self,
+            _id: InstanceId,
+            _running: bool,
+        ) -> Pin<Box<dyn Future<Output = CoreResult<()>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            panic!("MONEY: no test in this unit may reach a park/wake call");
         }
 
         fn destroy<'life0, 'async_trait>(
@@ -1533,5 +2043,33 @@ mod tests {
             matches!(accrued_cost(&billing), CostEstimate::Approximate { .. }),
             "a derived number is always labelled as one"
         );
+    }
+
+    #[test]
+    fn ssh_prefers_the_direct_port_and_falls_back_to_the_proxy() {
+        // The R4 box: proxy reverse listener never bound; `ssh -p 4013 root@129.204.7.16`
+        // (the 22/tcp mapping) is what actually worked. Direct wins when mapped.
+        let both: VastInstance = serde_json::from_value(serde_json::json!({
+            "id": 46509449,
+            "ssh_host": "ssh5.vast.ai", "ssh_port": 41234,
+            "public_ipaddr": "129.204.7.16",
+            "ports": {"22/tcp": [{"HostIp": "0.0.0.0", "HostPort": "4013"}]}
+        }))
+        .expect("de");
+        assert_eq!(ssh_target(&both), Some(("129.204.7.16".to_owned(), 4013)));
+
+        // No direct mapping: the proxy path still works.
+        let proxy_only: VastInstance = serde_json::from_value(serde_json::json!({
+            "id": 1, "ssh_host": "ssh5.vast.ai", "ssh_port": 41234
+        }))
+        .expect("de");
+        assert_eq!(
+            ssh_target(&proxy_only),
+            Some(("ssh5.vast.ai".to_owned(), 41234))
+        );
+
+        // Neither yet: the caller renders "not up yet", not a panic.
+        let bare: VastInstance = serde_json::from_str(r#"{"id": 1}"#).expect("de");
+        assert_eq!(ssh_target(&bare), None);
     }
 }

@@ -453,6 +453,12 @@ pub trait VastApi: Send + Sync {
     async fn instances(&self) -> Result<Vec<VastInstance>>;
     /// One instance, or `None` when it is gone.
     async fn instance(&self, id: InstanceId) -> Result<Option<VastInstance>>;
+    /// `PUT /instances/{id}/` with `{"state": "stopped" | "running"}` — park and wake.
+    ///
+    /// Stopping releases the GPUs and keeps billing the disk; starting resumes the hourly
+    /// bill, **which is why the callers gate it behind a `SpendApproval`**. The caller
+    /// verifies the state change happened; vast accepting the PUT is not the same thing.
+    async fn set_target_state(&self, id: InstanceId, running: bool) -> Result<()>;
     /// `DELETE`. The caller **verifies before forgetting**.
     async fn destroy(&self, id: InstanceId) -> Result<()>;
     /// `PUT /api/v0/instances/request_logs/{id}/`, then the two-phase `result_url` poll.
@@ -522,6 +528,18 @@ impl VastApi for VastApiHttp {
             .or_else(|| rows.into_iter().next()))
     }
 
+    async fn set_target_state(&self, id: InstanceId, running: bool) -> Result<()> {
+        let path = format!("/instances/{id}/");
+        let mut body = Map::new();
+        body.insert(
+            "state".to_owned(),
+            Value::String(if running { "running" } else { "stopped" }.to_owned()),
+        );
+        self.send(Method::PUT, &path, Some(Value::Object(body)))
+            .await
+            .map(|_| ())
+    }
+
     async fn destroy(&self, id: InstanceId) -> Result<()> {
         let path = format!("/instances/{id}/");
         let res = self
@@ -582,6 +600,8 @@ pub enum FixtureCall {
     Instances,
     /// `instance()`.
     Instance(InstanceId),
+    /// `set_target_state()` — `true` is a wake, `false` a park.
+    SetTargetState(InstanceId, bool),
     /// `destroy()`.
     Destroy(InstanceId),
     /// `logs()`.
@@ -978,6 +998,17 @@ impl VastApi for FixtureVast {
             }
         });
         Ok(self.read(|s| s.instances.iter().find(|i| i.id == id).cloned()))
+    }
+
+    async fn set_target_state(&self, id: InstanceId, running: bool) -> Result<()> {
+        self.mutate(|s| {
+            s.calls.push(FixtureCall::SetTargetState(id, running));
+            if let Some(inst) = s.instances.iter_mut().find(|i| i.id == id) {
+                inst.actual_status = Some(if running { "running" } else { "stopped" }.to_owned());
+                inst.intended_status = Some(if running { "running" } else { "stopped" }.to_owned());
+            }
+        });
+        Ok(())
     }
 
     async fn destroy(&self, id: InstanceId) -> Result<()> {

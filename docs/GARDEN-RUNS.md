@@ -407,3 +407,45 @@ Sixth pkill act: the kill pattern and the relaunch text must not share a command
 **Economics:** park-don't-destroy measured across our five hosts at **$0.12-0.19/GB/mo**
 → $3-6/week holds 100-150 GB of models + builds. `vast park`/`wake` verb pair filed
 (stop reserves disk, not GPUs — restart contends). This box parks tonight per operator.
+
+---
+
+## mk1.1 — the campaign's defect list, closed — 2026-08-02
+
+Every tooling defect this ledger filed with a reproduction is fixed, tested and
+live-proven on the running daemon (CHARTER amendment 2026-08-02 records the decisions):
+
+1. **The rent job finishes the chain.** `auto_tunnel`/`bind_alias` were write-only; the
+   job now runs rent → boot → tunnel → endpoint record → backend → alias, and a failure
+   after "healthy" alerts with the manual command instead of failing silently while the
+   box bills. `rented_backend()` is the one constructor both the job and `Provisioner::up`
+   build the row with.
+2. **The Fleet & cost page no longer blanks.** `Snapshot.instances` serves a fleet cache
+   (`AppState::fleet`) fed by a poller (`[providers.vast] fleet_poll_secs`, default 60)
+   and by every handler that reads the fleet; totals carry live credit, parked-aware burn
+   and burn-down. Verified live: instance 46509449 in `GET /v1/snapshot` with machine_id.
+3. **`status_msg` is surfaced, and a repeating fatal line is death.** The boot watchdog
+   streams changed status lines as instance log events (`watch` prints them), and an
+   identical fatal-looking line repeating 120 s with no phase advance gets the expire
+   treatment instead of burning the boot budget. The R1 lemon dies in 2 minutes now.
+   `ls`'s NOTE shows progress chatter while booting and errors always — one helper pair
+   on `VastInstance` (`status_note`/`status_looks_fatal`) feeds every surface.
+4. **The pre-check tests constraints, not price-window membership.** A named offer
+   outside the profile's top-N is fetched by id and judged by `constraint_failures()`,
+   which names what actually failed; `--machine <machine_id>` pins a host through the
+   re-mint churn (server-side `{"machine_id": {"eq": N}}`).
+5. **SSH prefers the direct port.** `ssh_endpoint` reads the 22/tcp mapping
+   (`ip:port`) before falling back to the `sshN.vast.ai` proxy — the CN doctrine, now
+   the default for tunnels, diagnose and restart-download alike.
+6. **Favorites are real.** `$STATE/favorites.json` keyed `machine_id`; `vast star|unstar|
+   favorites`; ★/☠ + MACHINE + CPU columns in the offers table; ☠ machines excluded from
+   anonymous auto-picks (with a banner) and warned about when named. ★ 10212 and ★ 140330
+   are stored with their campaign notes.
+7. **`vast park`/`wake` exist.** `stopped` is `BootPhase::Parked` (not Destroyed!), park
+   verifies the stop and ledgers the weekly disk figure, wake is SpendApproval-gated and
+   re-parks itself if GPUs are gone at boot-budget expiry. Park/Wake buttons on the web
+   UI instance card.
+
+Still open from the campaign file: image refresh (unsloth builds baked in, MTP pin,
+HF_ENDPOINT/ModelScope), `backend add --tag` no-op, backend ids from instance ids on
+tunnel adoption, `vast log` non-JSON body parse, R3 ComfyUI studio arc, Bonsai-27B cell.
