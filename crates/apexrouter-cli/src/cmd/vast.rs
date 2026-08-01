@@ -116,7 +116,7 @@ async fn offers(ctx: &Ctx, args: &VastOffersArgs) -> anyhow::Result<()> {
     }
     render::print_table(
         &[
-            "OFFER", "GPU", "N", "VRAM", "$/HR", "$/HR/GPU", "REL", "DOWN", "DISK", "GEO",
+            "OFFER", "GPU", "N", "VRAM", "$/HR", "$/HR/GPU", "REL", "DOWN", "DL$/TB", "DISK", "GEO",
         ],
         result
             .offers
@@ -397,7 +397,7 @@ async fn list(ctx: &Ctx, orphans: bool, json: bool) -> anyhow::Result<()> {
         }
         render::print_table(
             &[
-                "INSTANCE", "STATUS", "PHASE", "GPU", "N", "$/HR", "UPTIME", "GEO",
+                "INSTANCE", "STATUS", "PHASE", "GPU", "N", "$/HR", "UPTIME", "GEO", "NOTE",
             ],
             live.iter().map(instance_row).collect(),
         );
@@ -552,6 +552,18 @@ fn offer_row(o: &Offer) -> Vec<String> {
             .map(|r| format!("{r:.3}"))
             .unwrap_or_default(),
         o.inet_down.map(|d| format!("{d:.0}")).unwrap_or_default(),
+        // $/GB on the wire, $/TB for humans. Below fifty cents a terabyte is "~0": the
+        // operator is choosing hosts, not auditing rounding.
+        o.inet_down_cost
+            .map(|c| {
+                let per_tb = c * 1000.0;
+                if per_tb < 0.5 {
+                    "~0".to_owned()
+                } else {
+                    format!("{per_tb:.1}")
+                }
+            })
+            .unwrap_or_default(),
         o.disk_space.map(|d| format!("{d:.0}")).unwrap_or_default(),
         o.geolocation.clone().unwrap_or_default(),
     ]
@@ -570,7 +582,30 @@ fn instance_row(i: &VastInstance) -> Vec<String> {
             .map(|s| render::human_secs(s as i64))
             .unwrap_or_default(),
         i.geolocation.clone().unwrap_or_default(),
+        instance_note(i.status_msg.as_deref()),
     ]
+}
+
+/// The `NOTE` column: an error-bearing `status_msg`, surfaced instead of hidden.
+///
+/// Two lemons in one campaign sat in `pulling` for minutes while `status_msg` carried
+/// the containerd error the whole time — visible in the vast dashboard, invisible here
+/// (GARDEN-RUNS.md, R1 attempts 1/3/4). A routine message renders as nothing; an
+/// error renders truncated, because the operator needs the *smell*, not the stack.
+fn instance_note(status_msg: Option<&str>) -> String {
+    let Some(msg) = status_msg else {
+        return String::new();
+    };
+    let lower = msg.to_lowercase();
+    if !(lower.contains("error") || lower.contains("fail")) {
+        return String::new();
+    }
+    let flat = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out: String = flat.chars().take(60).collect();
+    if flat.chars().count() > 60 {
+        out.push('…');
+    }
+    out
 }
 
 /// One row of the offline (ledger) table.
@@ -625,6 +660,30 @@ mod tests {
             end_date: None,
             extra: serde_json::Map::new(),
         }
+    }
+
+    #[test]
+    fn the_note_column_surfaces_errors_and_swallows_routine_chatter() {
+        assert_eq!(instance_note(None), "");
+        assert_eq!(instance_note(Some("0e7f068147ad: Download complete")), "");
+        let n = instance_note(Some(
+            "Error response from daemon: failed to create task for container\nand more",
+        ));
+        assert!(n.starts_with("Error response from daemon"), "{n}");
+        assert!(!n.contains('\n'), "flattened: {n}");
+        let long = format!("error {}", "x".repeat(200));
+        assert!(instance_note(Some(&long)).chars().count() <= 61);
+    }
+
+    #[test]
+    fn the_dl_cost_column_prints_per_tb_and_calls_home_boxes_free() {
+        let mut o = offer(1, 0.30, Some(true), Some(false));
+        o.inet_down_cost = Some(0.0091);
+        assert_eq!(offer_row(&o)[8], "9.1");
+        o.inet_down_cost = Some(0.000_13);
+        assert_eq!(offer_row(&o)[8], "~0");
+        o.inet_down_cost = None;
+        assert_eq!(offer_row(&o)[8], "");
     }
 
     #[test]

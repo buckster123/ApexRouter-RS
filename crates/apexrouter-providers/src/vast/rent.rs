@@ -60,6 +60,11 @@ pub const DESTROY_VERIFY_SECS: u64 = 120;
 /// Warn when the account credit buys fewer than this many hours at the offered rate.
 const LOW_CREDIT_HOURS: f64 = 3.0;
 
+/// Inbound bandwidth (`inet_down_cost`, $/GB) above which the quote calls the host
+/// metered. $0.002/GB is $2/TB — home boxes sit at ~$0.13/TB, datacenter meters at
+/// $9-40/TB, and nothing in between is worth an operator's surprise.
+const METERED_INET_PER_GB: f64 = 0.002;
+
 /// Environment variable names whose values must never be rendered in a preview or a log.
 const SECRET_ENV: &[&str] = &["TOKEN", "KEY", "SECRET", "PASSWORD"];
 
@@ -126,6 +131,19 @@ pub fn preview(offer: &Offer, req: &RentRequest, credit: Option<f64>, hours: f64
             "this offer is ${:.4}/hr, above the ${:.4}/hr ceiling on the request",
             offer.dph_total, req.max_usd_per_hour
         ));
+    }
+
+    // Bandwidth is the cost the hourly rate hides: a metered host at ~$38/TB once turned
+    // $0.60 of box-hours into a $3.80 leg (GARDEN-RUNS.md, R2a). The offer has carried
+    // `inet_down_cost` all along; a quote that does not say it is not a quote.
+    if let Some(rate_per_gb) = offer.inet_down_cost {
+        if rate_per_gb > METERED_INET_PER_GB {
+            warnings.push(format!(
+                "metered inbound bandwidth: ${:.2}/TB — a 100 GB model pull adds ~${:.2}",
+                rate_per_gb * 1000.0,
+                rate_per_gb * 100.0
+            ));
+        }
     }
 
     let burn_down_hours = match credit {
@@ -1466,6 +1484,30 @@ pub(crate) mod tests {
         // It survives the wire, because the 409 body carries it.
         let json = serde_json::to_string(&p).expect("ser");
         assert_eq!(serde_json::from_str::<RentPreview>(&json).expect("de"), p);
+    }
+
+    #[test]
+    fn a_metered_host_is_named_in_the_quote_and_a_home_box_is_not() {
+        // The Taiwan rate that turned $0.60 of box-hours into a $3.80 leg.
+        let mut o = offer();
+        o.inet_down_cost = Some(0.0091);
+        let p = preview(&o, &request(), Some(10.0), 1.0);
+        assert!(
+            p.warnings
+                .iter()
+                .any(|w| w.contains("metered inbound") && w.contains("$9.10/TB")),
+            "{:?}",
+            p.warnings
+        );
+
+        // The Poland home-box rate: ~$0.13/TB is nobody's surprise.
+        o.inet_down_cost = Some(0.00013);
+        let p = preview(&o, &request(), Some(10.0), 1.0);
+        assert!(
+            !p.warnings.iter().any(|w| w.contains("metered")),
+            "{:?}",
+            p.warnings
+        );
     }
 
     #[test]
