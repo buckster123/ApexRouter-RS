@@ -579,7 +579,8 @@ async fn list(ctx: &Ctx, orphans: bool, json: bool) -> anyhow::Result<()> {
         );
         render::print_line(&format!(
             "burn ${:.4}/hr across {} instance(s)",
-            apexrouter_providers::checks::burn_per_hour(&live),
+            // `.max(0.0)` normalises float negative zero, which renders as "$-0.0000".
+            apexrouter_providers::checks::burn_per_hour(&live).max(0.0),
             live.len()
         ));
         let parked: Vec<&VastInstance> = live

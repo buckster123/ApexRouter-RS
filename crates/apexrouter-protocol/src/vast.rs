@@ -303,6 +303,15 @@ impl VastInstance {
             .actual_status
             .as_deref()
             .map(|s| s.trim().to_ascii_lowercase());
+        // The operator's intent disambiguates `exited`: the FIRST field park/wake ever
+        // shipped against reported a deliberately parked box as `actual_status: "exited"`
+        // + `intended_status: "stopped"` (★140330, 2026-08-02) — while the dashboard said
+        // "inactive" at the disk-only rate. Same word, opposite meanings: exited-by-crash
+        // is a failure; exited-because-told-to is a parked box.
+        let parked_on_purpose = self
+            .intended_status
+            .as_deref()
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("stopped"));
         match status.as_deref() {
             None => BootPhase::Reserved,
             Some("created") | Some("scheduling") | Some("starting") => BootPhase::Provisioning,
@@ -311,6 +320,7 @@ impl VastInstance {
             // A stopped box is NOT destroyed: it holds its disk, bills for it, and can be
             // woken. Reading it as `Destroyed` is how a fleet view lies about money.
             Some("stopped") | Some("inactive") => BootPhase::Parked,
+            Some("exited") if parked_on_purpose => BootPhase::Parked,
             Some(terminal @ ("exited" | "offline" | "unknown")) => BootPhase::Failed {
                 reason: self
                     .status_msg
@@ -664,6 +674,14 @@ mod tests {
             inst(Some("exited")).phase(),
             BootPhase::Failed { .. }
         ));
+        // The field lesson from the first real park: `exited` WITH `intended_status:
+        // "stopped"` is a parked box (★140330 reports exactly this), not a failure.
+        let mut parked = inst(Some("exited"));
+        parked.intended_status = Some("stopped".to_owned());
+        assert_eq!(parked.phase(), BootPhase::Parked);
+        let mut crashed = inst(Some("exited"));
+        crashed.intended_status = Some("running".to_owned());
+        assert!(matches!(crashed.phase(), BootPhase::Failed { .. }));
         // An unrecognised status is never treated as failure.
         assert_eq!(
             inst(Some("some-new-status")).phase(),
