@@ -449,3 +449,47 @@ live-proven on the running daemon (CHARTER amendment 2026-08-02 records the deci
 Still open from the campaign file: image refresh (unsloth builds baked in, MTP pin,
 HF_ENDPOINT/ModelScope), `backend add --tag` no-op, backend ids from instance ids on
 tunnel adoption, `vast log` non-JSON body parse, R3 ComfyUI studio arc, Bonsai-27B cell.
+
+---
+
+## R3 — the studio cell: image + video on the ★ pair — 2026-08-02
+
+**Box:** the same ★ `machine 140330` (instance `46509449`, Guangdong, 2× modded-48GB
+4090, $0.8361/hr) — repurposed live, no re-rent: the 122B was stopped by pid (its 78 GB
+GGUF kept on the 2 TB disk for instant rehire), and the studio moved into the freed VRAM.
+Engine: **ComfyUI headless** (`e803f24`), driven purely through its HTTP API with fixed
+workflow JSONs — the node UI never opened. Two instances, one per card, ports 8188/8189,
+loopback-only, direct-port tunnels home: **each service owns silicon.**
+
+**Setup, timed:** 4.5 min from bare box to both lanes answering (apt + venv + torch
+2.13.0+cu130 via the tuna mirror + ComfyUI + deps). Models via **ModelScope** (1.2 s
+answer from inside CN, ~19 MB/s aggregate): Wan 2.2 TI2V-5B fp16 + umt5-xxl fp8 + VAE;
+Qwen-Image 20B fp8 + Qwen2.5-VL-7B fp8 + VAE. One trap: the fp8-scaled path JIT-compiles
+a triton shim and needs **`python3.12-dev`** (Python.h) — first image job died in 1.9 s
+without it. And the fetch globs matched three 20 GB Qwen fp8 variants instead of one —
+the anchored-glob lesson applies to ModelScope `--include` patterns too.
+
+**The numbers (proxy of record: ComfyUI's own `Prompt executed` line):**
+
+| Lane | Model · workload | Cold | Warm, BOTH LANES FIRING | VRAM |
+|---|---|---|---|---|
+| video GPU0 | Wan 2.2 TI2V-5B fp16 · 1280×704 · 81 f @ 24 fps · 20 steps | 143.6 s | **95.2 s** (3.94 s/it) | 21.6 GB |
+| image GPU1 | Qwen-Image 20B fp8-hq · 1328×1328 · 20 steps | 62.7 s | **29.3 s** | 30.5 GB |
+
+**R3 verdicts:**
+
+1. **Zero contention.** Simultaneous warm runs, both cards at 100%, 61/65 °C
+   (watercooled): the video lane ran *faster* under contention than its solo cold run —
+   separate processes on separate cards simply do not see each other. The no-splitting
+   doctrine, validated for the studio posture.
+2. **The ★ pair is a complete two-lane studio at $0.84/hr**: ~4 s/frame-batch video,
+   sub-30 s stills, with headroom on both cards (27 GB free on GPU0 — the Wan 14B fp8
+   pair fits; 18.6 GB on GPU1 — an embedder or a second image model fits).
+3. **ComfyUI-as-engine works exactly as the arc predicted**: fixed workflow JSONs map
+   onto ApexRouter's recipe concept; agents never see the graph. Front door remains
+   Imaginarium (its local-provider arc is queued in that repo). sd.cpp stills bake-off
+   still open.
+
+**Filed on the way:** `python3.12-dev` belongs in any future studio image; ModelScope
+include patterns need the same anchoring as hf; first-frame outputs land in
+`ComfyUI/output/` and served via `/view` through the tunnel — no extra fileserver needed.
