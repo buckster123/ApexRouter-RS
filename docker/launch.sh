@@ -118,11 +118,21 @@ if [ "${IMAGE_TYPE}" = "builder" ] && [ ! -x /usr/local/bin/llama-server ]; then
         fetch_tree "${LLAMA_CPP_REPO}" "${LLAMA_CPP_REF}"
     fi
 
-    # The server build embeds webui assets; trees after ~2026-05 expect a BUILT dist/
-    # that a source checkout does not carry, and the configure step can clobber stubs.
-    # So: stub every path any known tree reads, immediately before the build. Four
-    # files, both locations, harmless where unused (GARDEN-RUNS "builder webui").
-    stub_webui() {
+    # Headless UI, two worlds, detected from the tree itself:
+    #  - Trees WITH scripts/ui-assets.cmake (post ~2026-06): stub NOTHING. A partial
+    #    dist/ passes the npm-skip check and then fails the embed tool's 8-file manifest
+    #    validation. With npm and the HF asset download both OFF, the script's own
+    #    fallback embeds a placeholder UI and succeeds.
+    #  - Older trees (incl. the MTP pin pull/22673/head): the xxd embed expects four
+    #    dist files a source checkout does not carry; stub them right before the build
+    #    (configure can clobber them) — the campaign-proven recipe.
+    UI_FLAGS=""
+    if [ -f "${SRC_DIR}/scripts/ui-assets.cmake" ]; then
+        UI_FLAGS="-DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF"
+        log "    new UI system detected: building with the placeholder UI (no stubs)"
+    fi
+    stub_webui_legacy() {
+        [ -f "${SRC_DIR}/scripts/ui-assets.cmake" ] && return 0
         local d f
         for d in "${BUILD_DIR}/tools/ui/dist" "${SRC_DIR}/tools/server/webui/dist"; do
             mkdir -p "${d}"
@@ -130,9 +140,11 @@ if [ "${IMAGE_TYPE}" = "builder" ] && [ ! -x /usr/local/bin/llama-server ]; then
                 [ -s "${d}/${f}" ] || printf '<!-- stub: headless build -->\n' > "${d}/${f}"
             done
         done
+        log "    legacy UI system: stubbed the four dist files"
     }
 
     log "    configuring for SM${SM}..."
+    # shellcheck disable=SC2086
     cmake -B "${BUILD_DIR}" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=ON \
@@ -140,9 +152,10 @@ if [ "${IMAGE_TYPE}" = "builder" ] && [ ! -x /usr/local/bin/llama-server ]; then
         -DCMAKE_CUDA_ARCHITECTURES="${SM}-real" \
         -DLLAMA_CURL=ON \
         -DBUILD_SHARED_LIBS=OFF \
+        ${UI_FLAGS} \
         "${SRC_DIR}" 2>&1 | tail -5
 
-    stub_webui
+    stub_webui_legacy
     log "    compiling llama-server (~8-12 min on first boot)..."
     cmake --build "${BUILD_DIR}" --config Release \
         -j"$(nproc)" \

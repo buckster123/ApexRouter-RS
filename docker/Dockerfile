@@ -45,9 +45,13 @@ RUN set -eux; \
     esac; \
     git -C llama.cpp rev-parse HEAD
 
-# The server build embeds webui assets; post-2026-05 trees expect a BUILT dist/ a source
-# checkout does not carry. Stub every path any known tree reads, after configure and
-# before the build (configure can clobber stubs). Harmless where unused.
+# Headless UI posture. Current trees (scripts/ui-assets.cmake): DO NOT stub anything —
+# a partial dist/ passes the "npm output up-to-date" check and then fails the embed
+# tool's 8-file manifest validation (proven the expensive way: a 63-minute CI build died
+# on the last step). With npm provisioning and the HF asset download both OFF and no
+# dist present, the script's own fallback embeds a placeholder UI and succeeds — exactly
+# what a serving image wants. (The old xxd-based trees that DO need stub files are the
+# builder image's problem; launch.sh detects which world it is in.)
 WORKDIR /opt/llama.cpp
 RUN set -eux; \
     cmake -B build -G Ninja \
@@ -56,13 +60,9 @@ RUN set -eux; \
         -DGGML_NATIVE=OFF \
         -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
         -DLLAMA_CURL=ON \
-        -DBUILD_SHARED_LIBS=OFF; \
-    for d in build/tools/ui/dist tools/server/webui/dist; do \
-        mkdir -p "$d"; \
-        for f in index.html bundle.js loading.html bundle.css; do \
-            [ -s "$d/$f" ] || printf '<!-- stub: headless build -->\n' > "$d/$f"; \
-        done; \
-    done; \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_USE_PREBUILT_UI=OFF; \
     cmake --build build --config Release -j"$(nproc)" \
         --target llama-server llama-cli llama-mtmd-cli llama-gguf-split llama-bench; \
     strip build/bin/llama-* || true
