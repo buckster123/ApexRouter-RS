@@ -575,9 +575,11 @@ mod tests {
             .expect("uptime field")
             .parse()
             .expect("uptime is a float");
-        // 100 Hz is USER_HZ on every Linux target we support; the test only needs an
-        // upper bound, so a fixed value is fine.
-        (secs * 100.0) as u64
+        // 100 Hz is USER_HZ on every Linux target we support. Use `ceil` plus one tick of
+        // slack: `starttime` is integer jiffies and `/proc/uptime` is a float, so
+        // `floor(uptime * 100)` can sit one jiffy *under* a just-started process's
+        // starttime and flake CI (observed: "child (N) must not postdate boot + uptime").
+        (secs * 100.0).ceil() as u64 + 1
     }
 
     /// A binary reachable under a name containing a space and a `)`, so the child's `comm`
@@ -690,15 +692,23 @@ mod tests {
 
         let ticks = start_time_ticks(pid).expect("start_time_ticks");
         // A process that started after us and before now. The naive whitespace parse yields
-        // `num_threads` (1) or `itrealvalue` (0) here, both far below this floor.
+        // `num_threads` (1) or `itrealvalue` (0) here, both far below this floor — and far
+        // above a 1-second slop on the ceiling, which is what this upper bound defends.
         let ours = start_time_ticks(std::process::id()).expect("our own start ticks");
         assert!(
             ticks >= ours,
             "child ({ticks}) must not predate this process ({ours})"
         );
+        let now = uptime_ticks();
         assert!(
-            ticks <= uptime_ticks(),
-            "child ({ticks}) must not postdate boot + uptime"
+            ticks <= now,
+            "child ({ticks}) must not postdate boot + uptime ({now})"
+        );
+        // Wrong-field parses land near 0 or 1 (or in the billions for synthetic fixtures);
+        // a real just-spawned child sits within a few seconds of `now`.
+        assert!(
+            now.saturating_sub(ticks) < 10_000,
+            "child starttime {ticks} is more than 100s before uptime {now} — wrong field?"
         );
     }
 
