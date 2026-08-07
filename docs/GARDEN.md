@@ -152,6 +152,57 @@ the same three-way corroboration MK1-CORE ACCEPTANCE used. Concurrent-slot behav
 | G4 | **unsloth quants preferred; ≥Q4 floor for the 27B thinker, Q6 preferred.** |
 | G5 | **No invented benchmarks.** A number without a measurement is written as a bound and labelled. |
 | G6 | **Campaign budget: the full remaining credit (~$7.73) is granted.** Every rent is operator-triggered with a `SpendApproval`; the ledger row precedes the billing call; everything else stays read-only; nothing that costs money is auto-destroyed. |
+| **G7** | **Quality ladders, not one fixed quant.** Every garden resident is a *family* (base model + quant/mode matrix). Cheap work rides Q2–Q4 on small verified boxes; showpiece work rides high quant / fp8 on fat silicon. The recipe names the ladder rung; the offer search sizes the box. *Agreed 2026-08-07.* |
+| **G8** | **Default studio demand (operator preference, 2026-08-07):** 2–4 concurrent **27B / 256k** Qwen slots (thinker alias stack) + a **high-quant video** lane + an **image** lane, all warm after launch-build-serve. Prefer **vast verified** hosts; geo preference **EU → Asia → USA** (not a hard filter until profile `geo` can express a ranked list — until then: profile default EU, fall through manually or via favorites ★). |
+| **G9** | **Roster is live, not frozen at charter date.** New open weights enter as *candidates* with sources + size bounds; they become residents only after a measured cell (G5). H3 and Qwen3.8 enter as candidates 2026-08-07 (§2.5). FLUX.3 open weights are **tracked, not scheduled**, until self-hostable files exist. |
+| **G10** | **MiniMax-H3 is a creative/omni resident (Comfy), not the text thinker.** Modes (at least FL2VA / Ref2VA) and the full community quant ladder (Q2…Q5 / pruned-fp8 GGUF) are first-class recipe dimensions. Cheap rung ≈ Q2–Q3 on mid cards; quality rung may want multi-GPU / H100-class / fp8-class VRAM — that is a *higher ladder recipe*, not a different product. |
+| **G11** | **Thinker line of succession:** Qwen3.6-27B (current measured) → **Qwen3.8-27B** when open weights + unsloth (or equivalent) GGUFs exist and a cell re-measures ≥ the 3.6 baseline on the same protocol. Do not rename the alias (`auto` / studio-llm); only the recipe behind it moves. |
+
+### 6.1 Amendments log (garden)
+
+- **2026-08-07** — G7–G11 added (quality ladders, default studio demand + geo preference, live roster rule, MiniMax-H3 creative family, Qwen3.8 succession). §2.5 candidate roster. Does not change G1–G6; does not invent benchmarks for unreleased weights.
+
+## 2.5 Candidate roster refresh — 2026-08-07 (not yet measured)
+
+*House rule 7: sizes and speeds below are **labels or third-party claims** until a GARDEN-RUNS cell lands. Prefer unsloth / Comfy-Org / official MiniMaxAI repos when they exist.*
+
+### Thinker (text / vision LLM)
+
+| Candidate | Status 2026-08-07 | Notes for recipes |
+|---|---|---|
+| **Qwen3.6-27B** (+ MTP variants) | **Current resident** (R1–R4 measured) | Keep as default until 3.8 cell closes |
+| **Qwen3.8-27B** | **Announced open-weight**, expected ~week of 2026-08-10 (Alibaba) | Day-zero: wait for unsloth GGUF ladder; re-run R1-style cell before flipping default recipes |
+| **Qwen3.8-Max** | Open-weight flagship (same wave) | Tier C / multi-GPU only; not the default studio thinker |
+| MiniMax **M3** (text MoE) | Separate product from H3; huge FP footprint | Optional high-end thinker experiment, **not** the default garden; do not confuse with H3 |
+
+### Video / omni creative (ComfyUI)
+
+| Candidate | Status 2026-08-07 | Notes |
+|---|---|---|
+| **MiniMax-H3** | Open weights ~2026-08-03 (`MiniMaxAI/MiniMax-H3`); Comfy-Org repack; community GGUF **Q2–Q5** + pruned-fp8 GGUF (≈11–24 GB class per mode file, third-party listings) | **Modes:** FL2VA (first/last-frame) · Ref2VA (omni-reference). License: community agreement — read before commercial use |
+| Wan 2.2 TI2V-5B | **R3 resident** (measured on ★140330) | Keep as measured baseline video lane |
+| LTX-2.3 / Wan heavier | Prior §2.2 | Swap-in / higher ladder only |
+
+### Image (ComfyUI)
+
+| Candidate | Status 2026-08-07 | Notes |
+|---|---|---|
+| Qwen-Image 20B fp8 | **R3 resident** | Keep measured default until a better measured cell |
+| FLUX.2-klein family | §2.2 | Co-habit candidate on 48 GB |
+| **FLUX.3** (BFL) | **API / early access**; **FLUX 3 Dev open-weight backbone announced, not generally downloadable for self-host yet** | **Do not** write a local recipe until weights + Comfy path exist. Hosted path stays Imaginarium (S14 spike: fal may already surface BFL) |
+| Additional 2026 image open weights | Field moved fast | Add as candidates when HF/Comfy-Org has a pinable SHA + size; measure before default |
+
+### Quality × price ladder (how recipes should be named)
+
+Recipes are **rungs**, not one mega-config:
+
+| Rung | Intent | Typical thinker | Typical H3 / video | Typical box class (illustrative) |
+|---|---|---|---|---|
+| **draft** | agent loops, layout, throwaway | 27B Q3–Q4, short/mid ctx | H3 Q2–Q3, short clips | 1× 24–32 GB verified, cheap |
+| **daily** | default operator studio | 27B Q5–Q6, **256k**, 2–4 slots | high-quant Wan/H3 mid | 48–96 GB (2×4090 class / ★140330) |
+| **show** | client delivery, print, long video | 27B Q6–Q8 or 3.8 when ready; or M3 experiment | H3 high quant / fp8 path; fat Wan | multi-GPU / H100-class as needed |
+
+Search profiles for each rung: `verified` preferred; **geo preference EU → Asia → USA** (G8); ★/☠ favorites still win over anonymous market when the machine exists.
 
 ## 7. The campaign — Tier B measurement protocol
 

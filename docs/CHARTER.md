@@ -310,3 +310,8 @@ one for reasoning.
   closed hollow rent approval / destroy-path / ledger-fsync / human-gate gaps; package (b)
   wired jobs-at-start, `register_started`, `retry_bucket`, request-path credentials, and the
   rule-4 ImplicitMulti alert. Package (c) is this hygiene pass — docs match the code.
+- **2026-08-07** — **Garden/studio roster refresh (no D-decision change):** `docs/GARDEN.md`
+  G7–G11 and `docs/STUDIO.md` S19–S22. Quality×price ladders, default “daily” studio demand
+  (2–4× 27B@256k + high-quant video + image), geo preference EU→Asia→USA, MiniMax-H3 as
+  Comfy creative candidate, Qwen3.8 succession, FLUX.3 tracked until open weights. Implementation
+  still follows STUDIO §5; this is charter only.

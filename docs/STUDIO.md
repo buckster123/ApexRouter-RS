@@ -287,3 +287,55 @@ Phases 1–2 and 3–7 are independent tracks; T1 needs nothing from ApexRouter 
 9. **140330 as single point of rehire**: the recipe degrades to profile search, but the CN weights
    doctrine and cached image are per-machine advantages that vanish with the box. Do we pre-warm a
    second favorite?
+10. **MiniMax-H3 modes in studio recipes**: one ServiceSpec per mode (FL2VA vs Ref2VA) or one
+    service with recipe-selected weights? Prefer **one video service, recipe-selected weights** so
+    ports stay 8811 forever (S5).
+11. **Qwen3.8 flip date**: when do we re-seed `studio-96gb` (and chat-heavy) to 3.8-27B — same day
+    as unsloth GGUFs, or after a full R1-style cell?
+
+## 7. Amendments log
+
+- **2026-08-07** — **S19–S22** (roster refresh after MiniMax-H3 open weights + Qwen3.8 announcement;
+  operator default demand). Complements GARDEN G7–G11. Does not change S1–S18; does not implement
+  code. **FLUX.3** remains API/preview for self-host — tracked under G9 only until open weights.
+
+### S19 — Default operator studio demand (the “most often rent”)
+
+When no recipe is named, **daily** rung (GARDEN §6.1 ladder) is the implied demand:
+
+1. **LLM:** 2–4 concurrent slots of **27B-class Qwen at 256k** (today: 3.6; succession: 3.8 per G11),
+   OpenAI path only, alias stack unchanged for clients.
+2. **Video:** high-quant lane ready (R3: Wan TI2V-5B; **candidate:** MiniMax-H3 mid/high quant).
+3. **Image:** ready lane (R3: Qwen-Image 20B fp8; expand candidates under G9).
+
+All three **warm after launch-build-serve** (S6 idempotent image + S8 barrier). Box class is
+whatever fits the rung — consumer multi-GPU or datacenter — not a fixed SKU. **★140330** remains
+the preferred hire when available (S1); otherwise ranked search.
+
+### S20 — Quality × price is a recipe dimension, not a second product
+
+Draft / daily / show rungs (GARDEN §6.1) map to **different `VastStudio` recipes** (or quant
+fields on one recipe family), not to different verbs. `studio up` still resolves wake → converge →
+rent (S1). SpendApproval and ledger stay per-instance (S9). Cheap Q2 H3 on a small box and fp8/H100
+H3 on a fat box are the **same product surface**, different recipe + profile.
+
+### S21 — Host selection defaults for studio rent
+
+Search / auto-rent defaults for studio recipes (profile fields, not hard-coded in the verb):
+
+1. **vast verified** preferred (lemon rate from R1 still applies).
+2. **Geo preference order: EU → Asia → USA** — express as ordered profile preference when the
+   offer query can rank; until then default profile geo = EU, with Asia (★140330 CN doctrine) and
+   USA as explicit profiles / favorites.
+3. ★ / ☠ favorites still override anonymous ranking (existing money path).
+4. Datacenter vs consumer is **whatever matches VRAM + cuda band** for the recipe; no ideology.
+
+### S22 — Creative roster candidates (Comfy lanes only)
+
+| Lane | Measured default (keep until re-measured) | Candidates (enter only after a cell) |
+|---|---|---|
+| Video | Wan 2.2 TI2V-5B (R3) | **MiniMax-H3** (FL2VA / Ref2VA, quant ladder Q2→high / pruned-fp8); heavier Wan/LTX |
+| Image | Qwen-Image 20B fp8 (R3) | FLUX.2-klein family; **FLUX.3 local only when open weights + Comfy path exist**; other 2026 open image GGUF/fp8 as they pin |
+
+MiniMax-H3 does **not** become an OpenAI Backend (S2). Imaginarium catalogs `comfy/minimax-h3-…`
+recipes; ApexRouter only reserves VRAM + ports + process lifecycle.
