@@ -1,4 +1,6 @@
-# vastai-gguf — the serving images ApexRouter rents boxes with
+# vastai-gguf + vastai-studio — the serving images ApexRouter rents boxes with
+
+## vastai-gguf (single-service LLM)
 
 Two images, one launch script, published as
 `ghcr.io/buckster123/vastai-gguf:{prebuilt,builder}`:
@@ -75,3 +77,17 @@ aria2c -x8 -s8 -c -d "$DIR" -o "<shard>.gguf" "<mirror-url>"
 entrypoint does not double-launch) and runs `bash /app/launch.sh > /var/log/launch.log
 2>&1 &` from `onstart`, with the model/quant/ctx env from the container plan. `HOST` is
 forced to `127.0.0.1` unless `expose_public` — the tunnel-only posture.
+
+## vastai-studio (multi-service: LLM + Comfy video/image)
+
+Published as `ghcr.io/buckster123/vastai-studio:cu128` (+ dated `:cu128-YYYYMMDD`).
+
+One image, three processes (S6): llama-server + two ComfyUI instances. Built from
+`docker/studio/` — see **[docker/studio/README.md](studio/README.md)** for the full
+contract, env vars, and `STUDIO_FETCH_FILES` format. Workflow:
+
+```
+Actions → "vastai-studio image" → Run workflow
+```
+
+Requires a published `vastai-gguf:prebuilt` (llama-server is `COPY --from` that image).

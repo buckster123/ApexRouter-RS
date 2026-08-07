@@ -208,6 +208,8 @@ download_dir = "~/models"
 prebuilt = "ghcr.io/buckster123/vastai-gguf:prebuilt"
 builder = "ghcr.io/buckster123/vastai-gguf:builder"
 vllm = "ghcr.io/buckster123/vastai-gguf:vllm"
+# Multi-service studio (LLM + Comfy video/image). See docs/STUDIO.md S6 and docker/studio/.
+studio = "ghcr.io/buckster123/vastai-studio:cu128"
 
 # Genuinely undiscoverable knowledge: which model needs which llama.cpp fork. A match here
 # FORCES the builder image, sets LLAMA_CPP_REPO/LLAMA_CPP_REF, and pushes a
