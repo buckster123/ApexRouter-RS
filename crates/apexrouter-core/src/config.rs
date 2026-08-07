@@ -415,6 +415,8 @@ pub struct DockerCfg {
     pub builder: String,
     /// vLLM image.
     pub vllm: String,
+    /// Multi-service studio image (llama-server + ComfyUI). See `docs/STUDIO.md` S6.
+    pub studio: String,
 }
 
 impl Default for DockerCfg {
@@ -423,6 +425,7 @@ impl Default for DockerCfg {
             prebuilt: "ghcr.io/buckster123/vastai-gguf:prebuilt".to_owned(),
             builder: "ghcr.io/buckster123/vastai-gguf:builder".to_owned(),
             vllm: "ghcr.io/buckster123/vastai-gguf:vllm".to_owned(),
+            studio: "ghcr.io/buckster123/vastai-studio:cu128".to_owned(),
         }
     }
 }
@@ -1138,6 +1141,7 @@ impl Config {
             ImageType::Prebuilt => self.docker.prebuilt.clone(),
             ImageType::Builder => self.docker.builder.clone(),
             ImageType::Vllm => self.docker.vllm.clone(),
+            ImageType::Studio => self.docker.studio.clone(),
         }
     }
 
@@ -1653,6 +1657,7 @@ mod tests {
         assert_eq!(c.image_for(ImageType::Prebuilt), c.docker.prebuilt);
         assert_eq!(c.image_for(ImageType::Builder), c.docker.builder);
         assert_eq!(c.image_for(ImageType::Vllm), c.docker.vllm);
+        assert_eq!(c.image_for(ImageType::Studio), c.docker.studio);
     }
 
     #[test]

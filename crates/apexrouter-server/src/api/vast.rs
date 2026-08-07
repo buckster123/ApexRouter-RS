@@ -987,8 +987,9 @@ pub async fn tunnel_up(
     ))
 }
 
-/// Bring the instance's tunnel up (idempotent) and persist it — the **one** implementation
-/// behind the `POST …/tunnel` route and the rent job's `auto_tunnel` step.
+/// Bring one forward up (idempotent on `(instance_id, remote_port)`) and persist it —
+/// the **one** implementation behind the `POST …/tunnel` route and the rent job's
+/// `auto_tunnel` step. Studio multi-tunnel (S4) calls this once per service.
 pub(crate) async fn ensure_tunnel(
     s: &Arc<AppState>,
     api: &dyn VastApi,
@@ -998,9 +999,13 @@ pub(crate) async fn ensure_tunnel(
 ) -> Result<TunnelStatus, ApiError> {
     let tunnels = require_tunnels()?;
     let (host, port) = ssh_endpoint(api, id).await?;
+    let rport = remote_port.unwrap_or(CONTAINER_PORT);
 
     let existing = s.store.load_tunnels().map_err(ApiError::from)?;
-    if let Some(up) = existing.iter().find(|t| t.spec.instance_id == id) {
+    if let Some(up) = existing
+        .iter()
+        .find(|t| t.spec.instance_id == id && t.spec.remote_port == rport)
+    {
         if up.up {
             return Ok(up.clone());
         }
@@ -1012,15 +1017,16 @@ pub(crate) async fn ensure_tunnel(
             Some(p) => p,
             None => next_local_port(s, &existing)?,
         },
-        remote_port: remote_port.unwrap_or(CONTAINER_PORT),
+        remote_port: rport,
         ssh_host: host,
         ssh_port: port,
     };
     let status = tunnels.up(spec).await.map_err(ApiError::from)?;
 
+    // Replace only this (instance, rport) row — keep sibling forwards for the same box.
     let mut all: Vec<TunnelStatus> = existing
         .into_iter()
-        .filter(|t| t.spec.instance_id != id)
+        .filter(|t| !(t.spec.instance_id == id && t.spec.remote_port == rport))
         .collect();
     all.push(status.clone());
     s.store.save_tunnels(&all).map_err(ApiError::from)?;
@@ -1156,33 +1162,58 @@ pub async fn wake_instance(
         )
         .await?;
 
-        // The persisted tunnel, if this box had one, needs its forward re-established
-        // against the (possibly re-mapped) ssh port.
+        // Re-establish **every** persisted forward for this instance at its recorded local
+        // port (S4 multi-tunnel). A studio box has three; a single-service rental has one.
         let mut local_port = None;
-        let had_tunnel = state
+        let had_tunnels: Vec<_> = state
             .store
             .load_tunnels()
             .ok()
-            .and_then(|all| all.into_iter().find(|t| t.spec.instance_id == id));
-        if let Some(t) = had_tunnel {
-            h.progress(Some(80.0), "re-establishing the tunnel");
-            match ensure_tunnel(&state, api.as_ref(), id, Some(t.spec.local_port), None).await {
-                Ok(status) => local_port = Some(status.spec.local_port),
-                Err(e) => {
-                    let why = e.body.message.clone();
-                    state.alert(
-                        AlertLevel::Serious,
-                        &format!("vast.wake.tunnel.{}", id.0),
-                        format!(
-                            "instance {} is awake and BILLING but its tunnel failed \
-                             ({why}); run `apexrouter tunnel up {}`",
-                            id.0, id.0
-                        ),
-                    );
-                    anyhow::bail!(
-                        "instance {} is awake (and billing) but the tunnel failed: {why}",
-                        id.0
-                    );
+            .map(|all| {
+                all.into_iter()
+                    .filter(|t| t.spec.instance_id == id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !had_tunnels.is_empty() {
+            h.progress(
+                Some(80.0),
+                format!("re-establishing {} tunnel(s)", had_tunnels.len()),
+            );
+            for t in had_tunnels {
+                match ensure_tunnel(
+                    &state,
+                    api.as_ref(),
+                    id,
+                    Some(t.spec.local_port),
+                    Some(t.spec.remote_port),
+                )
+                .await
+                {
+                    Ok(status) => {
+                        // Prefer the llm/container default for the rent-result field.
+                        if t.spec.remote_port == CONTAINER_PORT || local_port.is_none() {
+                            local_port = Some(status.spec.local_port);
+                        }
+                    }
+                    Err(e) => {
+                        let why = e.body.message.clone();
+                        state.alert(
+                            AlertLevel::Serious,
+                            &format!("vast.wake.tunnel.{}.{}", id.0, t.spec.remote_port),
+                            format!(
+                                "instance {} is awake and BILLING but tunnel remote_port {} \
+                                 failed ({why}); run `apexrouter tunnel up {}`",
+                                id.0, t.spec.remote_port, id.0
+                            ),
+                        );
+                        anyhow::bail!(
+                            "instance {} is awake (and billing) but tunnel remote_port {} \
+                             failed: {why}",
+                            id.0,
+                            t.spec.remote_port
+                        );
+                    }
                 }
             }
         }
@@ -1646,14 +1677,19 @@ fn ssh_opts(s: &Arc<AppState>, id: InstanceId) -> SshOpts {
     }
 }
 
-/// The next free local port in `[providers.vast] tunnel_port_range`.
+/// The next free local port in `[providers.vast] tunnel_port_range`, **skipping the
+/// 8810–8819 studio slice** (S5). Studio lanes pin 8811/8812 via `ServiceSpec.local_port`.
 fn next_local_port(s: &Arc<AppState>, taken: &[TunnelStatus]) -> Result<u16, ApiError> {
     let (lo, hi) = s.cfg().vast.tunnel_port_range;
     (lo..=hi)
-        .find(|p| !taken.iter().any(|t| t.spec.local_port == *p))
+        .find(|p| {
+            !apexrouter_protocol::is_studio_reserved_port(*p)
+                && !taken.iter().any(|t| t.spec.local_port == *p)
+        })
         .ok_or_else(|| {
             ApiError::conflict(format!(
-                "every local port in {lo}..={hi} is already forwarding something"
+                "every local port in {lo}..={hi} (outside the studio slice) is already \
+                 forwarding something"
             ))
         })
 }

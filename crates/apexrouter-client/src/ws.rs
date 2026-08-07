@@ -395,6 +395,8 @@ mod tests {
             },
             instances: vec![],
             tunnels: vec![],
+            services: vec![],
+            studio: None,
             providers: vec![],
             recipes: vec![],
             profiles: vec![],

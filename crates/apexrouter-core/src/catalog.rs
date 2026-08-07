@@ -424,6 +424,99 @@ pub fn validate_recipe(r: &Recipe, rig: &RigSnapshot, models: &[LocalModel]) -> 
                 ));
             }
         }
+
+        RecipeKind::VastStudio {
+            profile, launch, ..
+        } => {
+            match known_profile_ids() {
+                Some(known) if profile.as_str() == UNASSIGNED_PROFILE => issues.push(issue(
+                    "kind.profile",
+                    Severity::Warning,
+                    "profile deleted: this studio recipe has no search profile yet",
+                    Some(&format!(
+                        "attach one of the {} saved profiles: `apexrouter profile ls`",
+                        known.len()
+                    )),
+                )),
+                Some(known) if !known.iter().any(|k| k == profile) => issues.push(issue(
+                    "kind.profile",
+                    Severity::Warning,
+                    &format!("profile deleted: no search profile `{profile}` in the catalog"),
+                    Some("attach another one: `apexrouter profile ls`"),
+                )),
+                _ => {}
+            }
+            if launch.image.trim().is_empty() {
+                issues.push(issue(
+                    "kind.launch.image",
+                    Severity::Error,
+                    "no studio container image",
+                    Some("set `[docker].studio` in config.toml"),
+                ));
+            }
+            if launch.disk_gb == 0 {
+                issues.push(issue(
+                    "kind.launch.disk_gb",
+                    Severity::Error,
+                    "a studio container with no disk cannot hold weights across park/wake",
+                    Some("ask for the model sizes plus headroom — 2 TB is normal for 96 GB"),
+                ));
+            }
+            if launch.services.is_empty() {
+                issues.push(issue(
+                    "kind.launch.services",
+                    Severity::Error,
+                    "a studio recipe with no services is empty",
+                    Some("add at least one ServiceSpec (llm / video / image)"),
+                ));
+            }
+            if launch.onstart.contains("HF_TOKEN") {
+                issues.push(issue(
+                    "kind.launch.onstart",
+                    Severity::Error,
+                    "a credential is inlined into `onstart`, which vast persists and echoes \
+                     back from `show instance`",
+                    Some(
+                        "move it into the env map, which is where the container contract puts \
+                         `HF_TOKEN`",
+                    ),
+                ));
+            }
+            if launch.expose_public {
+                issues.push(issue(
+                    "kind.launch.expose_public",
+                    Severity::Warning,
+                    "a vast direct port is plaintext HTTP on a shared public IP",
+                    Some(
+                        "keep the tunnel-only posture, or mint a per-instance api key before \
+                         launching",
+                    ),
+                ));
+            }
+            for svc in &launch.services {
+                if let Some(lp) = svc.local_port {
+                    if !apexrouter_protocol::is_studio_reserved_port(lp)
+                        && matches!(svc.runtime, apexrouter_protocol::ServiceRuntime::ComfyUi)
+                    {
+                        issues.push(issue(
+                            "kind.launch.services.local_port",
+                            Severity::Warning,
+                            &format!(
+                                "service `{}` pins local_port {lp} outside the studio slice \
+                                 {}-{}",
+                                svc.name,
+                                apexrouter_protocol::DEFAULT_STUDIO_PORT_RANGE.0,
+                                apexrouter_protocol::DEFAULT_STUDIO_PORT_RANGE.1
+                            ),
+                            Some(
+                                "Comfy lanes should use 8811 (video) / 8812 (image) so the \
+                                 promise is collision-free by construction (S5)",
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     ValidationReport {

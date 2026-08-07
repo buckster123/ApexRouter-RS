@@ -200,6 +200,7 @@ fn image_type_from_index(i: i32) -> ImageType {
     match i {
         1 => ImageType::Builder,
         2 => ImageType::Vllm,
+        3 => ImageType::Studio,
         _ => ImageType::Prebuilt,
     }
 }
@@ -210,6 +211,7 @@ fn image_type_to_index(t: ImageType) -> i32 {
         ImageType::Prebuilt => 0,
         ImageType::Builder => 1,
         ImageType::Vllm => 2,
+        ImageType::Studio => 3,
     }
 }
 
@@ -1653,6 +1655,7 @@ fn wire_launch(ui: &AppWindow, bridge: &Bridge) {
                 image_type: match runtime {
                     ContainerRuntime::Vllm => ImageType::Vllm,
                     ContainerRuntime::LlamaCpp => ImageType::Prebuilt,
+                    // Studio is multi-service; the Slint launch drawer stays single-service.
                 },
                 disk_gb: st.get_rent_disk_gb().max(1) as u32,
                 env,

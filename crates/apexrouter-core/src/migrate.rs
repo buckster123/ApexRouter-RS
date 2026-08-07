@@ -1176,6 +1176,7 @@ fn kind_name(k: &RecipeKind) -> &'static str {
         RecipeKind::Local(_) => "a local llama-server",
         RecipeKind::LocalVllm(_) => "a local vLLM",
         RecipeKind::Vast { .. } => "a vast.ai rental",
+        RecipeKind::VastStudio { .. } => "a vast.ai studio rental",
         RecipeKind::Managed(_) => "a managed provider",
     }
 }

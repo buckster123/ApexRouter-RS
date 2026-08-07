@@ -18,7 +18,8 @@
 use crate::error::{Error, Result};
 use crate::paths::Paths;
 use apexrouter_protocol::{
-    Alias, Backend, BackendId, EndpointRecord, FavoriteHost, RouteFile, TunnelStatus,
+    Alias, Backend, BackendId, EndpointRecord, FavoriteHost, RouteFile, ServiceRecord,
+    StudioRecord, TunnelStatus,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -305,6 +306,38 @@ impl Store {
     /// `$STATE/tunnels.json`, atomically.
     pub fn save_tunnels(&self, t: &[TunnelStatus]) -> Result<()> {
         self.write_json(&self.paths.tunnels_file(), &t)
+    }
+
+    /// `$STATE/services.json`. Absent file = no studio services yet, not an error.
+    pub fn load_services(&self) -> Result<Vec<ServiceRecord>> {
+        Ok(self
+            .read_json::<Vec<ServiceRecord>>(&self.paths.services_file())?
+            .unwrap_or_default())
+    }
+
+    /// `$STATE/services.json`, atomically.
+    pub fn save_services(&self, s: &[ServiceRecord]) -> Result<()> {
+        self.write_json(&self.paths.services_file(), &s)
+    }
+
+    /// `$STATE/studio.json`. Absent file = no active studio, not an error.
+    pub fn load_studio(&self) -> Result<Option<StudioRecord>> {
+        self.read_json::<StudioRecord>(&self.paths.studio_file())
+    }
+
+    /// `$STATE/studio.json`, atomically. Writing `None` removes the file.
+    pub fn save_studio(&self, studio: Option<&StudioRecord>) -> Result<()> {
+        match studio {
+            Some(s) => self.write_json(&self.paths.studio_file(), s),
+            None => {
+                let path = self.paths.studio_file();
+                match fs::remove_file(&path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(io_err(&path, e)),
+                }
+            }
+        }
     }
 
     /// `$STATE/favorites.json`. Absent file = no verdicts, not an error.
@@ -626,6 +659,53 @@ mod tests {
         let tunnels = vec![tunnel(8800), tunnel(8801)];
         store.save_tunnels(&tunnels).expect("save");
         assert_eq!(store.load_tunnels().expect("reload"), tunnels);
+    }
+
+    #[test]
+    fn services_and_studio_default_when_absent_and_round_trip() {
+        use apexrouter_protocol::{
+            DesiredState, ServiceHealthProbe, ServiceId, ServiceRecord, ServiceRuntime,
+            StudioRecord, STUDIO_VIDEO_PORT,
+        };
+
+        let (_dir, store) = test_store();
+        // Pre-studio state dir: absent files are empty / None, never an error.
+        assert!(store.load_services().expect("services").is_empty());
+        assert!(store.load_studio().expect("studio").is_none());
+
+        let svc = ServiceRecord {
+            id: ServiceId::parse("studio-video").expect("id"),
+            instance_id: InstanceId(140_330),
+            name: "video".into(),
+            runtime: ServiceRuntime::ComfyUi,
+            remote_port: 8188,
+            local_port: STUDIO_VIDEO_PORT,
+            health: ServiceHealthProbe::ComfySystemStats,
+            devices: vec!["0".into()],
+            reserved_mb: 23_000,
+            desired: DesiredState::Running,
+            started_at_unix: 1_780_000_000,
+        };
+        store.save_services(&[svc.clone()]).expect("save services");
+        assert_eq!(store.load_services().expect("reload"), vec![svc]);
+
+        let studio = StudioRecord {
+            instance_id: InstanceId(140_330),
+            machine_id: Some(140_330),
+            recipe_id: None,
+            profile_id: None,
+            service_ids: vec![ServiceId::parse("studio-video").expect("id")],
+            endpoint_ids: vec![],
+            created_at_unix: 1_780_000_000,
+            updated_at_unix: 1_780_000_000,
+        };
+        store.save_studio(Some(&studio)).expect("save studio");
+        assert_eq!(store.load_studio().expect("reload"), Some(studio));
+
+        store.save_studio(None).expect("clear studio");
+        assert!(store.load_studio().expect("gone").is_none());
+        // Clearing twice is fine.
+        store.save_studio(None).expect("clear again");
     }
 
     #[test]

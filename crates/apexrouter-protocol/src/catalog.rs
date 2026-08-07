@@ -9,6 +9,7 @@ use crate::endpoint::{LocalLlamaSpec, LocalVllmSpec, ManagedSpec};
 use crate::fit::FitPlan;
 use crate::ids::{ProfileId, RecipeId};
 use crate::money::Money;
+use crate::studio::StudioLaunch;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -49,6 +50,17 @@ pub enum RecipeKind {
         /// What we expect to fit on the pooled VRAM.
         #[serde(default)]
         fit: Option<FitPlan>,
+    },
+    /// A multi-service studio rental (LLM + Comfy lanes). See `docs/STUDIO.md` S3.
+    /// Sibling of [`RecipeKind::Vast`] — `ContainerLaunch` stays one-image/one-port.
+    VastStudio {
+        /// Which search profile to run (or degrade to when the machine pin is gone).
+        profile: ProfileId,
+        /// Physical host pin when renting a favorite (★140330). `None` → ranked search.
+        #[serde(default)]
+        machine_id: Option<u64>,
+        /// The multi-service container contract.
+        launch: StudioLaunch,
     },
     /// A managed provider.
     Managed(ManagedSpec),
@@ -166,6 +178,8 @@ pub enum ImageType {
     Builder,
     /// vLLM.
     Vllm,
+    /// Multi-service studio image (llama-server + ComfyUI). See `docs/STUDIO.md` S6.
+    Studio,
 }
 
 /// **THE CONTAINER CONTRACT.** This is what makes a rented box actually serve tokens.
@@ -360,6 +374,20 @@ mod tests {
                     expose_public: false,
                 },
                 fit: None,
+            },
+            RecipeKind::VastStudio {
+                profile: ProfileId::parse("studio-96gb").expect("id"),
+                machine_id: Some(140_330),
+                launch: crate::studio::StudioLaunch {
+                    image: "ghcr.io/buckster123/vastai-studio:cu128".into(),
+                    image_type: ImageType::Studio,
+                    disk_gb: 2000,
+                    env: BTreeMap::new(),
+                    onstart: "bash /app/studio.sh > /var/log/studio.log 2>&1 &".into(),
+                    host: "127.0.0.1".into(),
+                    expose_public: false,
+                    services: crate::studio::studio_96gb_services(),
+                },
             },
         ];
         for k in &kinds {

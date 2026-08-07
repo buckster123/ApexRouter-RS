@@ -361,6 +361,10 @@ fn spec_for(r: &Recipe) -> Result<EndpointSpec, ApiError> {
             "vast recipes are instantiated by the vast provisioner (unit P-04, Stage 5); \
              this build has no way to rent a box and will not pretend otherwise",
         )),
+        RecipeKind::VastStudio { .. } => Err(ApiError::not_implemented(
+            "studio recipes are instantiated by `apexrouter studio up` (STUDIO.md S1); \
+             multi-service rent is not a single EndpointSpec",
+        )),
         RecipeKind::Managed(_) => Err(ApiError::not_implemented(
             "managed-provider recipes are registered by unit S-07 (Stage 5); \
              use POST /v1/backends to register the provider by URL in the meantime",

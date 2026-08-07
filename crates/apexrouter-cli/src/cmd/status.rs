@@ -62,13 +62,16 @@ async fn once(ctx: &Ctx, args: &StatusArgs) -> anyhow::Result<()> {
 /// # Errors
 /// A `$STATE` read failure, or a `default_alias` that is not a valid alias.
 pub fn offline_snapshot(ctx: &Ctx, store: &Store) -> anyhow::Result<Snapshot> {
-    let (endpoints, routes, backends, tunnels) = store.with_state_lock_shared(|| {
-        let endpoints = store.list_endpoints()?;
-        let routes = store.load_routes()?;
-        let backends = store.load_backends()?;
-        let tunnels = store.load_tunnels()?;
-        Ok((endpoints, routes, backends, tunnels))
-    })?;
+    let (endpoints, routes, backends, tunnels, services, studio) =
+        store.with_state_lock_shared(|| {
+            let endpoints = store.list_endpoints()?;
+            let routes = store.load_routes()?;
+            let backends = store.load_backends()?;
+            let tunnels = store.load_tunnels()?;
+            let services = store.load_services()?;
+            let studio = store.load_studio()?;
+            Ok((endpoints, routes, backends, tunnels, services, studio))
+        })?;
     let cat = catalog::load(&ctx.paths).unwrap_or_default();
 
     let (proxy_url, _) = url::proxy_base(ctx)?;
@@ -105,6 +108,8 @@ pub fn offline_snapshot(ctx: &Ctx, store: &Store) -> anyhow::Result<Snapshot> {
         rig: RigSnapshot::default(),
         instances: Vec::new(),
         tunnels,
+        services,
+        studio,
         providers: Vec::new(),
         recipes: cat.recipes,
         profiles: cat.profiles,

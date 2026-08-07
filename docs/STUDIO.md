@@ -295,6 +295,14 @@ Phases 1–2 and 3–7 are independent tracks; T1 needs nothing from ApexRouter 
 
 ## 7. Amendments log
 
+- **2026-08-07** — **Phase 3–4 foundation shipped** (protocol + multi-tunnel + store). Additive
+  only: `RecipeKind::VastStudio`, `ServiceSpec`/`ServiceRecord`/`StudioRecord`,
+  `ImageType::Studio`, `Event::ServiceChanged|Removed|StudioChanged`,
+  `DEFAULT_STUDIO_PORT_RANGE` (8810–8819) with fixed 8811/8812, tunnels keyed on
+  `(instance_id, remote_port)` with `cm-<i>-<rport>`, ordinary port allocator skips the studio
+  slice, wake restores **all** forwards, `$STATE/services.json` + `studio.json` atomic stores.
+  No Comfy wire protocol. No rent/destroy path change. Phases 5–7 (image, planner/prober, verb)
+  still open.
 - **2026-08-07** — **S19–S22** (roster refresh after MiniMax-H3 open weights + Qwen3.8 announcement;
   operator default demand). Complements GARDEN G7–G11. Does not change S1–S18; does not implement
   code. **FLUX.3** remains API/preview for self-host — tracked under G9 only until open weights.

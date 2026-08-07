@@ -226,7 +226,7 @@ async fn edit_document(ctx: &Ctx, id: &str) -> anyhow::Result<()> {
 
 /// Does instantiating this recipe start a bill?
 pub fn spends_money(k: &RecipeKind) -> bool {
-    matches!(k, RecipeKind::Vast { .. })
+    matches!(k, RecipeKind::Vast { .. } | RecipeKind::VastStudio { .. })
 }
 
 /// The `KIND` column.
@@ -235,6 +235,7 @@ pub fn kind_label(k: &RecipeKind) -> &'static str {
         RecipeKind::Local(_) => "local",
         RecipeKind::LocalVllm(_) => "local_vllm",
         RecipeKind::Vast { .. } => "vast",
+        RecipeKind::VastStudio { .. } => "vast_studio",
         RecipeKind::Managed(_) => "managed",
     }
 }
@@ -253,6 +254,16 @@ fn target_label(k: &RecipeKind) -> String {
             profile, launch, ..
         } => {
             format!("{} · {}", profile.as_str(), launch.image)
+        }
+        RecipeKind::VastStudio {
+            profile, launch, ..
+        } => {
+            format!(
+                "{} · studio/{}svc · {}",
+                profile.as_str(),
+                launch.services.len(),
+                launch.image
+            )
         }
         RecipeKind::Managed(s) => s
             .model_id

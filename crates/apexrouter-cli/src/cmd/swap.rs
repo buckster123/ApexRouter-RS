@@ -141,6 +141,9 @@ pub fn spec_of(r: &Recipe) -> anyhow::Result<EndpointSpec> {
         RecipeKind::Local(s) => Ok(EndpointSpec::LocalLlama(s.clone())),
         RecipeKind::LocalVllm(s) => Ok(EndpointSpec::LocalVllm(s.clone())),
         RecipeKind::Managed(s) => Ok(EndpointSpec::Managed(s.clone())),
+        RecipeKind::VastStudio { .. } => anyhow::bail!(
+            "a VastStudio recipe is multi-service — use `apexrouter studio up`, not swap"
+        ),
         RecipeKind::Vast { .. } => anyhow::bail!(
             "`{}` is a vast.ai recipe: swapping to it would start an hourly bill without \
              asking. Rent it explicitly with `apexrouter recipe run {} --yes`, then \

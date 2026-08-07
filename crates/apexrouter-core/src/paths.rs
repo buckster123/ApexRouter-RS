@@ -152,6 +152,16 @@ impl Paths {
         self.state.join("tunnels.json")
     }
 
+    /// `$STATE/services.json` — studio ServiceRecords (facts only).
+    pub fn services_file(&self) -> PathBuf {
+        self.state.join("services.json")
+    }
+
+    /// `$STATE/studio.json` — the active StudioRecord manifest, when one exists.
+    pub fn studio_file(&self) -> PathBuf {
+        self.state.join("studio.json")
+    }
+
     /// `$STATE/favorites.json` — starred/burned physical hosts, keyed `machine_id`.
     pub fn favorites_file(&self) -> PathBuf {
         self.state.join("favorites.json")
@@ -220,9 +230,17 @@ impl Paths {
         self.ssh_dir().join("known_hosts")
     }
 
-    /// `$STATE/ssh/cm-<instance-id>` — the ControlMaster socket.
+    /// `$STATE/ssh/cm-<instance-id>` — ControlMaster for general instance SSH (shell, remote
+    /// cmds). Tunnel forwards use [`Self::tunnel_control_path`] instead (S4).
     pub fn control_path(&self, id: InstanceId) -> PathBuf {
         self.ssh_dir().join(format!("cm-{}", id.0))
+    }
+
+    /// `$STATE/ssh/cm-<instance-id>-<remote-port>` — ControlMaster for one tunnel forward.
+    /// Keyed on `(instance, remote_port)` so multi-service studio boxes can hold three
+    /// concurrent `-L` children without fighting one socket (S4).
+    pub fn tunnel_control_path(&self, id: InstanceId, remote_port: u16) -> PathBuf {
+        self.ssh_dir().join(format!("cm-{}-{}", id.0, remote_port))
     }
 
     /// `$STATE/apexrouterd.lock`. **Only the daemon ever touches this file.**
@@ -560,6 +578,8 @@ mod tests {
             p.routes_file(),
             p.backends_file(),
             p.tunnels_file(),
+            p.services_file(),
+            p.studio_file(),
             p.catalog_file(),
             p.credentials_file(),
             p.ledger(),
@@ -573,6 +593,7 @@ mod tests {
             p.ssh_dir(),
             p.known_hosts(),
             p.control_path(InstanceId(28_675_431)),
+            p.tunnel_control_path(InstanceId(28_675_431), 8000),
             p.daemon_lock(),
             p.state_lock(),
         ] {
@@ -588,6 +609,12 @@ mod tests {
             p.control_path(InstanceId(28_675_431)),
             apex.join("ssh/cm-28675431")
         );
+        assert_eq!(
+            p.tunnel_control_path(InstanceId(28_675_431), 8188),
+            apex.join("ssh/cm-28675431-8188")
+        );
+        assert_eq!(p.services_file(), apex.join("services.json"));
+        assert_eq!(p.studio_file(), apex.join("studio.json"));
         assert_eq!(p.known_hosts(), apex.join("ssh/known_hosts"));
         assert_eq!(p.daemon_lock(), apex.join("apexrouterd.lock"));
         assert_eq!(p.state_lock(), apex.join("state.lock"));

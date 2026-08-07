@@ -1146,6 +1146,10 @@ pub fn recipe_rows(
                 apexrouter_protocol::RecipeKind::LocalVllm(_) => {
                     ("vllm".to_string(), String::new())
                 }
+                apexrouter_protocol::RecipeKind::VastStudio { profile, .. } => (
+                    "studio".to_string(),
+                    format!("studio against profile `{profile}`"),
+                ),
                 apexrouter_protocol::RecipeKind::Vast { profile, .. } => (
                     "vast".to_string(),
                     format!("rents against profile `{profile}`"),

@@ -26,6 +26,7 @@ pub mod money;
 pub mod provider;
 pub mod rig;
 pub mod route;
+pub mod studio;
 pub mod telemetry;
 pub mod vast;
 
@@ -41,6 +42,7 @@ pub use money::*;
 pub use provider::*;
 pub use rig::*;
 pub use route::*;
+pub use studio::*;
 pub use telemetry::*;
 pub use vast::*;
 
@@ -72,9 +74,23 @@ pub const DEFAULT_CONTROL_BIND: &str = "127.0.0.1:2739";
 pub const DEFAULT_LOCAL_PORT_RANGE: (u16, u16) = (8100, 8199);
 /// Port pool for `ssh -L` tunnels to rented boxes. Multiple rentals is the normal case.
 pub const DEFAULT_TUNNEL_PORT_RANGE: (u16, u16) = (8800, 8899);
+/// Reserved slice inside the tunnel pool for studio Comfy lanes (S5). Ordinary
+/// `allocate_port` / `next_local_port` never hand these out — only an explicit
+/// `ServiceSpec.local_port` or a studio ensure does.
+pub const DEFAULT_STUDIO_PORT_RANGE: (u16, u16) = (8810, 8819);
+/// Fixed local tunnel for the studio video (ComfyUI) lane. Promise: forever 8811.
+pub const STUDIO_VIDEO_PORT: u16 = 8811;
+/// Fixed local tunnel for the studio image (ComfyUI) lane. Promise: forever 8812.
+pub const STUDIO_IMAGE_PORT: u16 = 8812;
 /// Model names that ALWAYS fall through to the default alias, so smoke.sh's hardcoded
 /// `"model":"x"` and an absent model field keep working regardless of `unknown_model`.
 pub const LEGACY_MODEL_NAMES: &[&str] = &["", "x", "auto", "default"];
+
+/// Is `port` inside the studio-reserved slice of the tunnel pool?
+pub fn is_studio_reserved_port(port: u16) -> bool {
+    let (lo, hi) = DEFAULT_STUDIO_PORT_RANGE;
+    port >= lo && port <= hi
+}
 
 #[cfg(test)]
 mod tests {
@@ -87,6 +103,11 @@ mod tests {
         assert_eq!(DEFAULT_CONTROL_BIND, "127.0.0.1:2739");
         assert_eq!(DEFAULT_LOCAL_PORT_RANGE, (8100, 8199));
         assert_eq!(DEFAULT_TUNNEL_PORT_RANGE, (8800, 8899));
+        assert_eq!(DEFAULT_STUDIO_PORT_RANGE, (8810, 8819));
+        assert_eq!(STUDIO_VIDEO_PORT, 8811);
+        assert_eq!(STUDIO_IMAGE_PORT, 8812);
+        assert!(is_studio_reserved_port(8811));
+        assert!(!is_studio_reserved_port(8800));
         assert_eq!(LEGACY_MODEL_NAMES, &["", "x", "auto", "default"]);
     }
 

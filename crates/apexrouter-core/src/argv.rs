@@ -811,6 +811,7 @@ fn image_type_flag(t: ImageType) -> &'static str {
         ImageType::Prebuilt => "prebuilt",
         ImageType::Builder => "builder",
         ImageType::Vllm => "vllm",
+        ImageType::Studio => "studio",
     }
 }
 

@@ -8,11 +8,12 @@ use crate::backend::{Backend, BootPhase};
 use crate::catalog::{Recipe, SearchProfile};
 use crate::check::CheckResult as CheckResultBody;
 use crate::endpoint::{EndpointRecord, TunnelStatus};
-use crate::ids::{Alias, BackendId, InstanceId, JobId, RequestId};
+use crate::ids::{Alias, BackendId, InstanceId, JobId, RequestId, ServiceId};
 use crate::money::{CostEstimate, Money};
 use crate::provider::ProviderStatus;
 use crate::rig::RigSnapshot;
 use crate::route::ModelRoute;
+use crate::studio::{ServiceRecord, StudioRecord};
 use crate::telemetry::{RequestRecord, UsageSummary};
 use crate::vast::VastInstance;
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,22 @@ pub enum Event {
         /// Stable id, so repeats coalesce instead of stacking.
         id: String,
     },
+    /// A studio service record changed (S3 / S16). Facts only — liveness is on the status surface.
+    ServiceChanged {
+        /// The new description.
+        service: Box<ServiceRecord>,
+    },
+    /// A studio service went away.
+    ServiceRemoved {
+        /// Which one.
+        id: ServiceId,
+    },
+    /// The active studio manifest changed (or cleared).
+    StudioChanged {
+        /// The new manifest, or `None` when no studio is recorded.
+        #[serde(default)]
+        studio: Option<Box<StudioRecord>>,
+    },
 }
 
 /// How loud an alert is. `Critical` is reserved for money leaking.
@@ -198,6 +215,12 @@ pub struct Snapshot {
     /// SSH tunnels.
     #[serde(default)]
     pub tunnels: Vec<TunnelStatus>,
+    /// Studio service records (Comfy lanes + co-resident facts). Empty pre-studio.
+    #[serde(default)]
+    pub services: Vec<ServiceRecord>,
+    /// Active studio manifest, when one is recorded.
+    #[serde(default)]
+    pub studio: Option<StudioRecord>,
     /// Managed providers.
     #[serde(default)]
     pub providers: Vec<ProviderStatus>,
@@ -423,6 +446,8 @@ mod tests {
             rig: RigSnapshot::default(),
             instances: vec![],
             tunnels: vec![],
+            services: vec![],
+            studio: None,
             providers: vec![],
             recipes: vec![],
             profiles: vec![],
@@ -523,6 +548,36 @@ mod tests {
                 message: "duplicate upstream model id after a rental".into(),
                 action: None,
                 id: "route.collision.1".into(),
+            },
+            Event::ServiceChanged {
+                service: Box::new(crate::studio::ServiceRecord {
+                    id: crate::ids::ServiceId::parse("studio-video").expect("id"),
+                    instance_id: InstanceId(140_330),
+                    name: "video".into(),
+                    runtime: crate::studio::ServiceRuntime::ComfyUi,
+                    remote_port: 8188,
+                    local_port: crate::STUDIO_VIDEO_PORT,
+                    health: crate::studio::ServiceHealthProbe::ComfySystemStats,
+                    devices: vec!["0".into()],
+                    reserved_mb: 23_000,
+                    desired: crate::endpoint::DesiredState::Running,
+                    started_at_unix: 1_785_412_331,
+                }),
+            },
+            Event::ServiceRemoved {
+                id: crate::ids::ServiceId::parse("studio-video").expect("id"),
+            },
+            Event::StudioChanged {
+                studio: Some(Box::new(crate::studio::StudioRecord {
+                    instance_id: InstanceId(140_330),
+                    machine_id: Some(140_330),
+                    recipe_id: None,
+                    profile_id: None,
+                    service_ids: vec![],
+                    endpoint_ids: vec![],
+                    created_at_unix: 1_785_412_331,
+                    updated_at_unix: 1_785_412_331,
+                })),
             },
         ];
         for e in &events {

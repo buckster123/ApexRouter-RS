@@ -3,11 +3,14 @@
 //! The tunnel supervisor. It **owns the `ssh` `Child`** — `pgrep` appears nowhere, because
 //! `pgrep ssh` can kill an unrelated connection.
 //!
-//! The exact flag set (`ARCHITECTURE.md` §4.9):
-//! `-N -L <local>:127.0.0.1:8000 -p <port> root@<host> -o ExitOnForwardFailure=yes
+//! The exact flag set (`ARCHITECTURE.md` §4.9, studio S4):
+//! `-N -L <local>:127.0.0.1:<remote> -p <port> root@<host> -o ExitOnForwardFailure=yes
 //! -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new
 //! -o UserKnownHostsFile=$STATE/ssh/known_hosts -o ControlMaster=auto
-//! -o ControlPath=$STATE/ssh/cm-<instance-id> -o ControlPersist=5m`.
+//! -o ControlPath=$STATE/ssh/cm-<instance-id>-<remote-port> -o ControlPersist=5m`.
+//!
+//! Tunnels are keyed on **`(instance_id, remote_port)`** so a studio box can hold three
+//! concurrent forwards (llm:8000, video:8188, image:8189) without clobbering each other.
 //!
 //! Two things the source proposals dropped and this does not:
 //!
@@ -30,8 +33,10 @@ use apexrouter_core::exec;
 use apexrouter_core::proc::{self, Liveness, Signal, SpawnRequest};
 use apexrouter_core::store::Store;
 use apexrouter_core::Paths;
-use apexrouter_protocol::{AlertLevel, Event, InstanceId, LogSource, ProcFacts};
-use apexrouter_protocol::{TunnelSpec, TunnelStatus};
+use apexrouter_protocol::{
+    is_studio_reserved_port, AlertLevel, Event, InstanceId, LogSource, ProcFacts, TunnelSpec,
+    TunnelStatus,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -253,10 +258,9 @@ impl TunnelSupervisor {
 
     /// Bring one forward up.
     ///
-    /// Idempotent: an instance whose recorded child is still alive and still forwarding the
-    /// same port gets its existing record back, which is what stops a re-`up` after a daemon
-    /// restart from colliding on the local port. `local_port: 0` allocates from
-    /// `[vast] tunnel_port_range`.
+    /// Idempotent on **`(instance_id, remote_port)`** (S4): a recorded child that is still
+    /// alive and still forwarding that pair gets its existing record back. `local_port: 0`
+    /// allocates from `[vast] tunnel_port_range`, **skipping the 8810–8819 studio slice**.
     ///
     /// # Errors
     /// [`Error::PortInUse`] when somebody else — one of ours or a stranger — holds the local
@@ -266,12 +270,15 @@ impl TunnelSupervisor {
         self.paths.ensure_layout()?;
         let mut spec = spec;
         let records = self.store.load_tunnels()?;
+        let rport = spec.remote_port_or_default();
+        if spec.remote_port == 0 {
+            spec.remote_port = rport;
+        }
 
-        // Already ours and already up? Then this call is a no-op, which is what stops a
-        // re-`up` after a restart from fighting its own child for the local port.
+        // Already ours for this (instance, rport) and already up? No-op.
         let ours = records
             .iter()
-            .find(|t| t.spec.instance_id == spec.instance_id)
+            .find(|t| tunnel_key(&t.spec) == tunnel_key(&spec))
             .cloned();
         let live = ours.as_ref().is_some_and(|t| {
             t.proc
@@ -289,11 +296,12 @@ impl TunnelSupervisor {
         }
 
         // Somebody else's record on the same local port is a collision we can name.
+        // Same-instance different-rport is fine (studio multi-tunnel).
         let holder = records
             .iter()
             .find(|t| {
                 t.spec.local_port == spec.local_port
-                    && t.spec.instance_id != spec.instance_id
+                    && tunnel_key(&t.spec) != tunnel_key(&spec)
                     && t.proc.as_ref().is_some_and(is_live)
             })
             .map(|t| t.spec.instance_id);
@@ -310,17 +318,18 @@ impl TunnelSupervisor {
             });
         }
 
-        let control_path = self.paths.control_path(spec.instance_id);
-        // Our previous child is gone, so any master it left behind is against a link that
-        // no longer works. Close it and unlink the socket before spawning, or the new ssh
-        // multiplexes onto a corpse.
+        let control_path = self
+            .paths
+            .tunnel_control_path(spec.instance_id, spec.remote_port_or_default());
+        // Our previous child for this pair is gone, so any master it left behind is against
+        // a link that no longer works. Close it and unlink before spawning.
         if control_path.exists() {
             let old = ours.as_ref().map_or(&spec, |t| &t.spec);
             self.control_exit(old, &control_path).await;
             unlink(&control_path);
         }
         let argv = tunnel_argv(&spec, &self.paths.known_hosts(), &control_path);
-        let log = self.log_file(spec.instance_id);
+        let log = self.log_file(spec.instance_id, spec.remote_port_or_default());
         let child = proc::spawn_detached(SpawnRequest {
             program: &self.ssh,
             args: &argv,
@@ -334,7 +343,7 @@ impl TunnelSupervisor {
 
         let carried = records
             .iter()
-            .find(|t| t.spec.instance_id == spec.instance_id)
+            .find(|t| tunnel_key(&t.spec) == tunnel_key(&spec))
             .map(|t| t.restarts)
             .unwrap_or(0);
         let status = TunnelStatus {
@@ -359,35 +368,67 @@ impl TunnelSupervisor {
         Ok(status)
     }
 
-    /// Kill the child, run `ssh -O exit`, and unlink the ControlPath.
+    /// Kill **every** forward for an instance, run `ssh -O exit` per ControlPath, unlink.
     ///
-    /// All three, in that order, and none of them conditional on the previous one: killing
-    /// the `-N -L` child on its own leaves the ControlMaster alive for `ControlPersist`
-    /// minutes against a box that may already be destroyed, and a stale socket file makes
-    /// the *next* `up` reuse a master that cannot connect.
-    ///
-    /// Removing an unknown instance is not an error — `down` is what you run when you are
-    /// not sure.
+    /// S4: `tunnel_down(instance)` drops all. For a single service use
+    /// [`Self::down_one`]. Removing an unknown instance is not an error.
     ///
     /// # Errors
     /// Propagates a failure to rewrite `$STATE/tunnels.json`.
     pub async fn down(&self, id: InstanceId) -> Result<()> {
         let records = self.store.load_tunnels()?;
-        let record = records.iter().find(|t| t.spec.instance_id == id).cloned();
+        let mine: Vec<TunnelStatus> = records
+            .into_iter()
+            .filter(|t| t.spec.instance_id == id)
+            .collect();
 
-        if let Some(facts) = record.as_ref().and_then(|r| r.proc.clone()) {
-            self.terminate(&facts).await;
+        if mine.is_empty() {
+            // Legacy single-socket path may still exist from pre-S4 daemons.
+            unlink(&self.paths.control_path(id));
+            return Ok(());
         }
 
-        let control_path = self.paths.control_path(id);
-        if let Some(rec) = record.as_ref() {
+        for rec in &mine {
+            if let Some(facts) = rec.proc.as_ref() {
+                self.terminate(facts).await;
+            }
+            let control_path = self
+                .paths
+                .tunnel_control_path(id, rec.spec.remote_port_or_default());
             self.control_exit(&rec.spec, &control_path).await;
+            unlink(&control_path);
         }
-        unlink(&control_path);
+        // Pre-S4 single-socket path.
+        unlink(&self.paths.control_path(id));
 
-        self.forget(id)?;
-        if record.is_some() {
-            self.say(id, format!("tunnel down: instance {id}"));
+        self.forget_instance(id)?;
+        self.say(id, format!("tunnel down: instance {id} (all forwards)"));
+        Ok(())
+    }
+
+    /// Drop one forward for `(instance, remote_port)`. Idempotent.
+    ///
+    /// # Errors
+    /// Propagates a failure to rewrite `$STATE/tunnels.json`.
+    pub async fn down_one(&self, id: InstanceId, remote_port: u16) -> Result<()> {
+        let records = self.store.load_tunnels()?;
+        let record = records
+            .iter()
+            .find(|t| t.spec.instance_id == id && t.spec.remote_port_or_default() == remote_port)
+            .cloned();
+
+        if let Some(rec) = record.as_ref() {
+            if let Some(facts) = rec.proc.as_ref() {
+                self.terminate(facts).await;
+            }
+            let control_path = self.paths.tunnel_control_path(id, remote_port);
+            self.control_exit(&rec.spec, &control_path).await;
+            unlink(&control_path);
+            self.forget_one(id, remote_port)?;
+            self.say(
+                id,
+                format!("tunnel down: instance {id} remote_port {remote_port}"),
+            );
         }
         Ok(())
     }
@@ -445,7 +486,7 @@ impl TunnelSupervisor {
     /// `[supervisor] max_restarts_per_hour` attempts in a rolling hour, then one `Serious`
     /// alert and no more retries until somebody brings it up by hand.
     pub async fn supervise(self: Arc<Self>) {
-        let mut state: HashMap<u64, Attempt> = HashMap::new();
+        let mut state: HashMap<(u64, u16), Attempt> = HashMap::new();
         while !self.stopped.load(Ordering::Acquire) {
             if let Err(e) = self.tick(&mut state).await {
                 tracing::warn!(error = %e, "tunnel supervisor tick failed");
@@ -483,17 +524,18 @@ impl TunnelSupervisor {
     // -----------------------------------------------------------------------------------
 
     /// One pass over every persisted record.
-    async fn tick(&self, state: &mut HashMap<u64, Attempt>) -> Result<()> {
+    async fn tick(&self, state: &mut HashMap<(u64, u16), Attempt>) -> Result<()> {
         let records = self.store.load_tunnels()?;
-        let known: HashSet<u64> = records.iter().map(|r| r.spec.instance_id.0).collect();
-        state.retain(|id, _| known.contains(id));
+        let known: HashSet<(u64, u16)> = records.iter().map(|r| tunnel_key(&r.spec)).collect();
+        state.retain(|k, _| known.contains(k));
 
         for rec in records {
             let id = rec.spec.instance_id;
+            let key = tunnel_key(&rec.spec);
             if rec.proc.as_ref().is_some_and(is_live) {
-                state.remove(&id.0);
+                state.remove(&key);
                 if !rec.up {
-                    self.update(id, |t| {
+                    self.update(key, |t| {
                         t.up = true;
                         t.last_error = None;
                     })?;
@@ -506,7 +548,7 @@ impl TunnelSupervisor {
 
             // What this pass does, decided while the entry is borrowed and acted on after.
             let attempt = {
-                let entry = state.entry(id.0).or_default();
+                let entry = state.entry(key).or_default();
                 if entry.exhausted || entry.next_at.is_some_and(|at| now < at) {
                     continue;
                 }
@@ -524,16 +566,17 @@ impl TunnelSupervisor {
 
             let Some(attempt) = attempt else {
                 let why = format!(
-                    "tunnel for instance {id} has exhausted its budget of \
-                     {budget} reconnects per hour and is staying down"
+                    "tunnel for instance {id} remote_port {} has exhausted its budget of \
+                     {budget} reconnects per hour and is staying down",
+                    rec.spec.remote_port_or_default()
                 );
-                self.update(id, |t| {
+                self.update(key, |t| {
                     t.up = false;
                     t.last_error = Some(why.clone());
                 })?;
                 self.alert(
                     AlertLevel::Serious,
-                    format!("tunnel.{id}.restarts"),
+                    format!("tunnel.{id}.{}.restarts", rec.spec.remote_port_or_default()),
                     why,
                     Some("tunnel up".to_owned()),
                 );
@@ -542,15 +585,18 @@ impl TunnelSupervisor {
 
             self.say(
                 id,
-                format!("tunnel for instance {id} is down; reconnect attempt {attempt}"),
+                format!(
+                    "tunnel for instance {id} remote_port {} is down; reconnect attempt {attempt}",
+                    rec.spec.remote_port_or_default()
+                ),
             );
             let outcome = self.up(rec.spec.clone()).await;
-            let entry = state.entry(id.0).or_default();
+            let entry = state.entry(key).or_default();
             match outcome {
                 Ok(_) => {
                     entry.failures = 0;
                     entry.next_at = None;
-                    self.update(id, |t| t.restarts = t.restarts.saturating_add(1))?;
+                    self.update(key, |t| t.restarts = t.restarts.saturating_add(1))?;
                     self.say(id, format!("tunnel for instance {id} reconnected"));
                 }
                 Err(e) => {
@@ -558,7 +604,7 @@ impl TunnelSupervisor {
                     let delay = self.backoff(attempt);
                     entry.next_at = Some(Instant::now() + delay);
                     let why = e.to_string();
-                    self.update(id, |t| {
+                    self.update(key, |t| {
                         t.up = false;
                         t.last_error = Some(why.clone());
                     })?;
@@ -659,22 +705,34 @@ impl TunnelSupervisor {
         }
     }
 
-    /// First port in `[vast] tunnel_port_range` that is neither bound nor already promised.
+    /// First port in `[vast] tunnel_port_range` that is neither bound nor already promised,
+    /// **skipping the 8810–8819 studio slice** (S5). Studio lanes pin 8811/8812 explicitly.
     fn pick_port(&self, records: &[TunnelStatus]) -> Result<u16> {
         let range = self.cfg_read(|c| c.vast.tunnel_port_range);
-        let taken: Vec<u16> = records.iter().map(|t| t.spec.local_port).collect();
-        proc::alloc_port(range, &taken).ok_or(Error::PortInUse {
-            port: range.0,
-            held_by: Some(format!(
-                "the tunnel port pool {}-{} is full",
-                range.0, range.1
-            )),
-        })
+        let mut taken: Vec<u16> = records.iter().map(|t| t.spec.local_port).collect();
+        // Reserve the studio slice so ordinary leases never land on 8811/8812.
+        let (slo, shi) = apexrouter_protocol::DEFAULT_STUDIO_PORT_RANGE;
+        for p in slo..=shi {
+            if !taken.contains(&p) {
+                taken.push(p);
+            }
+        }
+        proc::alloc_port(range, &taken)
+            .filter(|p| !is_studio_reserved_port(*p))
+            .ok_or(Error::PortInUse {
+                port: range.0,
+                held_by: Some(format!(
+                    "the tunnel port pool {}-{} is full (studio slice {}-{} reserved)",
+                    range.0, range.1, slo, shi
+                )),
+            })
     }
 
-    /// `$STATE/logs/tunnel-<instance-id>.log`.
-    fn log_file(&self, id: InstanceId) -> PathBuf {
-        self.paths.logs_dir().join(format!("tunnel-{}.log", id.0))
+    /// `$STATE/logs/tunnel-<instance-id>-<remote-port>.log`.
+    fn log_file(&self, id: InstanceId, remote_port: u16) -> PathBuf {
+        self.paths
+            .logs_dir()
+            .join(format!("tunnel-{}-{}.log", id.0, remote_port))
     }
 
     /// Read something out of the config without holding the lock any longer than that.
@@ -685,14 +743,12 @@ impl TunnelSupervisor {
         }
     }
 
-    /// Insert or replace one record.
+    /// Insert or replace one record, keyed on `(instance_id, remote_port)`.
     fn put(&self, status: TunnelStatus) -> Result<()> {
         let _guard = self.io_guard();
         let mut all = self.store.load_tunnels()?;
-        match all
-            .iter_mut()
-            .find(|t| t.spec.instance_id == status.spec.instance_id)
-        {
+        let key = tunnel_key(&status.spec);
+        match all.iter_mut().find(|t| tunnel_key(&t.spec) == key) {
             Some(slot) => *slot = status,
             None => all.push(status),
         }
@@ -700,22 +756,36 @@ impl TunnelSupervisor {
     }
 
     /// Mutate one record in place, if it is still there.
-    fn update(&self, id: InstanceId, f: impl FnOnce(&mut TunnelStatus)) -> Result<()> {
+    fn update(&self, key: (u64, u16), f: impl FnOnce(&mut TunnelStatus)) -> Result<()> {
         let _guard = self.io_guard();
         let mut all = self.store.load_tunnels()?;
-        let Some(slot) = all.iter_mut().find(|t| t.spec.instance_id == id) else {
+        let Some(slot) = all.iter_mut().find(|t| tunnel_key(&t.spec) == key) else {
             return Ok(());
         };
         f(slot);
         self.store.save_tunnels(&all)
     }
 
-    /// Drop one record.
-    fn forget(&self, id: InstanceId) -> Result<()> {
+    /// Drop every record for an instance.
+    fn forget_instance(&self, id: InstanceId) -> Result<()> {
         let _guard = self.io_guard();
         let mut all = self.store.load_tunnels()?;
         let before = all.len();
         all.retain(|t| t.spec.instance_id != id);
+        if all.len() == before {
+            return Ok(());
+        }
+        self.store.save_tunnels(&all)
+    }
+
+    /// Drop one `(instance, remote_port)` record.
+    fn forget_one(&self, id: InstanceId, remote_port: u16) -> Result<()> {
+        let _guard = self.io_guard();
+        let mut all = self.store.load_tunnels()?;
+        let before = all.len();
+        all.retain(|t| {
+            !(t.spec.instance_id == id && t.spec.remote_port_or_default() == remote_port)
+        });
         if all.len() == before {
             return Ok(());
         }
@@ -807,6 +877,11 @@ fn resolve_ssh() -> PathBuf {
         }
     }
     PathBuf::from("ssh")
+}
+
+/// Stable key for one tunnel forward: `(instance_id, remote_port)`.
+fn tunnel_key(spec: &TunnelSpec) -> (u64, u16) {
+    (spec.instance_id.0, spec.remote_port_or_default())
 }
 
 /// Remove a file that may not be there. A ControlPath we could not unlink is a warning, not
@@ -1075,7 +1150,7 @@ while True:
         let argv = tunnel_argv(
             &spec,
             Path::new("/state/ssh/known_hosts"),
-            Path::new("/state/ssh/cm-28675431"),
+            Path::new("/state/ssh/cm-28675431-8000"),
         );
         assert_eq!(
             argv,
@@ -1099,11 +1174,24 @@ while True:
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                "ControlPath=/state/ssh/cm-28675431",
+                "ControlPath=/state/ssh/cm-28675431-8000",
                 "-o",
                 "ControlPersist=5m",
             ]
         );
+    }
+
+    #[test]
+    fn pick_port_skips_the_studio_slice() {
+        // Ordinary allocation must never hand out 8810–8819 (S5).
+        let mut taken: Vec<u16> = (8800..8810).collect();
+        let (slo, shi) = apexrouter_protocol::DEFAULT_STUDIO_PORT_RANGE;
+        for p in slo..=shi {
+            taken.push(p);
+        }
+        // After reserving 8800–8819, the next free in a 8800–8825 pool is 8820.
+        let next = (8800u16..=8825).find(|p| !taken.contains(p) && !is_studio_reserved_port(*p));
+        assert_eq!(next, Some(8820));
     }
 
     #[test]
@@ -1178,6 +1266,48 @@ while True:
         h.sup.down(InstanceId(1)).await.expect("down");
     }
 
+    /// S4: three forwards on one instance (llm/video/image) coexist without clobbering.
+    #[tokio::test]
+    async fn multi_tunnel_on_one_instance_keeps_every_forward() {
+        let h = Harness::new();
+        let p_llm = free_port();
+        let p_video = free_port();
+        let p_image = free_port();
+
+        let mut llm = h.spec(42, p_llm);
+        llm.remote_port = 8000;
+        let mut video = h.spec(42, p_video);
+        video.remote_port = 8188;
+        let mut image = h.spec(42, p_image);
+        image.remote_port = 8189;
+
+        h.sup.up(llm).await.expect("llm");
+        h.sup.up(video).await.expect("video");
+        h.sup.up(image).await.expect("image");
+
+        let recs = h.records();
+        assert_eq!(recs.len(), 3, "three (instance,rport) rows");
+        let ports: std::collections::HashSet<u16> =
+            recs.iter().map(|t| t.spec.remote_port).collect();
+        assert_eq!(ports, [8000, 8188, 8189].into_iter().collect());
+        assert!(recs.iter().all(|t| t.up && t.spec.instance_id.0 == 42));
+
+        // Drop only the video lane.
+        h.sup
+            .down_one(InstanceId(42), 8188)
+            .await
+            .expect("down_one");
+        let recs = h.records();
+        assert_eq!(recs.len(), 2);
+        assert!(!recs.iter().any(|t| t.spec.remote_port == 8188));
+        assert!(recs.iter().any(|t| t.spec.remote_port == 8000));
+        assert!(recs.iter().any(|t| t.spec.remote_port == 8189));
+
+        // Drop the rest.
+        h.sup.down(InstanceId(42)).await.expect("down all");
+        assert!(h.records().is_empty());
+    }
+
     #[tokio::test]
     async fn a_zero_local_port_is_allocated_from_the_pool() {
         let h = Harness::new();
@@ -1216,7 +1346,9 @@ while True:
         let port = free_port();
         let status = h.sup.up(h.spec(1, port)).await.expect("up");
         let facts = status.proc.clone().expect("facts");
-        let control_path = h.paths.control_path(InstanceId(1));
+        let control_path = h
+            .paths
+            .tunnel_control_path(InstanceId(1), status.spec.remote_port);
         until("the ControlPath to appear", || control_path.exists()).await;
 
         h.sup.down(InstanceId(1)).await.expect("down");
@@ -1360,7 +1492,8 @@ while True:
         assert!(
             alerts.iter().any(|e| matches!(
                 e,
-                Event::Alert { id, action, .. } if id == "tunnel.9.restarts" && action.is_some()
+                Event::Alert { id, action, .. }
+                    if id == "tunnel.9.8000.restarts" && action.is_some()
             )),
             "expected one Serious alert, got {alerts:?}"
         );

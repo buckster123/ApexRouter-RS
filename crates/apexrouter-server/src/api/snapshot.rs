@@ -178,6 +178,8 @@ pub async fn build(state: &Arc<AppState>) -> Snapshot {
         // is what blanked the Fleet & cost page (GARDEN-RUNS.md, R4).
         instances: state.fleet_cache().instances,
         tunnels: state.store.load_tunnels().unwrap_or_default(),
+        services: state.store.load_services().unwrap_or_default(),
+        studio: state.store.load_studio().unwrap_or_default(),
         providers: providers(&cfg, state),
         recipes: catalog.recipes,
         profiles: catalog.profiles,

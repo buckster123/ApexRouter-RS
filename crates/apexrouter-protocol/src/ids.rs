@@ -142,6 +142,10 @@ slug_id!(BuildId, "llama.cpp build id, which is the build-dir name");
 slug_id!(RecipeId, "recipe id");
 slug_id!(ProfileId, "vast.ai search-profile id");
 slug_id!(ProviderId, "managed-provider id");
+slug_id!(
+    ServiceId,
+    "studio service id — a non-Backend lane on a rented box"
+);
 
 /// A vast.ai contract id. Note that the create call returns it as `new_contract`, not `id`.
 #[derive(
