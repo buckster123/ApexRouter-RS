@@ -44,8 +44,9 @@ tools to local agents.
 3. **Persisted records hold facts, never status.** `pid`, `start_time_ticks`, `boot_id`, `port`,
    `argv`, `desired_state`. Liveness is *computed* on read — `status: "running"` on disk is a lie
    the moment someone types `kill`.
-4. **Nothing that costs money is auto-destroyed, and nothing that costs money happens without a
-   `SpendApproval`.** The ledger row is written *before* the billing call.
+4. **Nothing that costs money is auto-destroyed on shutdown/crash, and nothing that costs money
+   happens without a `SpendApproval`.** The ledger row is written *before* the billing call.
+   (Boot watchdog may stop a wedged rental — CHARTER D10 carve-out 2026-08-07.)
 5. **One XDG state dir. Nothing is ever written into a repo.**
 
 ---

@@ -207,8 +207,12 @@ pub struct RouterCfg {
     pub retry_budget_per_min: u32,
     /// Observations required before the breaker may open.
     pub breaker_min_volume: u32,
-    /// `off` | `passthrough`. Injecting `stream_options.include_usage` changes what every
-    /// streaming client receives, so opting in is a choice, not a default.
+    /// `off` | `passthrough`. **Parsed and documented; not yet applied on the OpenAI request
+    /// path in mk1** — the Anthropic → OpenAI cell always injects usage for its own
+    /// accounting, and the OpenAI cell leaves the client body alone. Kept so a config that
+    /// already names the key does not fail to load, and so mk2 can wire it without a schema
+    /// change. Injecting `stream_options.include_usage` changes what every streaming client
+    /// receives, so opting in stays a choice, not a default.
     pub request_usage: String,
     /// Prompts are NEVER stored unless this is on.
     pub capture_bodies: bool,

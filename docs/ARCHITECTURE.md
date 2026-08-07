@@ -8,12 +8,12 @@
 > Companion: `docs/BUILD-PLAN.md` (the parallel-agent implementation plan). Between them these two
 > files are the sole input for implementation agents.
 >
-> **Last cross-checked against the code on 2026-07-31** (work unit D-04), with a live daemon and a
-> real request through the proxy. Where the shipped code disagreed with this document, **the code
-> won and this document was corrected**, because the code is what 1411 tests and the MK1-CORE
-> acceptance run exercise. Those corrections are marked **As built:** so the delta is legible
-> rather than silently absorbed. Operational companions written from the same pass:
-> `docs/SLINT.md`, `docs/AGENTS.md`, `skills/apexrouter/SKILL.md`.
+> **Last cross-checked against the code on 2026-08-07** (full-repo audit packages a–c: proxy
+> mutation gate mounted, money-path composition fixes, jobs/`register_started`/`retry_bucket`
+> wiring, D10 boot-watchdog carve-out). Earlier **As built:** notes from 2026-07-31 (D-04 /
+> MK1-CORE) remain. Where this disagrees with the code, **one of them is a bug** — say which.
+> Operational companions: `docs/SLINT.md`, `docs/AGENTS.md`, `skills/apexrouter/SKILL.md`,
+> `docs/audits/2026-08-07-full-repo-audit.md`.
 
 ---
 
@@ -65,7 +65,7 @@ Two listeners in one process, because a single listener cannot satisfy both cont
 | Listener | Default bind | Contents | Auth posture |
 |---|---|---|---|
 | **Proxy / data plane** | `127.0.0.1:8888` | `/v1/*`, the catch-all fallback, and the three byte-compatible legacy routes `/health`, `/providers`, `POST /switch` | open on loopback (`OPENAI_API_KEY=not-needed` keeps working); optional bearer; `POST /switch` is treated as a mutation and gets the mutation gate (§9.3) |
-| **Control plane** | `127.0.0.1:2739` (`APEX` on a keypad) | `/v1/*` control REST, `/ws`, the embedded web UI, and `/metrics` (§4.5 — written, not yet mounted) | one configured bearer, loopback bypass keyed on `ConnectInfo` peer IP, mandatory `Origin`/`Sec-Fetch-Site` + `Host` validation on every mutation (§9.4) |
+| **Control plane** | `127.0.0.1:2739` (`APEX` on a keypad) | `/v1/*` control REST, `/ws`, the embedded web UI, and `/metrics` (§4.5 — **Prometheus text written, not yet mounted**; control answers 404) | one configured bearer, loopback bypass keyed on `ConnectInfo` peer IP, mandatory `Origin`/`Sec-Fetch-Site` + `Host` validation on every mutation (§9.4); proxy `POST /switch` uses the same mutation gate (§9.3) |
 
 Why not one socket: the proxy is a catch-all by contract (`05` §2 — everything that is not one of
 five (path, method) pairs is proxied, including `POST /health`). A catch-all `any()` route and the
@@ -1067,11 +1067,13 @@ Order, and what each rule buys:
    `ImplicitMulti`, plus a one-shot `Alert` naming the collision (a duplicate id appearing after a
    rental is exactly when routing silently changes under you).
 5. `model` is in `legacy_model_names` (`""`, `"x"`, `"auto"`, `"default"`, absent) → `default_alias`.
-   **This is why `smoke.sh`'s hardcoded `"model":"x"` keeps working.** → `DefaultFallback`
+   **This is why `smoke.sh`'s hardcoded `"model":"x"` keeps working.** → **`LegacyModelName`**
+   (the wire token is `legacy_model_name`). `DefaultFallback` / `default_fallback` is **only**
+   rule 6 under `[router] unknown_model = "fallback"`.
 6. Anything else → behaviour from `[router] unknown_model`, **default `reject`**: `404`
-   `model_not_found` listing known aliases. Set `= "fallback"` to get LocalRouter's old behaviour.
-   Rejecting by default is deliberate: a fat-fingered `gpt-4o-mimi` must not silently bill a rented
-   H100.
+   `model_not_found` listing known aliases. Set `= "fallback"` to get LocalRouter's old behaviour
+   (`RouteReason::DefaultFallback`). Rejecting by default is deliberate: a fat-fingered
+   `gpt-4o-mimi` must not silently bill a rented H100.
 
 **As built, two classes never route on the model string.** `GET`/`HEAD` on `RequestClass::Models`
 is answered by R-06 straight from the table, **before `resolve()` is called at all** — no upstream
@@ -1190,11 +1192,12 @@ both house projects), `starting`→503.
 Concurrency: one `Semaphore` per backend sized from `/props.total_slots` when available (the argv
 builder **passes `--props`, `--metrics` and `--slots`** to every server ApexRouter launches, feature
 detected — otherwise the sizing would read an endpoint we never enabled), else from `/slots` length,
-else config. A **global `max_inflight` (count) and `max_inflight_bytes` (bytes)** budget — a count
-cap alone permits 64 × 32 MiB of resident bodies. Retry budget is a **per-backend token bucket**, so
-a struggling backend cannot be amplified into a storm. The breaker requires `min_volume` (5)
-observations before it can open, so a single 200 ms blip on a 1 rps rig does not create a 30 s
-outage.
+else config's **`[router] max_inflight` as the per-backend permit default** (not a global count).
+A **global `max_inflight_bytes`** budget caps resident body memory — a count cap alone would permit
+64 × 32 MiB of RSS. Retry budget is a **per-backend token bucket** (`retry_budget_per_min`, spent
+on failover retries after the first attempt), so a struggling backend cannot be amplified into a
+storm. The breaker requires `min_volume` (5) observations before it can open, so a single 200 ms
+blip on a 1 rps rig does not create a 30 s outage.
 
 **As built, `/metrics` is written but not yet mounted.** `router::telemetry::Telemetry::prometheus
 (&BackendRegistry, Option<&RigSnapshot>) -> String` produces the exposition below and is

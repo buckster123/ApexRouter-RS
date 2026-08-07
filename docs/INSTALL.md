@@ -685,7 +685,9 @@ api_key_env = "OPENROUTER_API_KEY"
 ```
 
 **Money.** vast.ai rentals require a `SpendApproval`, the ledger row is written *before* the billing
-call, and nothing that costs money is auto-destroyed — not on shutdown, not on crash, at no setting.
+call, and nothing that costs money is auto-destroyed on shutdown or crash (CHARTER D10). The boot
+watchdog may destroy a *wedged* rental that never becomes healthy — that is stopping the meter, not
+cleanup on exit.
 There is a hard daemon-side ceiling you should set before you rent anything:
 
 ```toml
@@ -863,7 +865,8 @@ Three things it warns about before it does anything, because afterwards you cann
 
 - **`llama-server` children outlive the manager by design.** Removing ApexRouter does not free their
   VRAM. Stop them first with `apexrouter endpoint stop <id>`.
-- **Live vast.ai instances keep billing.** Nothing that costs money is ever auto-destroyed — that is
+- **Live vast.ai instances keep billing.** Nothing that costs money is auto-destroyed on
+  shutdown or crash — that is
   invariant 4 and it is a feature right up until you forget a box exists. Check
   `apexrouter vast ls` *before* you remove the binary that can list it. It reads the ledger, so it
   answers with the daemon down.

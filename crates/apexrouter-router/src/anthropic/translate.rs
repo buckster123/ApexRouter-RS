@@ -58,11 +58,15 @@
 use serde_json::{json, Map, Value};
 
 /// From `[router] anthropic_tools`.
+///
+/// **Stock config defaults `tools: true`** (CHARTER amendment 2026-07-31 — Claude Code
+/// sends tools on every request). This struct's [`Default`] is `tools: false` so a unit
+/// test that does not pass config stays conservative; production always builds from
+/// `RouterCfg.anthropic_tools`, not from `AnthropicCfg::default()`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnthropicCfg {
-    /// **Off by default.** With it off, a `/v1/messages` body carrying `tools` is REFUSED
-    /// with a clear error naming the config key — never silently stripped and answered
-    /// wrongly, which is the failure mode that actually costs an agent an hour.
+    /// When false, a `/v1/messages` body carrying `tools` is REFUSED with a clear error
+    /// naming the config key — never silently stripped and answered wrongly.
     pub tools: bool,
 }
 

@@ -101,8 +101,8 @@ backends, so `/v1/embeddings` cannot land on a chat-only llama-server.
 | 2 | `model` is `"<backend_id>/<upstream_model>"` | one candidate, **explicit pin** | `explicit_pin` | no — `RetryPolicy::default()` |
 | 3 | `model` matches an **upstream model id** on exactly one enabled backend | that backend | `upstream_id_match` | no |
 | 4 | same upstream id on several backends | implicit route via `[router] implicit_strategy` | `implicit_multi` | no |
-| 5 | `model` ∈ `legacy_model_names` (`""`, `"x"`, `"auto"`, `"default"`, or absent) | `default_alias` | `default_fallback` | yes |
-| 6 | anything else | `[router] unknown_model` | — | — |
+| 5 | `model` ∈ `legacy_model_names` (`""`, `"x"`, `"auto"`, `"default"`, or absent) | `default_alias` | `legacy_model_name` | yes |
+| 6 | anything else | `[router] unknown_model` — `reject` → 404; `fallback` → `default_alias` | `default_fallback` only under `fallback` | yes when fallback |
 
 **What each rule buys.**
 
@@ -240,9 +240,10 @@ and on a metered provider, three times the bill.
 ### 5.3 Admission control
 
 Per-backend concurrency is a `Semaphore` sized from `/props.total_slots` when available, else from
-the length of `/slots`, else from `BackendLimits.max_concurrent`. Globally there are **two** budgets:
-`max_inflight` (a count) and `max_inflight_bytes` (512 MiB by default). A count cap alone is not a
-budget — 64 × 32 MiB of resident bodies is 2 GiB of RSS.
+the length of `/slots`, else from `BackendLimits.max_concurrent`, else **`[router] max_inflight`**
+as that backend's permit default (a *per-backend* count, not a global one). Globally there is a
+**`max_inflight_bytes`** budget (512 MiB by default) on resident request bodies — without it,
+N backends × large bodies would be unbounded RSS.
 
 `InFlightGuard` owns the semaphore permit, the byte-budget permit, the in-flight gauge and the
 `RequestRecord`. Its `Drop` emits `RequestFinished { aborted: true }` when `finish()` was never
@@ -344,7 +345,7 @@ Nothing was configured. The prober had already indexed Together's catalogue.
 POST /v1/v1/chat/completions  {"model":"x"}
   path normalisation collapses the doubled /v1
   rule 5 → default_alias "auto" → first_healthy → local-carnice
-  X-ApexRouter-Route: auto|default_fallback
+  X-ApexRouter-Route: auto|legacy_model_name
 ```
 
 **A typo.**
@@ -388,8 +389,9 @@ POST /v1/chat/completions  {"model":"big","stream":true}
 | `default_alias` | `"auto"` | where rules 5 and 6-as-fallback land |
 | `implicit_strategy` | `"first_healthy"` | rule 4's ranking |
 | `unknown_model` | `"reject"` | rule 6: `reject` → 404, `fallback` → `default_alias` |
-| `max_inflight` | 64 | global request count |
-| `max_inflight_bytes` | 536870912 | global resident-body budget |
+| `max_inflight` | 64 | **per-backend** permit default when `/props` and limits are silent |
+| `max_inflight_bytes` | 536870912 | **global** resident-body budget |
+| `request_usage` | `"off"` | parsed; **not yet applied** on the OpenAI path in mk1 (see config doc) |
 | `max_body_bytes` | 33554432 | per-request 413 threshold |
 | `connect_timeout_ms` | 5000 | TCP/TLS establishment |
 | `headers_timeout_ms` | 600000 | first response byte — **not** a total timeout |

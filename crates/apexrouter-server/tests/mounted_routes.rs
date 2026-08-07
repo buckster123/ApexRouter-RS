@@ -668,7 +668,8 @@ async fn the_mounted_method_set_is_the_method_set_the_modules_register() {
 /// is what holds the two together, so a path documented here is a path §6 promises.
 ///
 /// The "not implemented at all" exemption is **derived**, never listed: a documented path with
-/// no `.route()` anywhere in the source is genuinely unbuilt (`/metrics`, `POST /v1/migrate`),
+/// no `.route()` anywhere in the source is genuinely unbuilt (`/metrics` alone —
+/// `POST /v1/migrate` shipped 2026-08-01 and is merged in `v1_routes()`),
 /// and the moment somebody writes its handler it stops being exempt and must be mounted.
 #[tokio::test]
 async fn every_documented_control_route_is_reachable() {

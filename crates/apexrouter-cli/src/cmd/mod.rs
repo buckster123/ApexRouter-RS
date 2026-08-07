@@ -145,11 +145,12 @@ pub async fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     }
 }
 
-/// The verbs the build plan delivers in a later stage, and who owns each one.
+/// Verbs once owned by a later work unit and not yet in the binary.
 ///
-/// Reporting this beats clap's "unrecognized subcommand": the operator running the
-/// MK1-CORE transcript learns which unit is missing and what to type meanwhile.
-const PENDING: &[(&str, &str, &str)] = &[("mcp", "M-01", "")];
+/// **Empty since M-01 landed:** `apexrouter mcp` is intercepted in `main` before clap and
+/// runs the stdio MCP server. Kept as a table so a future deferred verb can reclaim the
+/// "names its work unit" failure mode instead of clap's bare "unrecognized subcommand".
+const PENDING: &[(&str, &str, &str)] = &[];
 
 /// Report an unimplemented — or simply unknown — verb.
 ///
@@ -175,10 +176,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_planned_verb_names_its_work_unit() {
-        let e = pending(&["mcp".to_string(), "x".to_string()]).expect_err("must fail");
-        let msg = e.to_string();
-        assert!(msg.contains("M-01"), "{msg}");
+    fn mcp_is_not_listed_as_pending_it_ships() {
+        // A regression would send operators to "M-01 not in this build" while `main`
+        // intercepts `mcp` successfully. Keep the table honest.
+        assert!(
+            !PENDING.iter().any(|(name, _, _)| *name == "mcp"),
+            "mcp shipped with M-01; remove it from PENDING"
+        );
     }
 
     #[test]

@@ -294,7 +294,7 @@ mod tests {
             "tools":[{"name":"f","input_schema":{"type":"object"}}],
             "messages":[{"role":"user","content":"hi"}]}"#;
         let e = request_to_openai(body, &AnthropicCfg { tools: false })
-            .expect_err("tools are off by default");
+            .expect_err("tools flag off must refuse");
         let res = translate_error(&e);
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let v = body_json(res).await;

@@ -578,10 +578,11 @@ data: [DONE]
   streams the response carries `X-ApexRouter-Usage-Deferred: true` and the numbers land in
   `usage.jsonl`, in the `request_finished` WS event and in the live-request table. **This is a
   stated, tested divergence from LocalRouter.**
-- `[router] request_usage` defaults to **`"off"`**. Injecting `stream_options.include_usage` when
-  the client did not ask changes what every streaming client receives, so opting in is a choice.
-  When it is `"passthrough"` we do **not** filter the extra chunk back out — that would break the
-  byte-exactness claim in the other direction.
+- `[router] request_usage` defaults to **`"off"`** and is **parsed but not yet applied** on the
+  OpenAI request path in mk1 (the key is reserved so configs do not fail to load; Anthropic →
+  OpenAI translation injects usage for its own accounting regardless). When wired as
+  `"passthrough"`, injecting `stream_options.include_usage` when the client did not ask changes
+  what every streaming client receives — so opting in stays a choice.
 - `X-Accel-Buffering: no`, `Cache-Control: no-cache`.
 
 ---
@@ -596,7 +597,7 @@ reachable through the proxy for the first time.
 |---|---|---|
 | out | `content-type`, `accept`, `user-agent`, `x-request-id` | copied when present |
 | out | `accept-encoding: identity` | forced; the proxy never negotiates compression |
-| out | the backend's own credential | from `CredentialSource`, resolved per request |
+| out | the backend's own credential | from `CredentialSource`, materialised at backend upsert (Env/File); not re-read on the request path |
 | out | `Via: 1.1 apexrouter` | also the loop guard's token |
 | **never** out | `authorization` from the client, `x-api-key`, `anthropic-version`, `cookie` | consumed by the proxy |
 | back | `X-Request-Id` | the `RequestId` on the record |

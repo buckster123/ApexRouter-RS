@@ -6,10 +6,9 @@
 //! Global flags `--config` and `--home` are pushed into the process env **before**
 //! `Config::load()`, so env vars stay the single resolution mechanism.
 //!
-//! Verbs this build does not implement yet fall into [`Command::External`], which reports
-//! which work unit owns them instead of clap's bare "unrecognized subcommand". The noun
-//! groups delivered by S-08 (`up`, `swap`, `doctor`, `usage`, `vast`, `hf`, …) and M-01
-//! (`mcp`) add their own variants here when they land.
+//! Unknown trailing verbs fall into [`Command::External`], which names them instead of
+//! clap's bare "unrecognized subcommand". `apexrouter mcp` never reaches clap: `main`
+//! intercepts it for the stdio MCP server (M-01, shipped).
 
 use crate::daemon::Need;
 use apexrouter_core::usage::GroupBy;
@@ -1904,13 +1903,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unimplemented_verb_lands_in_external_rather_than_a_clap_error() {
-        // `mcp` belongs to M-01 and is intercepted in `main` before clap; until it lands it
-        // is the verb that proves the fallback still reports an owner rather than clap's
-        // bare "unrecognized subcommand".
-        let cli = Cli::parse_from(["apexrouter", "mcp", "--proxy", "http://127.0.0.1:2739"]);
+    fn an_unknown_verb_lands_in_external_rather_than_a_clap_error() {
+        // Real `mcp` is intercepted in `main` before clap. External is the fallback for
+        // anything clap does not own — still better than clap's bare "unrecognized".
+        let cli = Cli::parse_from(["apexrouter", "frobnicate", "--extra"]);
         match cli.verb() {
-            Command::External(args) => assert_eq!(args[0], "mcp"),
+            Command::External(args) => assert_eq!(args[0], "frobnicate"),
             other => panic!("expected External, got {other:?}"),
         }
     }

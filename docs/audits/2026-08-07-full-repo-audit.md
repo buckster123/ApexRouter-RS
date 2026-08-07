@@ -379,3 +379,15 @@ Live-confirmed P0: **mount the proxy mutation gate.**
 | Core & providers | ledger, fit, argv, discover, hermeticity, honesty types |
 
 No source files were modified by this audit.
+
+---
+
+## Appendix C — Remediation log
+
+| Package | Commit | Scope |
+|---|---|---|
+| **(a)** | `3a42962` | C1 proxy mutation gate + ListenerBind; H1 rent offer dph; H2 single destroy path; H3 human gate gates Api; H7 ledger fsync |
+| **(b)** | `186a17c` | H5 jobs at build_state; H4 register_started; H6 retry_bucket; H9 creds at upsert; H8 ImplicitMulti alert |
+| **(c)** | *(this hygiene pass)* | D10 boot-watchdog carve-out; MCP PENDING cleared; ROUTING/ARCHITECTURE rule-5 + max_inflight; request_usage tombstone; mounted_routes migrate comment; ARCHITECTURE cross-check 2026-08-07 |
+
+Still open from the audit backlog (not package a–c): `/metrics` mount, optional startup ledger↔fleet alert reconcile, stamp completeness on park/NoHealthy edges, multi-GPU soak, ledger O(1) seq.
