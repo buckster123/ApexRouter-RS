@@ -592,6 +592,7 @@ pub(crate) mod testkit {
             lock: Arc::new(Mutex::new(lock)),
             fleet: std::sync::RwLock::new(crate::state::FleetCache::default()),
             telemetry,
+            service_status: Arc::new(crate::svc_prober::ServiceStatusCache::default()),
         })
     }
 

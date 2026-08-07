@@ -48,6 +48,7 @@ pub mod jobs;
 pub mod prober;
 pub mod shutdown;
 pub mod state;
+pub mod svc_prober;
 #[allow(unused)]
 pub mod watcher;
 #[allow(unused)]
@@ -256,6 +257,10 @@ pub async fn build_state(
     assets::set_ui_dir(ui_dir_of(&cfg));
 
     let store = Store::new(paths.clone());
+    // Studio-96gb profile + recipe: additive seed, hand edits win (idempotent).
+    if let Err(e) = apexrouter_core::catalog::ensure_studio_seeds(&paths, &cfg.docker.studio) {
+        tracing::warn!(error = %e, "could not seed studio-96gb catalog entries");
+    }
     let state = Arc::new(AppState::new(
         paths,
         cfg,
@@ -331,6 +336,8 @@ pub async fn run(state: Arc<AppState>, shutdown: ShutdownHandle) -> anyhow::Resu
 
     // ---- 9. the pollers ----------------------------------------------------------------
     tokio::spawn(prober::health_prober(Arc::clone(&state)));
+    // Studio ServiceRecords (Comfy lanes) — never the routing table (S2 / S7).
+    tokio::spawn(svc_prober::service_prober(Arc::clone(&state)));
     tokio::spawn(watcher::config_watcher(Arc::clone(&state)));
     tokio::spawn(fleet::vast_fleet_poller(Arc::clone(&state)));
     // Alert-only ledger ↔ live fleet compare — not on the bind critical path, never destroys.

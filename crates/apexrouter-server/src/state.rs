@@ -11,6 +11,7 @@
 //! that a request path takes. `cfg` is an `ArcSwap` so a reload is a pointer store, and the
 //! routing table lives behind [`apexrouter_router::Router`] for the same reason.
 
+use crate::svc_prober::ServiceStatusCache;
 use apexrouter_core::checks::Registry;
 use apexrouter_core::config::Config;
 use apexrouter_core::lockfile::DaemonLock;
@@ -69,6 +70,8 @@ pub struct AppState {
     /// Prometheus counters + gauges for `GET /metrics` (R-07). Fed from the same
     /// `RequestFinished` bus the live-request log listens on.
     pub telemetry: Arc<Telemetry>,
+    /// Computed liveness for ServiceRecords (Comfy lanes). Never persisted.
+    pub service_status: Arc<ServiceStatusCache>,
     /* provider slots filled in Stage 5: vast, hf, together, tunnels */
 }
 
@@ -105,6 +108,7 @@ impl AppState {
             lock: Arc::new(Mutex::new(lock)),
             fleet: RwLock::new(FleetCache::default()),
             telemetry,
+            service_status: Arc::new(ServiceStatusCache::default()),
         }
     }
 

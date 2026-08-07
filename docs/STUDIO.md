@@ -295,12 +295,18 @@ Phases 1–2 and 3–7 are independent tracks; T1 needs nothing from ApexRouter 
 
 ## 7. Amendments log
 
+- **2026-08-07** — **Phase 6 shipped.** `core::studio::studio_budget()` (per-device free =
+  capacity − Σ reserved − headroom → `VramBudget` for existing `fit()`); `server::svc_prober`
+  probes ServiceRecords via local tunnels (`/system_stats` / `/v1/models`), caches
+  `ServiceStatus`, alerts on VRAM over reservation; seed profile+recipe `studio-96gb` (★140330
+  pin, EU-first geo, ImageType::Studio) via `ensure_studio_seeds` at daemon start. Phase 7
+  (the verb) still open.
 - **2026-08-07** — **Phase 5 image scaffold shipped.** `docker/studio/{Dockerfile,studio.sh,
   stop.sh,install-custom-nodes.sh,README.md}` + GHA `vastai-studio image` workflow. Image
   ref `ghcr.io/buckster123/vastai-studio:cu128` (dated rollback tags). llama-server via
   `COPY --from=vastai-gguf:prebuilt`; ComfyUI pin `e803f24` (R3); python3.12-dev + torch
   cu128; idempotent onstart with `/run/studio/*.pid`; exact-file weight pulls. **Not yet
-  built/pushed to ghcr** — dispatch the workflow when ready. Phase 6–7 still open.
+  built/pushed to ghcr** — dispatch the workflow when ready.
 - **2026-08-07** — **Phase 3–4 foundation shipped** (protocol + multi-tunnel + store). Additive
   only: `RecipeKind::VastStudio`, `ServiceSpec`/`ServiceRecord`/`StudioRecord`,
   `ImageType::Studio`, `Event::ServiceChanged|Removed|StudioChanged`,

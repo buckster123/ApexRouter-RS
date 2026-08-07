@@ -180,6 +180,78 @@ pub struct StudioRecord {
     pub updated_at_unix: i64,
 }
 
+// ---------------------------------------------------------------------------
+// Computed status (never persisted — invariant 3)
+// ---------------------------------------------------------------------------
+
+/// What the svc_prober last observed for one ServiceRecord. **Computed on read.**
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ServiceLiveness {
+    /// Prober has not spoken yet.
+    Unknown,
+    /// TCP/HTTP in flight or connection refused that may still be loading.
+    Starting {
+        /// Free-text detail (e.g. `"connection refused"`).
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    /// Probe path answered 2xx.
+    Ready,
+    /// Process expectation is Running but the probe is dead.
+    Down {
+        /// Why.
+        detail: String,
+    },
+    /// Observed VRAM exceeds the static reservation (S7 alert path).
+    ExceedsReservation {
+        /// What `/system_stats` reported, MiB.
+        observed_mb: u32,
+        /// What the ServiceRecord reserved, MiB.
+        reserved_mb: u32,
+    },
+}
+
+/// Live view of one service: facts + computed liveness. Not written to disk.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ServiceStatus {
+    /// The persisted facts.
+    pub record: ServiceRecord,
+    /// What the prober last saw.
+    pub liveness: ServiceLiveness,
+    /// Observed VRAM when the probe can report it (Comfy `/system_stats`).
+    #[serde(default)]
+    pub observed_vram_mb: Option<u32>,
+    /// When the last probe finished, unix seconds. `0` = never.
+    pub last_probe_unix: i64,
+}
+
+/// Per-device remainder after Comfy static reservations (S7). Pure planning output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StudioDeviceBudget {
+    /// Device token (`"0"`, `"1"`, …).
+    pub device: String,
+    /// Capacity we are planning against, MiB (usually card total or free-at-rent).
+    pub capacity_mb: u64,
+    /// Σ `ServiceSpec.reserved_mb` for lanes on this device, MiB.
+    pub reserved_mb: u64,
+    /// Global headroom held back on every device, MiB.
+    pub headroom_mb: u64,
+    /// `capacity − reserved − headroom`, saturating. What `fit()` may spend for the llm.
+    pub free_for_llm_mb: u64,
+}
+
+/// Full studio VRAM plan: per-device remainders + notes. Never a sum across devices.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StudioBudget {
+    /// One row per device that appears in any service's `devices` list (or explicit caps).
+    #[serde(default)]
+    pub devices: Vec<StudioDeviceBudget>,
+    /// Human-readable arithmetic, same spirit as `FitPlan::why`.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
 /// Seed helper: the R3-measured 96 GB dual-4090 posture (S2 table), without weights.
 ///
 /// Ports: llm remote 8000 / local lease; video 8188→**8811**; image 8189→**8812**.

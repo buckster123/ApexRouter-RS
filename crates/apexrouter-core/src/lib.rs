@@ -35,6 +35,7 @@ pub mod pricing;
 pub mod proc;
 pub mod secret;
 pub mod store;
+pub mod studio;
 pub mod upstream;
 pub mod usage;
 

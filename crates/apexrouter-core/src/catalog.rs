@@ -606,7 +606,105 @@ pub fn default_profiles() -> Vec<SearchProfile> {
             image_type: ImageType::Prebuilt,
             extra: serde_json::Map::new(),
         },
+        // Studio daily rung (S19–S21): dual consumer 48 GB class, verified preferred,
+        // geo EU-first with Asia (★140330) and USA as explicit favorites/profiles later.
+        SearchProfile {
+            id: id_from("studio-96gb", ProfileId::parse),
+            label: "Studio 96 GB (2× ~48 GB, e.g. modded-4090 pair)".to_string(),
+            gpu_names: vec![
+                "RTX 4090".to_string(),
+                "RTX 4090 D".to_string(),
+                "RTX 5090".to_string(),
+            ],
+            num_gpus_min: 2,
+            num_gpus_max: 2,
+            max_dph: Some(Money::from_usd(1.50)),
+            min_reliability: 0.98,
+            min_inet_down: 300,
+            min_disk_gb: 800,
+            min_cuda: Some(12.4),
+            geo: GeoFilter::Eu,
+            image_type: ImageType::Studio,
+            extra: serde_json::Map::new(),
+        },
     ]
+}
+
+/// Seed recipe for the R3 dual-48GB studio posture (STUDIO.md S2 / S6).
+///
+/// Written with a fixed id via [`save`] (same discipline as [`default_profiles`]). Weights
+/// and `STUDIO_FETCH_FILES` are env at rent time — the recipe names the image + services.
+pub fn default_studio_recipe(studio_image: &str) -> Recipe {
+    use apexrouter_protocol::{studio_96gb_services, StudioLaunch};
+    let now = now_unix();
+    Recipe {
+        id: id_from("studio-96gb", RecipeId::parse),
+        label: "Studio 96 GB daily (LLM + Wan video + Qwen-Image)".to_string(),
+        description: Some(
+            "R3-measured dual-48GB posture: llm on GPU0 remainder, Wan TI2V-5B @ 8811, \
+             Qwen-Image @ 8812. Re-measure reservations on recipe change (S7)."
+                .into(),
+        ),
+        kind: RecipeKind::VastStudio {
+            profile: id_from("studio-96gb", ProfileId::parse),
+            machine_id: Some(140_330), // ★ favorite pin; degrades to profile search if gone
+            launch: StudioLaunch {
+                image: studio_image.to_owned(),
+                image_type: ImageType::Studio,
+                disk_gb: 2000,
+                env: std::collections::BTreeMap::from([
+                    ("HOST".into(), "127.0.0.1".into()),
+                    ("MODEL_SOURCE".into(), "modelscope".into()),
+                    ("STUDIO_SERVICES".into(), "llm video image".into()),
+                ]),
+                onstart: "bash /app/studio.sh > /var/log/studio.log 2>&1 &".into(),
+                host: "127.0.0.1".into(),
+                expose_public: false,
+                services: studio_96gb_services(),
+            },
+        },
+        provenance: Provenance2 {
+            discovered_at_unix: now,
+            size_bytes: None,
+            source: "seed:docs/STUDIO.md S2 R3".into(),
+            fit: None,
+        },
+        created_at_unix: now,
+        updated_at_unix: now,
+    }
+}
+
+/// Ensure the studio-96gb profile + recipe exist in `$STATE/catalog.toml`.
+///
+/// Idempotent: existing rows with the same id are left alone (hand edits win). Call from
+/// migrate or `apexrouter recipe seed-studio` later; safe to call on every daemon start.
+///
+/// # Errors
+/// Propagates catalog I/O / parse failures.
+pub fn ensure_studio_seeds(paths: &Paths, studio_image: &str) -> Result<()> {
+    let store = Store::new(paths.clone());
+    store.with_state_lock_exclusive(|| {
+        let file = paths.catalog_file();
+        let mut cat = read_file(&file)?;
+        let mut dirty = false;
+        if !cat.profiles.iter().any(|p| p.id.as_str() == "studio-96gb") {
+            if let Some(p) = default_profiles()
+                .into_iter()
+                .find(|p| p.id.as_str() == "studio-96gb")
+            {
+                cat.profiles.push(p);
+                dirty = true;
+            }
+        }
+        if !cat.recipes.iter().any(|r| r.id.as_str() == "studio-96gb") {
+            cat.recipes.push(default_studio_recipe(studio_image));
+            dirty = true;
+        }
+        if dirty {
+            write_file(&store, &file, &cat)?;
+        }
+        Ok(())
+    })
 }
 
 /// "Save this running thing as a recipe."
@@ -1584,19 +1682,25 @@ mod tests {
     #[test]
     fn default_profiles_use_the_exact_gpu_name_strings_and_ranges() {
         let p = default_profiles();
-        assert_eq!(p.len(), 4);
+        assert!(p.len() >= 5, "expected original four plus studio-96gb");
 
         let ids: Vec<&str> = p.iter().map(|x| x.id.as_str()).collect();
-        assert_eq!(ids, ["rtx3090-2-4", "rtx3090-4-perf", "h100-1", "h100-2"]);
+        assert_eq!(
+            &ids[..4],
+            ["rtx3090-2-4", "rtx3090-4-perf", "h100-1", "h100-2"]
+        );
+        assert!(ids.contains(&"studio-96gb"));
 
-        // The exact strings verified in docs/port/00c, and nothing else.
-        let vocabulary = ["RTX 3090", "H100 SXM", "H100 NVL", "H100 PCIE"];
+        // The exact strings verified in docs/port/00c for the classic tiers, plus the
+        // studio consumer vocabulary (4090 / 5090 class).
+        let classic = ["RTX 3090", "H100 SXM", "H100 NVL", "H100 PCIE"];
+        let studio_vocab = ["RTX 4090", "RTX 4090 D", "RTX 5090"];
         for prof in &p {
             assert!(!prof.gpu_names.is_empty(), "{prof:?}");
             for name in &prof.gpu_names {
                 assert!(
-                    vocabulary.contains(&name.as_str()),
-                    "{name:?} is not one of the verified gpu_name strings"
+                    classic.contains(&name.as_str()) || studio_vocab.contains(&name.as_str()),
+                    "{name:?} is not a known seed gpu_name"
                 );
             }
             assert!(prof.num_gpus_min >= 1);
@@ -1605,8 +1709,14 @@ mod tests {
             assert!(prof.max_dph.is_some_and(|m| m > Money::ZERO));
             assert!(prof.min_disk_gb >= 80);
             assert!(prof.min_inet_down >= 300);
+        }
+        // Classic tiers are geo-Any; studio seed is EU-first (S21).
+        for prof in p.iter().take(4) {
             assert_eq!(prof.geo, GeoFilter::Any);
         }
+        let studio = p.iter().find(|x| x.id.as_str() == "studio-96gb").unwrap();
+        assert_eq!(studio.geo, GeoFilter::Eu);
+        assert_eq!(studio.image_type, ImageType::Studio);
 
         // The 3090 tier spans 2–4 in ONE profile, never one profile per count.
         assert_eq!((p[0].num_gpus_min, p[0].num_gpus_max), (2, 4));
@@ -1614,6 +1724,38 @@ mod tests {
         // The H100 tiers carry all three spellings, because the market picks which is cheap.
         assert_eq!(p[2].gpu_names.len(), 3);
         assert_eq!(p[3].gpu_names.len(), 3);
+    }
+
+    #[test]
+    fn ensure_studio_seeds_is_idempotent_and_writes_both_rows() {
+        let (_dir, paths) = test_paths();
+        let image = "ghcr.io/buckster123/vastai-studio:cu128";
+        ensure_studio_seeds(&paths, image).expect("seed");
+        ensure_studio_seeds(&paths, image).expect("seed again");
+        let cat = load(&paths).expect("load");
+        assert_eq!(
+            cat.profiles
+                .iter()
+                .filter(|p| p.id.as_str() == "studio-96gb")
+                .count(),
+            1
+        );
+        let recipes: Vec<_> = cat
+            .recipes
+            .iter()
+            .filter(|r| r.id.as_str() == "studio-96gb")
+            .collect();
+        assert_eq!(recipes.len(), 1);
+        match &recipes[0].kind {
+            RecipeKind::VastStudio {
+                machine_id, launch, ..
+            } => {
+                assert_eq!(*machine_id, Some(140_330));
+                assert_eq!(launch.services.len(), 3);
+                assert_eq!(launch.image, image);
+            }
+            other => panic!("expected VastStudio, got {other:?}"),
+        }
     }
 
     // -- save this running thing as a recipe ---------------------------------------------
