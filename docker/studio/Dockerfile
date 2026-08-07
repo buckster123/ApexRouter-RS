@@ -24,8 +24,10 @@ FROM ${GGUF_IMAGE} AS gguf
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
-# ComfyUI commit measured in R3 (docs/GARDEN-RUNS.md). Bump only with a re-measure.
-ARG COMFYUI_REF=e803f24
+# ComfyUI commit measured in R3 (docs/GARDEN-RUNS.md). Full SHA required for
+# `git fetch origin <ref>` — a short hash is not a remote ref name.
+# Bump only with a re-measure.
+ARG COMFYUI_REF=e803f24ea090de7108772d65957fd6388d3f2085
 # Torch wheel index for CUDA 12.8. S6 pins cu128 to the base image family.
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu128
 ARG TORCH_VERSION=2.7.1
@@ -61,9 +63,10 @@ RUN python3 -m venv /opt/comfy-venv \
  && /opt/comfy-venv/bin/pip install --no-cache-dir \
         --index-url "${TORCH_INDEX}" \
         "torch==${TORCH_VERSION}" torchvision torchaudio \
- && git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git /opt/ComfyUI \
+ && git init /opt/ComfyUI \
+ && git -C /opt/ComfyUI remote add origin https://github.com/comfyanonymous/ComfyUI.git \
  && git -C /opt/ComfyUI fetch --depth 1 origin "${COMFYUI_REF}" \
- && git -C /opt/ComfyUI checkout "${COMFYUI_REF}" \
+ && git -C /opt/ComfyUI checkout --detach FETCH_HEAD \
  && /opt/comfy-venv/bin/pip install --no-cache-dir -r /opt/ComfyUI/requirements.txt \
  && /opt/comfy-venv/bin/pip install --no-cache-dir \
         "triton>=3.0" \

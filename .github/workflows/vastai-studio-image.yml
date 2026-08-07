@@ -13,8 +13,8 @@ on:
   workflow_dispatch:
     inputs:
       comfy_ref:
-        description: ComfyUI git ref to pin (R3 measured e803f24)
-        default: e803f24
+        description: ComfyUI full commit SHA to pin (R3 measured e803f24…)
+        default: e803f24ea090de7108772d65957fd6388d3f2085
       gguf_image:
         description: Source image for llama-server COPY
         default: ghcr.io/buckster123/vastai-gguf:prebuilt
