@@ -65,7 +65,7 @@ Two listeners in one process, because a single listener cannot satisfy both cont
 | Listener | Default bind | Contents | Auth posture |
 |---|---|---|---|
 | **Proxy / data plane** | `127.0.0.1:8888` | `/v1/*`, the catch-all fallback, and the three byte-compatible legacy routes `/health`, `/providers`, `POST /switch` | open on loopback (`OPENAI_API_KEY=not-needed` keeps working); optional bearer; `POST /switch` is treated as a mutation and gets the mutation gate (§9.3) |
-| **Control plane** | `127.0.0.1:2739` (`APEX` on a keypad) | `/v1/*` control REST, `/ws`, the embedded web UI, and `/metrics` (§4.5 — **Prometheus text written, not yet mounted**; control answers 404) | one configured bearer, loopback bypass keyed on `ConnectInfo` peer IP, mandatory `Origin`/`Sec-Fetch-Site` + `Host` validation on every mutation (§9.4); proxy `POST /switch` uses the same mutation gate (§9.3) |
+| **Control plane** | `127.0.0.1:2739` (`APEX` on a keypad) | `/v1/*` control REST, `/ws`, the embedded web UI, and **`GET /metrics`** (Prometheus text, §4.5 — public like `/health`) | one configured bearer, loopback bypass keyed on `ConnectInfo` peer IP, mandatory `Origin`/`Sec-Fetch-Site` + `Host` validation on every mutation (§9.4); proxy `POST /switch` uses the same mutation gate (§9.3) |
 
 Why not one socket: the proxy is a catch-all by contract (`05` §2 — everything that is not one of
 five (path, method) pairs is proxied, including `POST /health`). A catch-all `any()` route and the
@@ -1199,15 +1199,12 @@ on failover retries after the first attempt), so a struggling backend cannot be 
 storm. The breaker requires `min_volume` (5) observations before it can open, so a single 200 ms
 blip on a 1 rps rig does not create a 30 s outage.
 
-**As built, `/metrics` is written but not yet mounted.** `router::telemetry::Telemetry::prometheus
-(&BackendRegistry, Option<&RigSnapshot>) -> String` produces the exposition below and is
-unit-tested against it, but no `.route("/metrics", …)` line exists in
-`server::lib::v1_routes()`, so the control listener currently `404`s it. That gap is *held open
-deliberately rather than forgotten*: `crates/apexrouter-server/tests/openapi_routes.rs` carries it
-on an explicit `PENDING` list naming the owing unit, and **the test fails the moment it is wired**
-so the list cannot rot. (`POST /v1/migrate` (§6.2) sat in the same position until 2026-08-01, when
-`api::migrate` and its `.merge(…)` line landed; `/metrics` is now that list's one entry.) Treat
-`PENDING` in that test as the authority on what is still outstanding.
+**As built (2026-08-07), `/metrics` is mounted** on the control listener as a public
+`GET /metrics` (sibling of `/health`, not behind the auth layer). R-07's
+`Telemetry::prometheus` renders the exposition; `AppState` holds an `Arc<Telemetry>` fed from
+`RequestFinished` at startup (same attach rule as the live-request log). `openapi_routes.rs`
+`PENDING` is empty. Rig VRAM series are optional (`rig: None` on the scrape path) so a scrape
+never walks the filesystem.
 
 `GET /metrics` on the control listener (Prometheus text): `apexrouter_requests_total{alias,backend,
 status}`, `apexrouter_ttft_seconds`, `apexrouter_tokens_total{kind}`,

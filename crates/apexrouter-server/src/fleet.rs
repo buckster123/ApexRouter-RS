@@ -80,3 +80,83 @@ fn active_rentals(state: &Arc<AppState>) -> usize {
         .map(|rows| rows.len())
         .unwrap_or(0)
 }
+
+/// One-shot, **alert-only** compare of the local ledger against the live vast fleet.
+///
+/// Spawned at daemon start after bind is scheduled — never blocks listening, never creates
+/// or destroys anything. Surfaces:
+/// * ledger-active ids missing from the live fleet (orphans / already-gone boxes),
+/// * live fleet ids with no active ledger row (silent billing risk — the original A1 shape),
+/// * unresolved `Reserved` / `OrphanSuspect` rows without an instance id.
+///
+/// Being offline is never evidence: a failed list leaves no alert beyond the fleet poller's
+/// own "unreachable with actives" path.
+pub async fn reconcile_ledger_once(state: Arc<AppState>) {
+    let Some(api) = crate::api::vast::vast_api() else {
+        return;
+    };
+    let Ok(ledger) = Ledger::open(&state.paths) else {
+        return;
+    };
+    let Ok(active) = ledger.active() else {
+        return;
+    };
+    let Ok(instances) = api.instances().await else {
+        return;
+    };
+
+    // Seed the fleet cache so the first snapshot is not empty when we just read the world.
+    let credit = api.account().await.ok().map(|a| a.credit);
+    state.update_fleet(instances.clone(), credit);
+
+    let live_ids: std::collections::HashSet<u64> = instances.iter().map(|i| i.id.0).collect();
+    let mut ledger_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    for row in &active {
+        match row.instance_id {
+            Some(id) => {
+                ledger_ids.insert(id.0);
+                if !live_ids.contains(&id.0) {
+                    state.alert(
+                        AlertLevel::Warning,
+                        &format!("vast.ledger.missing_live.{}", id.0),
+                        format!(
+                            "ledger still counts instance {} as active (state {:?}) but vast \
+                             does not list it — confirm on the console or run \
+                             `apexrouter vast ls --orphans`",
+                            id.0, row.state
+                        ),
+                    );
+                }
+            }
+            None => {
+                state.alert(
+                    AlertLevel::Serious,
+                    &format!("vast.ledger.unresolved.{}", row.seq),
+                    format!(
+                        "ledger has an unresolved {:?} row (seq {}) with no instance id — a \
+                         create may have succeeded without a local record; check \
+                         `apexrouter vast ls --orphans`",
+                        row.state, row.seq
+                    ),
+                );
+            }
+        }
+    }
+
+    for inst in &instances {
+        if !ledger_ids.contains(&inst.id.0) {
+            state.alert(
+                AlertLevel::Critical,
+                &format!("vast.fleet.unknown_to_ledger.{}", inst.id.0),
+                format!(
+                    "vast lists instance {} ({}) but the local ledger has no active row for \
+                     it — a box may be billing with no local record; run \
+                     `apexrouter vast ls --orphans` and destroy or import it",
+                    inst.id.0,
+                    inst.gpu_name.as_deref().unwrap_or("unknown GPU")
+                ),
+            );
+        }
+    }
+}

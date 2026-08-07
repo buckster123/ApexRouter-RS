@@ -43,10 +43,9 @@ const METHODS: [&str; 8] = [
 ///
 /// A path may only sit here while it is genuinely absent from the source; the moment it is
 /// wired, this test fails and the entry must be deleted. That is the point.
-const PENDING: [(&str, &str); 1] = [(
-    "/metrics",
-    "R-07/S-01 — the Prometheus text exposition (ARCHITECTURE.md §4.5)",
-)];
+///
+/// Empty since 2026-08-07: `/metrics` is mounted on the control listener (S-01 + R-07).
+const PENDING: [(&str, &str); 0] = [];
 
 /// Proxy-listener paths served by `.fallback(any(proxy_handler))` rather than by a `.route()`.
 ///

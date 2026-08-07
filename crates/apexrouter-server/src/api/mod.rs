@@ -578,6 +578,7 @@ pub(crate) mod testkit {
             tx.clone(),
         ));
         let lock = DaemonLock::acquire(&paths).expect("daemon lock");
+        let telemetry = Arc::new(apexrouter_router::Telemetry::new(tx.clone(), 1_000));
         Arc::new(AppState {
             store: Store::new(paths.clone()),
             paths,
@@ -590,6 +591,7 @@ pub(crate) mod testkit {
             started_at: Instant::now(),
             lock: Arc::new(Mutex::new(lock)),
             fleet: std::sync::RwLock::new(crate::state::FleetCache::default()),
+            telemetry,
         })
     }
 

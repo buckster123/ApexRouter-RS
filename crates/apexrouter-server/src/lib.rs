@@ -277,6 +277,10 @@ pub async fn build_state(
     // lazy call becomes a no-op that returns this same log.
     api::requests::attach(&state.tx);
 
+    // Prometheus counters: same bus, same startup rule. Without a subscriber at boot,
+    // `GET /metrics` would only ever show gauges from the registry.
+    attach_telemetry(&state);
+
     // Jobs: crash-recovery and WS broadcasts must be live *before* any handler can
     // `spawn_with`. Lazy `ensure_wired` on the first `/v1/jobs` call left Pending rows from a
     // previous daemon open, and UI endpoint boots via `?no_wait=true` never hit that path —
@@ -284,6 +288,24 @@ pub async fn build_state(
     state.jobs.ensure_wired(&state.tx, &state.paths);
 
     Ok(state)
+}
+
+/// Feed [`AppState::telemetry`] from `RequestFinished` events for the life of the process.
+fn attach_telemetry(state: &Arc<AppState>) {
+    let mut rx = state.tx.subscribe();
+    let telemetry = Arc::clone(&state.telemetry);
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(Event::RequestFinished { record }) => telemetry.record(*record),
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::debug!(missed = n, "telemetry lagged the broadcast");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// Steps 6–9: reconcile, arm, bind, poll, serve, drain.
@@ -311,6 +333,8 @@ pub async fn run(state: Arc<AppState>, shutdown: ShutdownHandle) -> anyhow::Resu
     tokio::spawn(prober::health_prober(Arc::clone(&state)));
     tokio::spawn(watcher::config_watcher(Arc::clone(&state)));
     tokio::spawn(fleet::vast_fleet_poller(Arc::clone(&state)));
+    // Alert-only ledger ↔ live fleet compare — not on the bind critical path, never destroys.
+    tokio::spawn(fleet::reconcile_ledger_once(Arc::clone(&state)));
     spawn_sighup_reloader(Arc::clone(&state), shutdown.clone());
 
     let proxy_app = proxy_app(&state);
@@ -779,7 +803,12 @@ fn listener_died(
 /// listener's address rather than only the configured bind string.
 pub fn api_router(state: Arc<AppState>) -> axum::Router {
     let bind = auth::ListenerBind(state.cfg().control_bind());
-    let public = axum::Router::new().route("/health", get(control_health).head(control_health));
+    // `/health` and `/metrics` are the only unversioned public control paths (CHARTER D3 /
+    // ARCHITECTURE §6.2). Metrics is scrape-friendly: loopback bypass covers Prometheus on
+    // the same host; a non-loopback bind still requires the bearer for everything else.
+    let public = axum::Router::new()
+        .route("/health", get(control_health).head(control_health))
+        .route("/metrics", get(control_metrics));
 
     let authed = v1_routes().route_layer(axum::middleware::from_fn_with_state(
         Arc::clone(&state),
@@ -855,6 +884,25 @@ async fn control_health(State(s): State<Arc<AppState>>) -> Json<serde_json::Valu
         "version": VERSION,
         "uptime": s.uptime_secs(),
     }))
+}
+
+/// `GET /metrics` — Prometheus text exposition (ARCHITECTURE §4.5 / R-07).
+///
+/// Public on the control listener so a local scraper does not need a bearer. Body is pure
+/// text; gauges come from the live registry, counters from `RequestFinished` via
+/// [`attach_telemetry`]. Rig VRAM gauges are omitted here (would require a network-free
+/// scan on every scrape); backend gauges and request counters are the product signal.
+async fn control_metrics(State(s): State<Arc<AppState>>) -> Response {
+    let body = s.telemetry.prometheus(s.router.registry(), None);
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// The control listener's 404. JSON, because every client of this listener parses JSON.

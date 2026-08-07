@@ -256,16 +256,31 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
                             continue 'dispatch;
                         }
                         Parking::Refused(resp) => {
-                            return stamp(resp, park.stamp(alias));
+                            let why = park_reason(pk.model.as_deref(), alias);
+                            return stamp(resp, park.stamp(alias, why));
                         }
                         Parking::NotWarming => {}
                     }
                 }
                 let (status, kind) = map_status(&e);
-                return stamp(
-                    error_response(ingress, status, kind, &e.to_string()),
-                    Stamp::pre(&id, ingress),
-                );
+                // Alias-known failures carry the alias (and Alias reason) so
+                // `X-ApexRouter-Route` is not `-|-` when we already know which route failed.
+                let mark = match &e {
+                    RouteError::NoHealthy { alias } | RouteError::FilteredOut { alias, .. } => {
+                        Stamp {
+                            id: &id,
+                            alias: Some(alias),
+                            reason: Some(RouteReason::Alias),
+                            backend: None,
+                            attempts: 0,
+                            fallback: false,
+                            ingress,
+                            upstream: None,
+                        }
+                    }
+                    RouteError::NoRoute { .. } => Stamp::pre(&id, ingress),
+                };
+                return stamp(error_response(ingress, status, kind, &e.to_string()), mark);
             }
         };
 
@@ -634,12 +649,13 @@ struct ParkCtx<'a> {
 }
 
 impl ParkCtx<'_> {
-    /// The header set for a `503` raised while parked: the alias is known, no backend is.
-    fn stamp<'b>(&'b self, alias: &'b Alias) -> Stamp<'b> {
+    /// The header set for a `503` raised while parked: the alias (and why we picked it)
+    /// are known; no backend is.
+    fn stamp<'b>(&'b self, alias: &'b Alias, reason: RouteReason) -> Stamp<'b> {
         Stamp {
             id: &self.id,
             alias: Some(alias),
-            reason: None,
+            reason: Some(reason),
             backend: None,
             attempts: 0,
             fallback: false,
@@ -3950,7 +3966,9 @@ mod tests {
             retry_after.parse::<u32>().map(|n| n >= 1).unwrap_or(false),
             "Retry-After must be a usable number of seconds: {retry_after}"
         );
-        assert_eq!(header(&resp, "x-apexrouter-route"), Some("auto|-"));
+        // Alias is known; reason is the rule that put us on `auto` (legacy_model_name or
+        // alias depending on the model string — here `model: auto` is rule 1).
+        assert_eq!(header(&resp, "x-apexrouter-route"), Some("auto|alias"));
         let body = body_to_bytes(resp.into_body(), 64 * 1024)
             .await
             .expect("body");

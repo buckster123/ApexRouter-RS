@@ -52,6 +52,7 @@ pub use registry::{
 };
 pub use resolve::{Candidate, Plan, RequestClass, RouteError, UnknownModelPolicy};
 pub use table::{RoutingTable, TableBuilder};
+pub use telemetry::Telemetry;
 
 use apexrouter_core::config::Config;
 use apexrouter_core::usage::UsageWriter;

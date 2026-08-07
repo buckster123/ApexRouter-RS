@@ -454,7 +454,7 @@ fn bearer_matches(h: &HeaderMap, expected: Option<&str>) -> bool {
 /// client's reachability probe and `apexrouter serve`'s own autostart poll depend on it
 /// answering before any credential exists.
 fn is_public(path: &str) -> bool {
-    path.trim_end_matches('/') == "/health"
+    matches!(path.trim_end_matches('/'), "/health" | "/metrics")
 }
 
 /// The data plane. `Read`, deliberately — see [`required_scope`].

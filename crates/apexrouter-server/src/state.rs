@@ -18,6 +18,7 @@ use apexrouter_core::paths::Paths;
 use apexrouter_core::store::Store;
 use apexrouter_protocol::{Event, VastInstance};
 use apexrouter_providers::local::LocalProvisioner;
+use apexrouter_router::Telemetry;
 use arc_swap::ArcSwap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -65,6 +66,9 @@ pub struct AppState {
     pub lock: Arc<Mutex<DaemonLock>>,
     /// The rented fleet as last observed, for the network-free snapshot.
     pub fleet: RwLock<FleetCache>,
+    /// Prometheus counters + gauges for `GET /metrics` (R-07). Fed from the same
+    /// `RequestFinished` bus the live-request log listens on.
+    pub telemetry: Arc<Telemetry>,
     /* provider slots filled in Stage 5: vast, hf, together, tunnels */
 }
 
@@ -85,6 +89,9 @@ impl AppState {
         checks: Arc<Registry>,
         lock: DaemonLock,
     ) -> AppState {
+        // Same ring depth as the live-request log (1_000): counters are unbounded; the ring
+        // inside Telemetry is only for `window()` aggregation helpers.
+        let telemetry = Arc::new(Telemetry::new(tx.clone(), 1_000));
         AppState {
             paths,
             cfg: ArcSwap::from_pointee(cfg),
@@ -97,6 +104,7 @@ impl AppState {
             started_at: Instant::now(),
             lock: Arc::new(Mutex::new(lock)),
             fleet: RwLock::new(FleetCache::default()),
+            telemetry,
         }
     }
 

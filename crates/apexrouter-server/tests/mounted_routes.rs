@@ -82,7 +82,9 @@ const METHODS: [&str; 8] = [
 /// This is a carve-out of one path, not a route list, and it cannot rot silently —
 /// [`the_public_carve_out_is_still_exactly_one_public_route`] proves each entry really is
 /// outside the auth layer *and* really is served.
-const PUBLIC_ROUTES: [&str; 1] = ["/health"];
+/// Control paths outside the auth layer — presence probe's `403` cannot apply (see
+/// `the_public_carve_out_is_still_exactly_the_public_set`).
+const PUBLIC_ROUTES: [&str; 2] = ["/health", "/metrics"];
 
 /// The `Origin` the presence probe sends: an authority this daemon can never be.
 const FOREIGN_ORIGIN: &str = "http://apexrouter-mount-guard.invalid";
@@ -668,8 +670,8 @@ async fn the_mounted_method_set_is_the_method_set_the_modules_register() {
 /// is what holds the two together, so a path documented here is a path §6 promises.
 ///
 /// The "not implemented at all" exemption is **derived**, never listed: a documented path with
-/// no `.route()` anywhere in the source is genuinely unbuilt (`/metrics` alone —
-/// `POST /v1/migrate` shipped 2026-08-01 and is merged in `v1_routes()`),
+/// no `.route()` anywhere in the source is genuinely unbuilt (the historical
+/// `/metrics` and `POST /v1/migrate` gaps are closed),
 /// and the moment somebody writes its handler it stops being exempt and must be mounted.
 #[tokio::test]
 async fn every_documented_control_route_is_reachable() {
@@ -847,11 +849,11 @@ async fn the_absent_route_signature_is_real() {
 
 /// The `PUBLIC_ROUTES` carve-out is exactly what it claims: served, and outside the auth layer.
 ///
-/// The carve-out exists because §6.2's `/health` is public, so the `403` the presence probe
-/// relies on cannot apply to it. That makes it the one place this guard could be widened into a
-/// hole, so each entry is checked from both sides.
+/// The carve-out exists because §6.2's `/health` (and `/metrics`) are public, so the `403`
+/// the presence probe relies on cannot apply. That makes them the place this guard could be
+/// widened into a hole, so each entry is checked from both sides.
 #[tokio::test]
-async fn the_public_carve_out_is_still_exactly_one_public_route() {
+async fn the_public_carve_out_is_still_exactly_the_public_set() {
     let d = Daemon::boot().await;
 
     for p in PUBLIC_ROUTES {
@@ -860,11 +862,19 @@ async fn the_public_carve_out_is_still_exactly_one_public_route() {
             get.status, 200,
             "{p} is carved out as public but does not answer"
         );
-        assert!(
-            get.body.contains("\"product\""),
-            "{p} answered 200 but not with the control-plane health body: {:?}",
-            get.body
-        );
+        match p {
+            "/health" => assert!(
+                get.body.contains("\"product\""),
+                "/health answered 200 but not with the control-plane health body: {:?}",
+                get.body
+            ),
+            "/metrics" => assert!(
+                get.body.contains("apexrouter_") || get.body.contains("# TYPE"),
+                "/metrics answered 200 but not with Prometheus text: {:?}",
+                get.body
+            ),
+            other => panic!("PUBLIC_ROUTES gained {other} without a body assertion"),
+        }
         // Outside the auth layer: a foreign `Origin` on a mutation is not refused, because
         // there is no gate on this path to refuse it.
         let probe = d

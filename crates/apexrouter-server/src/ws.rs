@@ -295,6 +295,7 @@ pub(crate) mod testkit {
         // An empty rig, installed rather than scanned, so a snapshot never shells out.
         supervisor.set_rig(apexrouter_protocol::RigSnapshot::default());
         let lock = DaemonLock::acquire(&paths).expect("daemon lock");
+        let telemetry = Arc::new(apexrouter_router::Telemetry::new(tx.clone(), 1_000));
         let state = Arc::new(AppState {
             store: Store::new(paths.clone()),
             paths,
@@ -307,6 +308,7 @@ pub(crate) mod testkit {
             started_at: Instant::now(),
             lock: Arc::new(tokio::sync::Mutex::new(lock)),
             fleet: std::sync::RwLock::new(crate::state::FleetCache::default()),
+            telemetry,
         });
         Harness { state, dir }
     }
