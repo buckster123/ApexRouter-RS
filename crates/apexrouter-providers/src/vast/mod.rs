@@ -25,5 +25,7 @@ pub use offers::{
     QueryOverrides,
 };
 pub use query::build_query;
-pub use rent::{park, rent, rented_backend, wake, weekly_disk_usd, VastProvisioner};
+pub use rent::{
+    destroy, destroy_within, park, rent, rented_backend, wake, weekly_disk_usd, VastProvisioner,
+};
 pub use stall::{restart_download, sample_download};

@@ -107,7 +107,11 @@ impl Ledger {
         // One buffer, one `write_all`: a short line never straddles two syscalls.
         file.write_all(line.as_bytes())
             .map_err(|source| self.io(source))?;
-        file.flush().map_err(|source| self.io(source))?;
+        // Flush is not enough: the product's billing-leak defence is "a `Reserved` row
+        // exists *before* the create call returns", and a power cut or kernel buffer loss
+        // between create and durable disk reopens that hole. Store / secret / lockfile all
+        // fsync; the ledger is the one that *must*.
+        file.sync_all().map_err(|source| self.io(source))?;
 
         Ok(seq)
     }

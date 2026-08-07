@@ -84,11 +84,14 @@ impl SpendApproval {
     ///    fills in a big number still cannot spend more than the human configured. A
     ///    negative rate is meaningless and is normalised to [`Money::ZERO`] first, so it can
     ///    never sneak past a comparison.
-    /// 2. **Human confirmation.** With `cfg.require_human_confirm`, an
-    ///    [`ApprovalSource::Mcp`] whose `human_cleared` is `false` gets
+    /// 2. **Human confirmation.** With `cfg.require_human_confirm`, only a surface that is
+    ///    already a human — [`ApprovalSource::Cli`], [`ApprovalSource::WebUi`],
+    ///    [`ApprovalSource::SlintUi`] — or an MCP call a human has already cleared
+    ///    ([`ApprovalSource::Mcp`] with `human_cleared: true`) passes. An uncleared agent
+    ///    **and a bare API call** (the path an agent takes when it omits `?source=mcp`) get
     ///    [`ApprovalError::HumanConfirmationRequired`] carrying a fresh [`JobId`] — the id
-    ///    the human clears with `apexrouter approvals grant <id>`. Every other source, and an
-    ///    MCP call a human has already cleared, passes.
+    ///    the human clears with `apexrouter approvals grant <id>`. Gating only MCP was how
+    ///    an agent skipped the flag by posting to the same HTTP route without the query.
     /// 3. **Credit.** When the caller could read the account's credit, one hour at the
     ///    approved rate must fit inside it, otherwise
     ///    [`ApprovalError::InsufficientCredit`]. `credit: None` means "we could not ask" —
@@ -110,14 +113,7 @@ impl SpendApproval {
             return Err(ApprovalError::AboveCeiling { requested, ceiling });
         }
 
-        if cfg.require_human_confirm
-            && matches!(
-                source,
-                ApprovalSource::Mcp {
-                    human_cleared: false
-                }
-            )
-        {
+        if cfg.require_human_confirm && !source_is_human_cleared(source) {
             return Err(ApprovalError::HumanConfirmationRequired {
                 pending: JobId::new(),
             });
@@ -154,6 +150,23 @@ impl SpendApproval {
     pub fn source(&self) -> ApprovalSource {
         self.source
     }
+}
+
+/// Surfaces that may spend when `[providers.vast] require_human_confirm` is on.
+///
+/// A human on the CLI / web UI / Slint app, or an MCP call that already carries a granted
+/// approval id. Bare [`ApprovalSource::Api`] and uncleared MCP do **not** pass — that is
+/// what stops an agent from omitting `?source=mcp` and walking through the same HTTP route.
+fn source_is_human_cleared(source: ApprovalSource) -> bool {
+    matches!(
+        source,
+        ApprovalSource::Cli
+            | ApprovalSource::WebUi
+            | ApprovalSource::SlintUi
+            | ApprovalSource::Mcp {
+                human_cleared: true
+            }
+    )
 }
 
 #[cfg(test)]
@@ -227,7 +240,6 @@ mod tests {
             ApprovalSource::Cli,
             ApprovalSource::WebUi,
             ApprovalSource::SlintUi,
-            ApprovalSource::Api,
             ApprovalSource::Mcp {
                 human_cleared: true,
             },
@@ -236,6 +248,21 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{source:?} must pass the gate: {e}"));
             assert_eq!(a.source(), source);
         }
+    }
+
+    #[test]
+    fn a_bare_api_call_requires_confirmation_when_the_gate_is_on() {
+        // An agent that omits `?source=mcp` lands as Api. That used to skip the human
+        // gate entirely; the gate is now about the surface, not the query string the
+        // caller chose to write.
+        let mut cfg = cfg();
+        cfg.require_human_confirm = true;
+        let err = SpendApproval::confirm(Money::from_usd(0.34), ApprovalSource::Api, &cfg, None)
+            .expect_err("a bare API call is not a human");
+        assert!(
+            matches!(err, ApprovalError::HumanConfirmationRequired { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

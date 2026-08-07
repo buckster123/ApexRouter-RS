@@ -40,13 +40,13 @@ use apexrouter_core::ledger::Ledger;
 use apexrouter_core::money::{ApprovalError, ApprovalSource, SpendApproval};
 use apexrouter_protocol::{
     AlertLevel, ApprovalRequest, CheckResult, CostEstimate, DownloadHealth, ErrorBody,
-    ErrorEnvelope, Event, FavoriteHost, FavoriteVerdict, InstanceId, JobId, JobRecord, LedgerRow,
-    LedgerState, Money, OfferQuery, OfferSearchResult, PriceSource, ProfileId, RentRequest,
-    TunnelSpec, TunnelStatus, VastAccount, VastInstance,
+    ErrorEnvelope, Event, FavoriteHost, FavoriteVerdict, InstanceId, JobId, JobRecord, Money,
+    OfferQuery, OfferSearchResult, PriceSource, ProfileId, RentRequest, TunnelSpec, TunnelStatus,
+    VastAccount, VastInstance,
 };
 use apexrouter_providers::vast::{
-    constraint_failures, gpu_name_vocabulary, profile_to_query, restart_download, sample_download,
-    search_unified, watch_boot, QueryOverrides, VastApi,
+    constraint_failures, destroy_within, gpu_name_vocabulary, profile_to_query, restart_download,
+    sample_download, search_unified, watch_boot, QueryOverrides, VastApi,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -650,9 +650,10 @@ pub async fn rent(
 /// `DELETE /v1/vast/instances/{id}?confirm=true` — destroy, **verify**, then forget.
 ///
 /// Without `?confirm=true` this is a `409` carrying the instance and what it has cost so
-/// far. With it: `DELETE`, then poll until the instance is gone or terminal, and only then
-/// append the `Destroyed` ledger row. A row written before the box is actually gone is how a
-/// fleet view starts lying about money.
+/// far. With it: the **one** library path (`providers::vast::destroy_within`) — ledger
+/// `DestroyRequested` first, then the API call, then verify, then `Destroyed`. There is no
+/// second destroy implementation on the control plane; two authorities was how intent and
+/// reality diverged after a crash mid-call.
 pub async fn destroy(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -690,65 +691,19 @@ pub async fn destroy(
             .into_response());
     }
 
-    api.destroy(id).await.map_err(ApiError::from)?;
+    let ledger = Ledger::open(&s.paths).map_err(ApiError::from)?;
+    let poll_min = s.cfg().vast.poll_min_ms.max(POLL_FLOOR_MS);
+    destroy_within(
+        api.as_ref(),
+        &ledger,
+        id,
+        &s.tx,
+        DESTROY_VERIFY_SECS,
+        poll_min,
+    )
+    .await
+    .map_err(ApiError::from)?;
 
-    // Verify before forgetting.
-    let poll = Duration::from_millis(s.cfg().vast.poll_min_ms.max(POLL_FLOOR_MS));
-    let deadline = std::time::Instant::now() + Duration::from_secs(DESTROY_VERIFY_SECS);
-    let mut gone = false;
-    while std::time::Instant::now() < deadline {
-        match api.instance(id).await {
-            Ok(None) => {
-                gone = true;
-                break;
-            }
-            Ok(Some(now)) if now.is_terminal() => {
-                gone = true;
-                break;
-            }
-            // An unreachable API is not evidence that a box is gone. Keep asking.
-            _ => tokio::time::sleep(poll).await,
-        }
-    }
-
-    if let Ok(ledger) = Ledger::open(&s.paths) {
-        let _ = ledger.append(&LedgerRow {
-            seq: 0,
-            at_unix: now_unix(),
-            instance_id: Some(id),
-            state: if gone {
-                LedgerState::Destroyed
-            } else {
-                LedgerState::DestroyRequested
-            },
-            offer_id: None,
-            profile: None,
-            gpu: None,
-            num_gpus: None,
-            dph: None,
-            approved_max_dph: None,
-            approval_source: None,
-            destroyed_at_unix: gone.then(now_unix),
-            est_cost: accrued.clone(),
-            note: Some(if gone {
-                "destroy verified".to_owned()
-            } else {
-                "destroy issued; the instance had not disappeared before the deadline".to_owned()
-            }),
-        });
-    }
-
-    if !gone {
-        s.alert(
-            AlertLevel::Serious,
-            &format!("vast.destroy.{}", id.0),
-            format!(
-                "instance {} was asked to destroy but was still listed {DESTROY_VERIFY_SECS}s \
-                 later — check the vast console before assuming it stopped billing",
-                id.0
-            ),
-        );
-    }
     let fleet = api.instances().await.unwrap_or_default();
     let credit = api.account().await.ok().map(|a| a.credit);
     s.update_fleet(fleet.clone(), credit);
@@ -760,9 +715,10 @@ pub async fn destroy(
         },
     );
 
+    // `destroy_within` only returns Ok after the instance is verified gone (or terminal).
     Ok(Json(serde_json::json!({
         "instance_id": id,
-        "destroyed": gone,
+        "destroyed": true,
         "accrued": accrued,
     }))
     .into_response())
@@ -1329,21 +1285,31 @@ fn parse_instance(raw: &str) -> Result<InstanceId, ApiError> {
     })
 }
 
-/// Which surface asked, from `?source=`. Anything unrecognised is [`ApprovalSource::Api`],
-/// which is the *stricter* reading for everything except `mcp` and cannot be used to dodge
-/// the human gate.
+/// Which surface asked, from `?source=` and an optional granted approval id.
+///
+/// A granted `?approval=` always clears the human gate (MCP or otherwise). `source=mcp`
+/// without a grant is an uncleared agent. Human surfaces (`cli` / `web_ui` / `slint_ui`)
+/// pass the gate when named; a bare call is [`ApprovalSource::Api`] and is **gated** when
+/// `require_human_confirm` is on — that is what stops an agent from omitting `?source=mcp`
+/// and walking through the same HTTP route as the CLI.
 fn approval_source(s: &Arc<AppState>, q: &RentQuery) -> ApprovalSource {
+    let granted = q
+        .approval
+        .as_deref()
+        .and_then(|a| a.parse::<ulid::Ulid>().ok())
+        .map(JobId)
+        .is_some_and(|id| approval_granted(s, id));
+    if granted {
+        return ApprovalSource::Mcp {
+            human_cleared: true,
+        };
+    }
     match q.source.as_deref().map(str::trim) {
         Some("cli") => ApprovalSource::Cli,
         Some("web_ui") => ApprovalSource::WebUi,
         Some("slint_ui") => ApprovalSource::SlintUi,
         Some("mcp") => ApprovalSource::Mcp {
-            human_cleared: q
-                .approval
-                .as_deref()
-                .and_then(|a| a.parse::<ulid::Ulid>().ok())
-                .map(JobId)
-                .is_some_and(|id| approval_granted(s, id)),
+            human_cleared: false,
         },
         _ => ApprovalSource::Api,
     }
@@ -1855,6 +1821,36 @@ mod tests {
         let body: RentRefusal = res.json().await.expect("RentRefusal");
         assert_eq!(body.error.kind, "insufficient_credit");
         assert_eq!(body.preview.credit, Some(0.10));
+
+        install_vast_api(None);
+    }
+
+    /// An agent that omits `?source=mcp` used to land as `Api` and skip the human gate.
+    /// Bare API calls are gated too when the flag is on.
+    #[tokio::test]
+    async fn a_bare_api_rent_requires_human_confirm_when_the_flag_is_on() {
+        let _guard = slot_lock().lock().await;
+        install_vast_api(Some(Arc::new(FakeVast::new(7.73))));
+
+        let mut cfg = test_config();
+        cfg.vast.require_human_confirm = true;
+        let state = app(cfg);
+        let base = serve_s07(Arc::clone(&state)).await;
+        let http = reqwest::Client::new();
+
+        let res = http
+            .post(format!("{base}/v1/vast/instances"))
+            .json(&rent_body(true, 0.40))
+            .send()
+            .await
+            .expect("post");
+        assert_eq!(res.status(), 409);
+        let body: RentRefusal = res.json().await.expect("RentRefusal");
+        assert_eq!(
+            body.error.kind, "approval_required",
+            "omitting source must not skip the human gate: {:?}",
+            body.error
+        );
 
         install_vast_api(None);
     }

@@ -370,12 +370,15 @@ async fn rent(ctx: &Ctx, args: &VastRentArgs) -> anyhow::Result<()> {
     }
 
     // ---- the approval is explicit, and it is the only thing that unlocks the spend -------
+    // `source=cli` is what lets this pass `[providers.vast] require_human_confirm` — a bare
+    // API call is gated so an agent cannot skip the human flag by omitting `?source=mcp`.
+    // `--yes` is the human action; the query names the surface for the ledger.
     let mut body = request;
     body["confirm"] = serde_json::Value::Bool(true);
     body["offer_id"] = serde_json::Value::from(offer.id);
     let path = match args.no_wait {
-        true => "/v1/vast/instances?no_wait=true",
-        false => "/v1/vast/instances",
+        true => "/v1/vast/instances?source=cli&no_wait=true",
+        false => "/v1/vast/instances?source=cli",
     };
     let raw: serde_json::Value = client.post(path, &body).await?;
 

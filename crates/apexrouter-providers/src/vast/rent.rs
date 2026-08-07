@@ -37,9 +37,9 @@ use apexrouter_core::ledger::Ledger;
 use apexrouter_core::money::SpendApproval;
 use apexrouter_protocol::{
     AlertLevel, ArgvPreview, Backend, BackendId, BackendKind, BackendLimits, BootPhase,
-    ContainerLaunch, CostEstimate, CredentialSource, EndpointRef, EndpointSpec, Event, Health,
-    InstanceId, LedgerRow, LedgerState, LogSource, Money, Offer, PriceModel, PriceSource, Protocol,
-    Provenance, RentRequest, VastInstance, VastSpec,
+    ContainerLaunch, CostEstimate, CredentialSource, EndpointRef, EndpointSpec, Event, GeoFilter,
+    Health, InstanceId, LedgerRow, LedgerState, LogSource, Money, Offer, OfferQuery, PriceModel,
+    PriceSource, Protocol, Provenance, RentRequest, VastInstance, VastSpec,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,48 @@ use tokio::time::Instant;
 /// The window a cost preview is quoted over, hours. One hour is the same unit
 /// `SpendApproval::confirm` checks credit against, so the two numbers never disagree.
 pub const PREVIEW_HOURS: f64 = 1.0;
+
+/// Look up one market offer so rent can check its live rate against the approval.
+///
+/// Vast has no single-ask GET we rely on; we search with an `id` equality filter and, when
+/// the transport ignores `extra` (the in-process fixture), fall back to a wide search and
+/// filter client-side. An offer that is gone from the market refuses rather than billing
+/// an unknown rate.
+async fn resolve_offer(api: &dyn VastApi, offer_id: u64) -> Result<Offer> {
+    let mut q = OfferQuery {
+        gpu_names: Vec::new(),
+        num_gpus_min: 0,
+        num_gpus_max: 0,
+        max_dph: None,
+        min_reliability: None,
+        min_inet_down: None,
+        min_disk_gb: None,
+        min_cuda: None,
+        geo: GeoFilter::Any,
+        verified: None,
+        limit: 256,
+        order: Vec::new(),
+        extra: serde_json::Map::new(),
+    };
+    q.extra
+        .insert("id".to_owned(), serde_json::json!({ "eq": offer_id }));
+    let res = api.search(&q).await?;
+    if let Some(o) = res.offers.into_iter().find(|o| o.id == offer_id) {
+        return Ok(o);
+    }
+    // Client-side fixtures ignore `extra`; try once more without the id filter.
+    q.extra.clear();
+    let res = api.search(&q).await?;
+    res.offers
+        .into_iter()
+        .find(|o| o.id == offer_id)
+        .ok_or_else(|| {
+            Error::NotFound(format!(
+                "offer {offer_id} is not on the market; cannot verify its hourly rate against \
+                 the approval"
+            ))
+        })
+}
 
 /// How long [`destroy`] keeps checking that the box really is gone before giving up and
 /// telling a human. Verification is the point: a `Destroyed` row we cannot justify is worse
@@ -262,13 +304,39 @@ pub async fn rent(
             .to_owned(),
     })?;
 
+    // The approval and the request max are ceilings on a *number the client typed*. The
+    // bill is the offer's live `dph_total`. Without this check, a caller can approve $0.40
+    // and still create a $3.34/hr box by naming its offer_id — which is how SpendApproval
+    // was hollow for rent while wake already compared live rate.
+    let offer = resolve_offer(api, offer_id).await?;
+    let offer_rate = Money::from_usd(offer.dph_total);
+    if offer_rate > approval.max_usd_per_hour() {
+        return Err(Error::Invalid {
+            what: "rent request".to_owned(),
+            why: format!(
+                "offer {offer_id} bills {offer_rate}/hr but the approval covers only {}/hr",
+                approval.max_usd_per_hour()
+            ),
+        });
+    }
+    if offer.dph_total > req.max_usd_per_hour {
+        return Err(Error::Invalid {
+            what: "rent request".to_owned(),
+            why: format!(
+                "offer {offer_id} bills ${:.4}/hr, above the request ceiling of ${:.4}/hr",
+                offer.dph_total, req.max_usd_per_hour
+            ),
+        });
+    }
+
     let launch = hardened(&req.launch);
     let label = label_for(req);
 
     let _ = tx.send(Event::LogLine {
         source: LogSource::Daemon,
         line: format!(
-            "vast: reserving offer {offer_id} at up to {}/hr (approved via {:?})",
+            "vast: reserving offer {offer_id} at ${:.4}/hr (approved up to {}/hr via {:?})",
+            offer.dph_total,
             approval.max_usd_per_hour(),
             approval.source()
         ),
@@ -1580,6 +1648,37 @@ pub(crate) mod tests {
             label: "apexrouter:big".to_owned(),
         }));
         assert_eq!(api.created().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rent_refuses_an_offer_whose_rate_exceeds_the_approval() {
+        // Approval $0.40, H100 at $3.344/hr — the classic hollow-approval hole.
+        let dir = tempfile::tempdir().expect("tmp");
+        let ledger = ledger(dir.path());
+        let api = FixtureVast::recorded();
+        let tx = channel();
+
+        let mut req = request();
+        req.offer_id = Some(RECORDED_H100);
+        req.max_usd_per_hour = 0.40;
+
+        let err = rent(&api, &ledger, &req, approval(0.40), &tx)
+            .await
+            .expect_err("a $3.34/hr offer must not clear a $0.40 approval");
+        assert!(
+            err.to_string().contains("3.344") || err.to_string().contains("3.34"),
+            "error must name the offer rate: {err}"
+        );
+        assert!(
+            ledger.rows().expect("rows").is_empty(),
+            "nothing may be reserved when the rate check fails"
+        );
+        assert!(
+            !api.calls()
+                .iter()
+                .any(|c| matches!(c, FixtureCall::Create { .. })),
+            "create must not run"
+        );
     }
 
     #[tokio::test]

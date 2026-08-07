@@ -1489,7 +1489,14 @@ mod remote {
         if let Some(al) = arg_str(a, "bind_alias") {
             body["bind_alias"] = Value::String(al);
         }
-        post(c, "/v1/vast/instances", &body).await
+        // Always identify as MCP so `require_human_confirm` can see us. A bare POST was
+        // classified as Api and used to skip the human gate entirely.
+        let mut path = "/v1/vast/instances?source=mcp".to_owned();
+        if let Some(a) = arg_str(a, "approval") {
+            path.push_str("&approval=");
+            path.push_str(&a);
+        }
+        post(c, &path, &body).await
     }
 
     /// **Reachable only with `confirm: true`.**

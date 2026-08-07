@@ -72,7 +72,7 @@ use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Json;
+use axum::{Extension, Json};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -768,7 +768,11 @@ fn listener_died(
 ///
 /// `/health` is public (§6.2); everything else sits behind S-02's auth middleware. The `/v1`
 /// modules are merged in [`v1_routes`], which is the one place a later unit adds a line.
+///
+/// [`auth::ListenerBind`] is installed so the Host allowlist classifies against this
+/// listener's address rather than only the configured bind string.
 pub fn api_router(state: Arc<AppState>) -> axum::Router {
+    let bind = auth::ListenerBind(state.cfg().control_bind());
     let public = axum::Router::new().route("/health", get(control_health).head(control_health));
 
     let authed = v1_routes().route_layer(axum::middleware::from_fn_with_state(
@@ -787,7 +791,12 @@ pub fn api_router(state: Arc<AppState>) -> axum::Router {
         // No `CorsLayer`, ever, on this listener: the embedded UI is same-origin and §9.3's
         // mutation gate is stronger than a CORS policy. `[server] proxy_cors_origins`
         // deliberately does not reach here.
+        //
+        // axum applies layers outside-in (first `.layer` = outermost). Trace is outermost
+        // so every refusal is logged; `ListenerBind` wraps the routes so `require_auth`
+        // finds it on the request extensions.
         .layer(trace_layer())
+        .layer(Extension(bind))
 }
 
 /// Every authenticated control route, in one place.
@@ -854,17 +863,33 @@ async fn control_not_found() -> Response {
         .into_response()
 }
 
-/// The proxy-plane `Router`: R-08's catch-all, plus tracing and the optional CORS header.
+/// The proxy-plane `Router`: R-08's catch-all, the mutation gate, tracing and the optional
+/// CORS header.
 ///
 /// The catch-all lives inside `proxy_router` as `.fallback(any(proxy_handler))`, **not** as a
 /// `/{*path}` route, so no `Router::merge` overlap can exist.
+///
+/// **§9.3's mutation gate is mounted here.** The proxy is unauthenticated for inference, but
+/// it still serves one mutation — `POST /switch` — and a DNS-rebinding page that makes
+/// `Host: evil.example:8888` same-origin must not reach it. Rules 1 and 3 live in
+/// [`auth::mutation_gate`]; rule 2 is also enforced inside the switch handler as defence in
+/// depth. Inference paths are `Scope::Read` and pass the gate untouched.
 pub fn proxy_app(state: &Arc<AppState>) -> axum::Router {
+    let bind = auth::ListenerBind(state.cfg().proxy_bind());
+    // axum applies layers outside-in (first `.layer` = outermost). Order:
+    //   request → trace → ListenerBind → mutation_gate → cors → handler
+    // so a rebinding refusal is logged, never CORS-decorated, and sees the bind extension.
     apexrouter_router::proxy_router(Arc::clone(&state.router))
+        .layer(trace_layer())
+        .layer(Extension(bind))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(state),
+            auth::mutation_gate,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(state),
             cors_middleware,
         ))
-        .layer(trace_layer())
 }
 
 /// `[server] proxy_cors_origins`, applied to the **proxy** listener only.
@@ -1758,6 +1783,41 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("refusing to start"), "{msg}");
         assert!(msg.contains("APEXROUTER_TOKEN"), "{msg}");
+    }
+
+    /// C1 / §9.3: the proxy mutation gate must refuse a rebinding-shaped `Host` on
+    /// `POST /switch`. Before the gate was mounted, the handler ran and returned a body
+    /// error; with the gate, the answer is 403 and the switch never executes.
+    #[tokio::test]
+    async fn proxy_switch_refuses_a_dns_rebinding_host() {
+        let fx = fixture();
+        let cfg = fx.config();
+        let proxy_port = cfg.proxy_bind().port();
+        fx.write_config(&cfg);
+
+        let state = build_state(fx.paths.clone(), cfg.clone(), fx.lock())
+            .await
+            .expect("state");
+        let proxy = spawn_on(cfg.proxy_bind(), "proxy", proxy_app(&state)).await;
+
+        let res = client()
+            .post(format!("http://{proxy}/switch"))
+            .header(header::HOST, format!("evil.example.com:{proxy_port}"))
+            .header(
+                header::ORIGIN,
+                format!("http://evil.example.com:{proxy_port}"),
+            )
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(r#"{"name":"x"}"#)
+            .send()
+            .await
+            .expect("proxy answered");
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "rebinding Host must not reach POST /switch: {}",
+            res.text().await.unwrap_or_default()
+        );
     }
 
     #[tokio::test]
