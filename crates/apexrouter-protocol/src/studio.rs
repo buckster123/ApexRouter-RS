@@ -252,6 +252,67 @@ pub struct StudioBudget {
     pub notes: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Wire types for the studio verb (phase 7)
+// ---------------------------------------------------------------------------
+
+/// `POST /v1/studio/up` body.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StudioUpRequest {
+    /// Recipe id. Default `studio-96gb`.
+    #[serde(default)]
+    pub recipe_id: Option<RecipeId>,
+    /// Without this, the call returns a cost preview and creates/wakes nothing.
+    pub confirm: bool,
+    /// Requested ceiling for rent/wake. Still subject to the daemon-side hard ceiling.
+    pub max_usd_per_hour: f64,
+    /// Override the recipe's machine pin (★ favorite).
+    #[serde(default)]
+    pub machine_id: Option<u64>,
+    /// Pin a specific offer instead of searching (advanced).
+    #[serde(default)]
+    pub offer_id: Option<u64>,
+}
+
+/// Which path `studio up` took (or will take).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StudioUpPath {
+    /// `$STATE/studio.json` names a parked instance → wake + restore tunnels.
+    Wake,
+    /// Instance is already running → re-establish tunnels + readiness.
+    Converge,
+    /// No studio (or box gone) → rent a new one.
+    Rent,
+}
+
+/// Snapshot of the active studio for `GET /v1/studio` and CLI status.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StudioStatus {
+    /// The manifest, if any.
+    #[serde(default)]
+    pub studio: Option<StudioRecord>,
+    /// Every ServiceRecord on disk for this studio.
+    #[serde(default)]
+    pub services: Vec<ServiceRecord>,
+    /// Computed liveness (empty when the prober has not spoken).
+    #[serde(default)]
+    pub service_status: Vec<ServiceStatus>,
+    /// Tunnels belonging to the studio instance.
+    #[serde(default)]
+    pub tunnels: Vec<crate::endpoint::TunnelStatus>,
+    /// Live instance phase when the fleet cache has it.
+    #[serde(default)]
+    pub instance_phase: Option<crate::backend::BootPhase>,
+    /// Live dph when known.
+    #[serde(default)]
+    pub dph_total: Option<f64>,
+    /// Which path `up` would take right now.
+    pub next_up_path: StudioUpPath,
+    /// Free-text summary for humans.
+    pub summary: String,
+}
+
 /// Seed helper: the R3-measured 96 GB dual-4090 posture (S2 table), without weights.
 ///
 /// Ports: llm remote 8000 / local lease; video 8188→**8811**; image 8189→**8812**.

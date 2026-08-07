@@ -879,6 +879,7 @@ fn v1_routes() -> axum::Router<Arc<AppState>> {
         .merge(api::checks::router())
         .merge(api::compare::router())
         .merge(api::migrate::router())
+        .merge(api::studio::router())
 }
 
 /// `GET /health` on the control listener: `{ok, product, version}` plus uptime (§6.2).

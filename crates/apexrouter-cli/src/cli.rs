@@ -163,6 +163,12 @@ pub enum Command {
         #[command(subcommand)]
         cmd: TunnelCmd,
     },
+    /// Multi-service studio (LLM + Comfy lanes). One verb: up / down / status.
+    Studio {
+        /// What to do.
+        #[command(subcommand)]
+        cmd: StudioCmd,
+    },
     /// Spend approvals waiting for a human.
     Approvals {
         /// What to do.
@@ -1124,6 +1130,47 @@ pub enum TunnelCmd {
     Status(JsonFlag),
 }
 
+/// `apexrouter studio …` — the one multi-service verb (STUDIO.md S1).
+#[derive(Debug, Clone, Subcommand)]
+pub enum StudioCmd {
+    /// Bring the studio to full posture: wake → converge → rent.
+    ///
+    /// Requires `--yes` for any path that spends (wake/rent). Converge is free of new
+    /// billing but still wants `--yes` so a script cannot surprise you.
+    Up {
+        /// Required for any spending path.
+        #[arg(long)]
+        yes: bool,
+        /// Ceiling $/hr (still subject to the daemon hard ceiling). Default 1.50.
+        #[arg(long)]
+        max_hourly: Option<f64>,
+        /// Recipe id (default `studio-96gb`).
+        #[arg(long)]
+        recipe: Option<String>,
+        /// Override the recipe machine pin.
+        #[arg(long)]
+        machine_id: Option<u64>,
+        /// Pin a specific offer (skips search).
+        #[arg(long)]
+        offer_id: Option<u64>,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Park the studio box (disk held). Never destroys.
+    Down {
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Facts + computed liveness for the active studio.
+    Status {
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// `apexrouter approvals …`.
 #[derive(Debug, Clone, Subcommand)]
 pub enum ApprovalsCmd {
@@ -1586,6 +1633,7 @@ impl Command {
                 TunnelCmd::Status(_) => Need::ReadState,
                 _ => Need::Mutate,
             },
+            Command::Studio { .. } => Need::Mutate,
             Command::Vast { cmd } => match cmd {
                 // The cached listing: the ledger is a file, and a box that is billing must
                 // stay visible when the daemon is not running.
@@ -1735,6 +1783,11 @@ impl Command {
                 TunnelCmd::Status(a) => a.json,
                 TunnelCmd::Up { json, .. } => *json,
                 TunnelCmd::Down { .. } => false,
+            },
+            Command::Studio { cmd } => match cmd {
+                StudioCmd::Status { json }
+                | StudioCmd::Up { json, .. }
+                | StudioCmd::Down { json } => *json,
             },
             Command::Approvals { cmd } => match cmd {
                 ApprovalsCmd::Ls(a) => a.json,

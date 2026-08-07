@@ -32,6 +32,7 @@ pub mod route;
 pub mod serve;
 pub mod smoke;
 pub mod status;
+pub mod studio;
 pub mod swap;
 pub mod switch;
 pub mod token;
@@ -132,6 +133,7 @@ pub async fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Command::Provider { cmd } => provider::run(&ctx, cmd).await,
         Command::Vast { cmd } => vast::run(&ctx, cmd).await,
         Command::Tunnel { cmd } => tunnel::run(&ctx, cmd).await,
+        Command::Studio { cmd } => studio::run(&ctx, cmd).await,
         Command::Approvals { cmd } => approvals::run(&ctx, cmd).await,
         Command::Hf { cmd } => hf::run(&ctx, cmd).await,
         Command::Usage(a) => usage::run(&ctx, a).await,

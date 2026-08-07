@@ -1416,7 +1416,7 @@ fn tunnel_slot() -> &'static RwLock<Option<Arc<dyn Tunnels>>> {
 }
 
 /// The vast client, or a `503` that names the credential that is probably missing.
-fn require_vast() -> Result<Arc<dyn VastApi>, ApiError> {
+pub(crate) fn require_vast() -> Result<Arc<dyn VastApi>, ApiError> {
     vast_api().ok_or_else(no_vast_client)
 }
 
@@ -1431,7 +1431,7 @@ fn no_vast_client() -> ApiError {
 }
 
 /// The tunnel supervisor, or a `503`.
-fn require_tunnels() -> Result<Arc<dyn Tunnels>, ApiError> {
+pub(crate) fn require_tunnels() -> Result<Arc<dyn Tunnels>, ApiError> {
     tunnels().ok_or_else(|| {
         ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,

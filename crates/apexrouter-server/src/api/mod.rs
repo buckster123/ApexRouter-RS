@@ -41,6 +41,7 @@ pub mod requests;
 pub mod rig;
 pub mod routes;
 pub mod snapshot;
+pub mod studio;
 pub mod usage;
 pub mod vast;
 
