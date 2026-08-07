@@ -17,7 +17,7 @@
 //! file lock, so every call here is wrapped in `spawn_blocking`.
 
 use crate::api::rig::{local_model_list, rig_snapshot};
-use crate::api::{bind_alias, register_backend, ApiError, ApiResult};
+use crate::api::{bind_alias, register_started, ApiError, ApiResult};
 use crate::state::AppState;
 use apexrouter_core::catalog;
 use apexrouter_core::error::Result as CoreResult;
@@ -321,7 +321,8 @@ async fn launch(
         .await
         .map_err(ApiError::from)?;
 
-    register_backend(state, backend.clone());
+    // Fresh process — arm accepting so a prior drain on this id cannot strand Ready.
+    register_started(state, backend.clone());
 
     if let Some(alias) = alias {
         if let Err(report) = bind_alias(state, &alias, &backend.id) {

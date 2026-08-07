@@ -40,10 +40,9 @@ use crate::relay::{
 use crate::resolve::{RequestClass, RouteError, UnknownModelPolicy};
 use crate::{Router, COLLAPSE_LOG_CAPACITY, RING_CAPACITY};
 
-use apexrouter_core::secret::Secret;
 use apexrouter_core::upstream::{join_v1, parse_timings, parse_usage, Timings, UsageFields};
 use apexrouter_protocol::{
-    Alias, BackendId, CostEstimate, CredentialSource, Event, Protocol, RequestId, RequestRecord,
+    AlertLevel, Alias, BackendId, CostEstimate, Event, Protocol, RequestId, RequestRecord,
     RouteReason, TokenCount, UsageRecord,
 };
 use axum::body::Body;
@@ -270,6 +269,24 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
             }
         };
 
+        // Rule 4: an exact upstream id on several backends. resolve() deliberately does not
+        // emit the one-shot Alert (it is sync and owns no bus); the handler does, once per
+        // dispatch, so operators see the collision without grepping response headers.
+        if matches!(plan.reason, RouteReason::ImplicitMulti) && r.events.receiver_count() > 0 {
+            let model = pk.model.as_deref().unwrap_or("");
+            let _ = r.events.send(Event::Alert {
+                level: AlertLevel::Info,
+                message: format!(
+                    "model `{model}` matches more than one backend; using \
+                     [router] implicit_strategy — pin with `<backend_id>/{model}` or an alias"
+                ),
+                action: Some(format!(
+                    "apexrouter route set <alias> --target <backend_id>/{model}"
+                )),
+                id: format!("route.implicit_multi.{model}"),
+            });
+        }
+
         let mut draft = RecordDraft {
             id,
             started,
@@ -380,6 +397,16 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
                 continue;
             }
 
+            // Per-backend retry budget: a flapping backend must not absorb unlimited
+            // failover retries. First attempt is free; retries spend a token.
+            if draft.attempts > 0 && !cand.backend.retry_bucket.try_take() {
+                tracing::debug!(
+                    backend = %meta.id,
+                    "retry budget exhausted; skipping candidate"
+                );
+                continue;
+            }
+
             let mut guard = match InFlightGuard::acquire(
                 &cand.backend,
                 pk.bytes,
@@ -476,8 +503,10 @@ pub async fn proxy_handler(State(r): State<Router>, req: axum::extract::Request)
 
             // Outbound headers are CONSTRUCTED: the inbound map is never cloned, so a client's
             // `Authorization` — or an Anthropic client's `x-api-key` — cannot reach a third party.
-            let cred = credential_for(&meta.credential).await;
-            let mut out_headers = outbound_headers(&headers, cred.as_ref(), &[]);
+            // The credential was materialised at upsert onto `LiveBackend` — no FS/env on the
+            // request path (invariant 2).
+            let cred_slot = cand.backend.credential.load_full();
+            let mut out_headers = outbound_headers(&headers, cred_slot.as_ref().as_ref(), &[]);
             if !out_headers.contains_key("x-request-id") {
                 set(&mut out_headers, "x-request-id", &id.to_string());
             }
@@ -930,27 +959,6 @@ fn upstream_url(base_url: &str, path: &str, query: Option<&str>) -> String {
     match query {
         Some(q) if !q.is_empty() => format!("{joined}?{q}"),
         _ => joined,
-    }
-}
-
-/// The backend's own credential, resolved from its *description*.
-///
-/// `Managed`/`Instance` sources need `Paths` and the credential store, which the request path
-/// deliberately does not hold; they resolve to `None` here and are supplied by the supervisor
-/// when it builds the backend.
-async fn credential_for(src: &CredentialSource) -> Option<Secret<String>> {
-    let raw = match src {
-        CredentialSource::Env { var } => std::env::var(var).ok()?,
-        CredentialSource::File { path } => tokio::fs::read_to_string(path).await.ok()?,
-        CredentialSource::None | CredentialSource::Managed { .. } | CredentialSource::Instance => {
-            return None
-        }
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(Secret::new(trimmed.to_owned()))
     }
 }
 
@@ -1705,8 +1713,8 @@ mod tests {
     use apexrouter_core::paths::Paths;
     use apexrouter_core::usage::UsageWriter;
     use apexrouter_protocol::{
-        Backend, BackendKind, BackendLimits, BackendSelector, Health, ModelRoute, Provenance,
-        RetryPolicy, RouteFile, RouteFilter, RouteTarget, Strategy, UpstreamModel,
+        Backend, BackendKind, BackendLimits, BackendSelector, CredentialSource, Health, ModelRoute,
+        Provenance, RetryPolicy, RouteFile, RouteFilter, RouteTarget, Strategy, UpstreamModel,
     };
     use axum::body::to_bytes as body_to_bytes;
     use axum::extract::Request;

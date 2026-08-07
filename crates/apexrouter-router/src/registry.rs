@@ -48,7 +48,8 @@
 use crate::breaker::Breaker;
 use crate::limits::TokenBucket;
 use apexrouter_core::config::RouterCfg;
-use apexrouter_protocol::{AlertLevel, Alias, Backend, BackendId, Event};
+use apexrouter_core::secret::Secret;
+use apexrouter_protocol::{AlertLevel, Alias, Backend, BackendId, CredentialSource, Event};
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -73,6 +74,10 @@ pub struct LiveBackend {
     pub breaker: Breaker,
     /// Per-backend retry budget, so a struggling backend cannot be amplified into a storm.
     pub retry_bucket: TokenBucket,
+    /// Resolved bearer for `Env`/`File` credentials, materialised at upsert so the request
+    /// path never does filesystem or env I/O. `Managed`/`Instance` stay `None` here — the
+    /// supervisor puts those on the description when it builds the backend.
+    pub credential: ArcSwap<Option<Secret<String>>>,
     /// The router's **own** in-flight counter — `/slots` 501s on `--no-slots` builds.
     pub inflight: AtomicU32,
     /// False while draining.
@@ -101,6 +106,24 @@ fn unpoison<T>(r: Result<T, std::sync::PoisonError<T>>) -> T {
     r.unwrap_or_else(|p| p.into_inner())
 }
 
+/// Materialise Env/File credentials into memory. Called at upsert, **not** on the request
+/// path — invariant 2 forbids `stat`/`read` under a chat completion.
+fn materialise_credential(src: &CredentialSource) -> Option<Secret<String>> {
+    let raw = match src {
+        CredentialSource::Env { var } => std::env::var(var).ok()?,
+        CredentialSource::File { path } => std::fs::read_to_string(path).ok()?,
+        CredentialSource::None | CredentialSource::Managed { .. } | CredentialSource::Instance => {
+            return None
+        }
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(Secret::new(trimmed.to_owned()))
+    }
+}
+
 impl LiveBackend {
     /// Create live state for a backend seen for the first time.
     pub fn new(b: Backend, cfg: &RouterCfg) -> Arc<LiveBackend> {
@@ -108,12 +131,14 @@ impl LiveBackend {
         let id = b.id.clone();
         let accepting = b.enabled;
         let models: Vec<String> = b.models.iter().map(|m| m.id.clone()).collect();
+        let credential = materialise_credential(&b.credential);
         Arc::new(LiveBackend {
             id,
             meta: ArcSwap::from_pointee(b),
             sem: Arc::new(Semaphore::new(permits as usize)),
             breaker: Breaker::default(),
-            retry_bucket: TokenBucket::default(),
+            retry_bucket: TokenBucket::new(cfg.retry_budget_per_min),
+            credential: ArcSwap::from_pointee(credential),
             inflight: AtomicU32::new(0),
             accepting: AtomicBool::new(accepting),
             latency: LatencyEwma::default(),
@@ -125,7 +150,11 @@ impl LiveBackend {
     ///
     /// The permit pool, breaker, retry bucket, in-flight gauge, drain flag, latency EWMA and
     /// the prober's model index all survive: this replaces the *description* and nothing else.
+    /// Credentials are re-materialised so a rotated env var or key file lands on the next
+    /// upsert without a request-path re-read.
     pub fn update_meta(&self, b: Backend) {
+        self.credential
+            .store(Arc::new(materialise_credential(&b.credential)));
         self.meta.store(Arc::new(b));
     }
 

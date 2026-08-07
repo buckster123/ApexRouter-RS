@@ -17,7 +17,7 @@
 //! house pattern for that — a `202` with a `JobRecord` immediately, and S-04's `JobRegistry`
 //! guaranteeing the row is flipped to `Failed` on every error path, including a panic.
 
-use super::{bind_alias, register_backend, ApiError, ApiResult};
+use super::{bind_alias, register_backend, register_started, ApiError, ApiResult};
 use crate::state::AppState;
 use apexrouter_core::argv;
 use apexrouter_core::error::Error as CoreError;
@@ -116,7 +116,9 @@ pub async fn create(
             h.progress(Some(20.0), "starting, waiting for the health gate");
             let backend = state.supervisor.up_forced(plan, None, force).await?;
             let id = backend.id.clone();
-            register_backend(&state, backend);
+            // New process under a possibly recycled id: must arm `accepting`, not inherit a
+            // drain flag from the corpse (register_started, not register_backend).
+            register_started(&state, backend);
             if let Some(alias) = alias {
                 h.progress(Some(90.0), format!("binding {alias}"));
                 bind(&state, &alias, &id)?;
@@ -133,7 +135,7 @@ pub async fn create(
         .await
         .map_err(ApiError::from)?;
     let id = backend.id.clone();
-    register_backend(&s, backend);
+    register_started(&s, backend);
 
     if let Some(alias) = alias {
         bind(&s, &alias, &id).map_err(|e| {
@@ -190,7 +192,7 @@ pub async fn restart(
         .map_err(ApiError::from)?;
     let backend = s.supervisor.up(plan, None).await.map_err(ApiError::from)?;
     let new_id = backend.id.clone();
-    register_backend(&s, backend);
+    register_started(&s, backend);
 
     for alias in &previous.alias_bindings {
         if let Err(report) = bind_alias(&s, alias, &new_id) {

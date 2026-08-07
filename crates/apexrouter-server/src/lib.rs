@@ -277,6 +277,12 @@ pub async fn build_state(
     // lazy call becomes a no-op that returns this same log.
     api::requests::attach(&state.tx);
 
+    // Jobs: crash-recovery and WS broadcasts must be live *before* any handler can
+    // `spawn_with`. Lazy `ensure_wired` on the first `/v1/jobs` call left Pending rows from a
+    // previous daemon open, and UI endpoint boots via `?no_wait=true` never hit that path —
+    // jobs stayed memory-only. Wiring here makes every spawn site a no-op for ensure.
+    state.jobs.ensure_wired(&state.tx, &state.paths);
+
     Ok(state)
 }
 
