@@ -44,6 +44,10 @@ tags:
     description: Managed providers and their credential sources.
   - name: vast
     description: The rented fleet. Every mutating path is gated behind SpendApproval.
+  - name: studio
+    description: >-
+      Multi-service studio (LLM + Comfy lanes). One verb: up resolves wake → converge → rent;
+      down parks only. Money paths require SpendApproval.
   - name: hf
     description: Hugging Face search and downloads.
   - name: observability
@@ -1737,6 +1741,78 @@ paths:
               schema:
                 type: array
                 items: { $ref: '#/components/schemas/TunnelStatus' }
+
+  /v1/studio:
+    get:
+      operationId: studioStatus
+      x-listener: [control]
+      tags: [studio]
+      summary: Active studio status — facts, tunnels, computed service liveness, next up path.
+      description: >-
+        Reads `$STATE/studio.json` + services + tunnels and the fleet cache. `next_up_path`
+        is which arm of `POST /v1/studio/up` would run: wake | converge | rent.
+      responses:
+        '200':
+          description: Studio status snapshot.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StudioStatus' }
+
+  /v1/studio/up:
+    post:
+      operationId: studioUp
+      x-listener: [control]
+      tags: [studio]
+      summary: One verb — wake → converge → rent under SpendApproval.
+      description: >-
+        Resolution order (STUDIO.md S1): (1) studio names a parked instance → wake and
+        restore all tunnels; (2) instance is running → converge tunnels + ServiceRecords;
+        (3) no studio / box gone → rent from the studio-96gb recipe (or body.recipe_id),
+        multi-tunnel, write records, bind OpenAI aliases. Rent and wake require
+        `confirm: true` and `max_usd_per_hour`. Answers 202 with a JobRecord.
+      parameters:
+        - name: source
+          in: query
+          schema: { type: string, description: 'cli | mcp | web_ui | api' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StudioUpRequest' }
+      responses:
+        '202':
+          description: The studio job (wake, converge, or rent).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/JobRecord' }
+        '409':
+          description: Confirmation required or ceiling exceeded; body carries path and rate.
+
+  /v1/studio/down:
+    post:
+      operationId: studioDown
+      x-listener: [control]
+      tags: [studio]
+      summary: Park the studio box. Never destroys.
+      description: >-
+        Drops tunnels, parks the instance (disk held, storage still bills), marks services
+        desired=Stopped, keeps StudioRecord so `studio up` can wake. Destruction stays on
+        `DELETE /v1/vast/instances/{id}?confirm=true` only.
+      responses:
+        '200':
+          description: Park receipt.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance_id: { type: integer, format: int64 }
+                  phase: { $ref: '#/components/schemas/BootPhase' }
+                  disk_gb: { type: number, nullable: true }
+                  weekly_disk_usd: { type: number, nullable: true }
+                  note: { type: string }
+        '404':
+          description: No active studio.
 
   /v1/approvals:
     get:
@@ -3470,3 +3546,34 @@ components:
         imported: { type: integer, format: int64 }
         skipped: { type: integer, format: int64 }
         warnings: { type: array, items: { type: string } }
+
+    StudioUpRequest:
+      type: object
+      required: [confirm, max_usd_per_hour]
+      properties:
+        recipe_id:
+          type: string
+          nullable: true
+          description: Default studio-96gb.
+        confirm: { type: boolean }
+        max_usd_per_hour: { type: number, description: Ceiling still subject to daemon hard ceiling. }
+        machine_id: { type: integer, format: int64, nullable: true }
+        offer_id: { type: integer, format: int64, nullable: true }
+    StudioUpPath:
+      type: string
+      enum: [wake, converge, rent]
+    StudioStatus:
+      type: object
+      required: [next_up_path, summary]
+      properties:
+        studio: { type: object, nullable: true, additionalProperties: true }
+        services: { type: array, items: { type: object, additionalProperties: true } }
+        service_status: { type: array, items: { type: object, additionalProperties: true } }
+        tunnels:
+          type: array
+          items: { $ref: '#/components/schemas/TunnelStatus' }
+        instance_phase:
+          oneOf: [{ $ref: '#/components/schemas/BootPhase' }, { type: 'null' }]
+        dph_total: { type: number, nullable: true }
+        next_up_path: { $ref: '#/components/schemas/StudioUpPath' }
+        summary: { type: string }
