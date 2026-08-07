@@ -44,6 +44,7 @@ use apexrouter_protocol::{
     OfferQuery, OfferSearchResult, PriceSource, ProfileId, RentRequest, TunnelSpec, TunnelStatus,
     VastAccount, VastInstance,
 };
+use apexrouter_providers::checks::{orphan_report, OrphanReport};
 use apexrouter_providers::vast::{
     constraint_failures, destroy_within, gpu_name_vocabulary, profile_to_query, restart_download,
     sample_download, search_unified, watch_boot, QueryOverrides, VastApi,
@@ -82,6 +83,11 @@ pub fn router() -> axum::Router<Arc<AppState>> {
         .route("/v1/vast/offers/search", post(search_offers))
         .route("/v1/vast/instances", get(list_instances).post(rent))
         .route("/v1/vast/instances/{id}", axum::routing::delete(destroy))
+        .route("/v1/vast/instances/{id}/forget", post(forget_instance))
+        .route(
+            "/v1/vast/orphans",
+            get(list_orphans).post(reconcile_orphans),
+        )
         .route("/v1/vast/instances/{id}/log", get(instance_log))
         .route(
             "/v1/vast/instances/{id}/restart-download",
@@ -440,6 +446,136 @@ pub async fn list_instances(State(s): State<Arc<AppState>>) -> ApiResult<Vec<Vas
         },
     );
     Ok(Json(instances))
+}
+
+/// `GET /v1/vast/orphans` — ledger vs live fleet disagreement (same math as `doctor`'s
+/// `vast.orphans` check). Pure read.
+pub async fn list_orphans(State(s): State<Arc<AppState>>) -> ApiResult<OrphanReport> {
+    let api = require_vast()?;
+    let live = api.instances().await.map_err(ApiError::from)?;
+    let credit = api.account().await.ok().map(|a| a.credit);
+    s.update_fleet(live.clone(), credit);
+    let active = Ledger::open(&s.paths)
+        .and_then(|l| l.active())
+        .map_err(ApiError::from)?;
+    Ok(Json(orphan_report(&active, &live)))
+}
+
+/// `POST /v1/vast/orphans?confirm=true` — mark every **stale** ledger row (and unlinked
+/// reservations) as gone. **Bookkeeping only** — never calls destroy, never stops a live box.
+///
+/// Untracked live instances are **not** touched: those are real money and need a human.
+pub async fn reconcile_orphans(
+    State(s): State<Arc<AppState>>,
+    Query(q): Query<ConfirmQuery>,
+) -> Result<Response, ApiError> {
+    if !q.confirm.unwrap_or(false) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": {
+                    "kind": "confirmation_required",
+                    "message": "re-send with ?confirm=true — this only clears ledger lies \
+                                after you have checked the vast console",
+                    "param": "confirm",
+                }
+            })),
+        )
+            .into_response());
+    }
+    let api = require_vast()?;
+    let live = api.instances().await.map_err(ApiError::from)?;
+    let ledger = Ledger::open(&s.paths).map_err(ApiError::from)?;
+    let active = ledger.active().map_err(ApiError::from)?;
+    let report = orphan_report(&active, &live);
+
+    let mut cleared: Vec<u64> = Vec::new();
+    let mut unlinked_cleared = 0usize;
+    for id in &report.stale {
+        ledger
+            .mark_gone(
+                Some(InstanceId(*id)),
+                format!(
+                    "reconcile: vast no longer lists instance {id}; bookkeeping Destroyed \
+                     (no API destroy issued)"
+                ),
+            )
+            .map_err(ApiError::from)?;
+        cleared.push(*id);
+    }
+    // Unlinked reservations (no instance id) — mark gone without an id so they leave active().
+    for row in active.iter().filter(|r| r.instance_id.is_none()) {
+        ledger
+            .mark_gone(
+                None,
+                format!(
+                    "reconcile: unresolved {:?} row seq {} cleared (no instance id)",
+                    row.state, row.seq
+                ),
+            )
+            .map_err(ApiError::from)?;
+        unlinked_cleared += 1;
+    }
+
+    Ok(Json(serde_json::json!({
+        "cleared_stale": cleared,
+        "cleared_unlinked": unlinked_cleared,
+        "untracked_left": report.untracked,
+        "note": "untracked live instances are never auto-forgotten — they may still bill",
+    }))
+    .into_response())
+}
+
+/// `POST /v1/vast/instances/{id}/forget?confirm=true` — one stale ledger row.
+///
+/// Refuses if the instance is still on the live fleet (that would hide a billing box).
+pub async fn forget_instance(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ConfirmQuery>,
+) -> Result<Response, ApiError> {
+    let id = parse_instance(&id)?;
+    if !q.confirm.unwrap_or(false) {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": {
+                    "kind": "confirmation_required",
+                    "message": format!(
+                        "forgetting {0} only clears the ledger — re-send with ?confirm=true \
+                         after checking vast no longer lists it",
+                        id.0
+                    ),
+                    "param": "confirm",
+                }
+            })),
+        )
+            .into_response());
+    }
+    let api = require_vast()?;
+    if let Ok(Some(_)) = api.instance(id).await {
+        return Err(ApiError::conflict(format!(
+            "instance {} is still on the live fleet — destroy it first if you mean to stop \
+             billing, do not forget a live box",
+            id.0
+        )));
+    }
+    let ledger = Ledger::open(&s.paths).map_err(ApiError::from)?;
+    ledger
+        .mark_gone(
+            Some(id),
+            format!(
+                "forget: operator cleared stale ledger for {}; vast does not list it \
+                 (no API destroy issued)",
+                id.0
+            ),
+        )
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({
+        "instance_id": id,
+        "forgotten": true,
+    }))
+    .into_response())
 }
 
 // ----------------------------------------------------------------------------------------

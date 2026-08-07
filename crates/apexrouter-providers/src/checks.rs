@@ -571,7 +571,7 @@ impl Check for VastOrphans {
 }
 
 /// What the ledger and the fleet disagree about.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OrphanReport {
     /// Billing right now with no ledger row: **we are paying for these and did not know**.
     pub untracked: Vec<u64>,
@@ -603,7 +603,11 @@ impl OrphanReport {
                     "{} reservation(s) whose create call was never confirmed",
                     self.unlinked
                 ),
-                Some("`apexrouter vast ls --orphans` shows what to reconcile".to_owned()),
+                Some(
+                    "`apexrouter vast ls --orphans` lists them; after checking the console, \
+                     `apexrouter vast reconcile --yes` clears bookkeeping only"
+                        .to_owned(),
+                ),
             );
         }
         if !self.stale.is_empty() {
@@ -614,7 +618,14 @@ impl OrphanReport {
                     self.stale.len(),
                     join_ids(&self.stale)
                 ),
-                Some("`apexrouter vast ls --orphans` reconciles them".to_owned()),
+                Some(format!(
+                    "`apexrouter vast ls --orphans` then `apexrouter vast forget {} --yes` \
+                     (or `vast reconcile --yes` for all stale) — bookkeeping only, no destroy",
+                    self.stale
+                        .first()
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "<id>".to_owned())
+                )),
             );
         }
         (

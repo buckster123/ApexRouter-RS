@@ -122,9 +122,9 @@ pub async fn reconcile_ledger_once(state: Arc<AppState>) {
                         &format!("vast.ledger.missing_live.{}", id.0),
                         format!(
                             "ledger still counts instance {} as active (state {:?}) but vast \
-                             does not list it — confirm on the console or run \
-                             `apexrouter vast ls --orphans`",
-                            id.0, row.state
+                             does not list it — confirm on the console, then \
+                             `apexrouter vast forget {} --yes`",
+                            id.0, row.state, id.0
                         ),
                     );
                 }

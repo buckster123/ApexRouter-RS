@@ -71,6 +71,8 @@ pub async fn run(ctx: &Ctx, cmd: &VastCmd) -> anyhow::Result<()> {
         VastCmd::Offers(args) => offers(ctx, args).await,
         VastCmd::Rent(args) => rent(ctx, args).await,
         VastCmd::Ls { orphans, json } => list(ctx, *orphans, *json).await,
+        VastCmd::Forget { id, yes, json } => forget(ctx, *id, *yes, *json).await,
+        VastCmd::Reconcile { yes, json } => reconcile(ctx, *yes, *json).await,
         VastCmd::Watch { id } => watch(ctx, *id).await,
         VastCmd::Log { id, follow } => log(ctx, *id, *follow).await,
         VastCmd::Diagnose { id, json } => {
@@ -565,11 +567,22 @@ pub fn print_quote(q: &RentPreview) {
 
 /// `vast ls` — live instances from the daemon, the ledger when there is none.
 ///
+/// With `--orphans`, the daemon path returns the ledger↔fleet report (not the live list);
+/// that is what doctor points operators at.
+///
 /// # Errors
 /// A ledger that cannot be read.
 async fn list(ctx: &Ctx, orphans: bool, json: bool) -> anyhow::Result<()> {
     let serving = ctx.serving(Need::ReadState).await?;
     if let Serving::Daemon(c) = &serving {
+        if orphans {
+            let report: serde_json::Value = c.get("/v1/vast/orphans").await?;
+            if json {
+                return render::print_json(ServedBy::Daemon, render::now_unix(), false, &report);
+            }
+            print_orphan_report(&report);
+            return Ok(());
+        }
         let live: Vec<VastInstance> = c.get("/v1/vast/instances").await?;
         if json {
             return render::print_json(ServedBy::Daemon, render::now_unix(), false, &live);
@@ -609,23 +622,127 @@ async fn list(ctx: &Ctx, orphans: bool, json: bool) -> anyhow::Result<()> {
     }
 
     // Offline: the ledger. `active()` is every row without a verified destroy, which is
-    // exactly the set that may still be billing.
+    // exactly the set that may still be billing. Without a live fleet we cannot classify
+    // orphans — print active rows and say so.
     let rows = Ledger::open(&ctx.paths)?.active()?;
-    let rows: Vec<LedgerRow> = if orphans {
-        rows.into_iter()
-            .filter(|r| r.state != LedgerState::Destroyed)
-            .collect()
-    } else {
-        rows
-    };
+    if orphans {
+        if json {
+            return render::print_json(
+                serving.served_by(),
+                render::now_unix(),
+                true,
+                &serde_json::json!({
+                    "stale": rows.iter().filter_map(|r| r.instance_id.map(|i| i.0)).collect::<Vec<_>>(),
+                    "untracked": [],
+                    "unlinked": rows.iter().filter(|r| r.instance_id.is_none()).count(),
+                    "note": "offline: cannot compare to live fleet; start the daemon for a real report",
+                }),
+            );
+        }
+        render::print_offline_notice();
+        render::print_line(
+            "offline: cannot compare ledger to live fleet — start a daemon, then \
+             `apexrouter vast ls --orphans`",
+        );
+    }
     if json {
         return render::print_json(serving.served_by(), render::now_unix(), true, &rows);
     }
-    render::print_offline_notice();
+    if !orphans {
+        render::print_offline_notice();
+    }
     render::print_table(
         &["INSTANCE", "STATE", "GPU", "N", "$/HR", "SINCE", "NOTE"],
         rows.iter().map(ledger_row).collect(),
     );
+    Ok(())
+}
+
+/// Human view of the orphans JSON object.
+fn print_orphan_report(report: &serde_json::Value) {
+    let stale = report
+        .get("stale")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let untracked = report
+        .get("untracked")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let unlinked = report.get("unlinked").and_then(|v| v.as_u64()).unwrap_or(0);
+    if stale.is_empty() && untracked.is_empty() && unlinked == 0 {
+        render::print_line("the ledger and the fleet agree");
+        return;
+    }
+    if !stale.is_empty() {
+        let ids: Vec<String> = stale
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n.to_string()))
+            .collect();
+        render::print_line(&format!(
+            "stale (ledger active, vast gone): {} — clear with `apexrouter vast forget <id> --yes` \
+             or `apexrouter vast reconcile --yes`",
+            ids.join(", ")
+        ));
+    }
+    if !untracked.is_empty() {
+        let ids: Vec<String> = untracked
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n.to_string()))
+            .collect();
+        render::print_line(&format!(
+            "UNTRACKED (billing with no ledger): {} — import or destroy on the console",
+            ids.join(", ")
+        ));
+    }
+    if unlinked > 0 {
+        render::print_line(&format!(
+            "{unlinked} unresolved reservation(s) with no instance id — \
+             `apexrouter vast reconcile --yes` after checking the console"
+        ));
+    }
+}
+
+/// `vast forget <id> --yes` — bookkeeping Destroyed for a stale ledger row.
+async fn forget(ctx: &Ctx, id: u64, yes: bool, json: bool) -> anyhow::Result<()> {
+    if !yes {
+        anyhow::bail!(
+            "forgetting {id} only clears the local ledger (no vast destroy) — re-run with --yes \
+             after checking the instance is gone on the console"
+        );
+    }
+    let client = ctx.serving(Need::Mutate).await?.into_daemon()?;
+    let body: serde_json::Value = client
+        .post(
+            &format!("/v1/vast/instances/{id}/forget?confirm=true"),
+            &serde_json::json!({}),
+        )
+        .await?;
+    if json {
+        return render::print_json(ServedBy::Daemon, render::now_unix(), false, &body);
+    }
+    render::print_line(&format!(
+        "cleared stale ledger row for instance {id} (no destroy issued)"
+    ));
+    Ok(())
+}
+
+/// `vast reconcile --yes` — clear all stale + unlinked bookkeeping rows.
+async fn reconcile(ctx: &Ctx, yes: bool, json: bool) -> anyhow::Result<()> {
+    if !yes {
+        anyhow::bail!(
+            "reconcile clears stale ledger rows only (never destroys a live box) — re-run with --yes"
+        );
+    }
+    let client = ctx.serving(Need::Mutate).await?.into_daemon()?;
+    let body: serde_json::Value = client
+        .post("/v1/vast/orphans?confirm=true", &serde_json::json!({}))
+        .await?;
+    if json {
+        return render::print_json(ServedBy::Daemon, render::now_unix(), false, &body);
+    }
+    render::print_line(&body.to_string());
     Ok(())
 }
 

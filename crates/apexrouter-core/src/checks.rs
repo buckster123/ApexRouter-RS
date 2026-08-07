@@ -470,18 +470,23 @@ impl Check for PortCheck {
                     None,
                 )
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => result(
-                &self.id,
-                &self.label,
-                // Warn, not Fail: the usual holder is our own daemon, which is the
-                // desired state. Identifying the holder needs `/proc`, which is
-                // `apexrouter status`'s job, not a check's.
-                CheckStatus::Warn,
-                format!("{addr} is already bound — by our daemon, or by something else"),
-                Some(
-                    "`apexrouter status` says whether it is ours; otherwise stop endpoint_proxy.py",
-                ),
-            ),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // Prefer a health probe over "maybe ours": a live apexrouter answers
+                // product=apexrouter on both listeners. LocalRouter / foreign holders do not.
+                match probe_our_listener(addr, self.control).await {
+                    Some(detail) => result(&self.id, &self.label, CheckStatus::Pass, detail, None),
+                    None => result(
+                        &self.id,
+                        &self.label,
+                        CheckStatus::Warn,
+                        format!("{addr} is bound by something that is not answering as apexrouter"),
+                        Some(
+                            "`apexrouter status` names our daemon; otherwise stop \
+                             endpoint_proxy.py or whatever holds the port",
+                        ),
+                    ),
+                }
+            }
             Err(e) => result(
                 &self.id,
                 &self.label,
@@ -491,6 +496,30 @@ impl Check for PortCheck {
             ),
         }
     }
+}
+
+/// Ask the bound port for house `/health`. Control answers `product=apexrouter`; the proxy
+/// answers the same product field on the legacy-shaped body. Anything else (or no answer)
+/// is treated as a foreign holder.
+async fn probe_our_listener(addr: std::net::SocketAddr, control: bool) -> Option<String> {
+    let url = format!("http://{addr}/health");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(800))
+        .build()
+        .ok()?;
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let product = v.get("product").and_then(|p| p.as_str())?;
+    if product != "apexrouter" {
+        return None;
+    }
+    let which = if control { "control" } else { "proxy" };
+    Some(format!(
+        "{addr} is bound by our {which} listener (product=apexrouter)"
+    ))
 }
 
 // ---------------------------------------------------------------------------------------

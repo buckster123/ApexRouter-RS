@@ -925,9 +925,29 @@ pub enum VastCmd {
     Rent(VastRentArgs),
     /// Rented instances, from the ledger when the daemon is down.
     Ls {
-        /// Show only rows that are billing with no live record.
+        /// Ledger vs fleet disagreement (stale / untracked / unlinked).
         #[arg(long)]
         orphans: bool,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear one **stale** ledger row (instance gone from vast). Bookkeeping only.
+    Forget {
+        /// Instance id that vast no longer lists.
+        id: u64,
+        /// Required. Does not call vast destroy.
+        #[arg(long)]
+        yes: bool,
+        /// Print the JSON envelope and nothing else.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear every stale ledger row and unlinked reservation. Bookkeeping only.
+    Reconcile {
+        /// Required. Never touches untracked live instances.
+        #[arg(long)]
+        yes: bool,
         /// Print the JSON envelope and nothing else.
         #[arg(long)]
         json: bool,
@@ -1698,7 +1718,10 @@ impl Command {
                 VastCmd::Account(a) | VastCmd::GpuNames(a) | VastCmd::Favorites(a) => a.json,
                 VastCmd::Offers(a) => a.json,
                 VastCmd::Rent(a) => a.json,
-                VastCmd::Ls { json, .. } | VastCmd::Diagnose { json, .. } => *json,
+                VastCmd::Ls { json, .. }
+                | VastCmd::Diagnose { json, .. }
+                | VastCmd::Forget { json, .. }
+                | VastCmd::Reconcile { json, .. } => *json,
                 VastCmd::Watch { .. }
                 | VastCmd::Log { .. }
                 | VastCmd::RestartDownload { .. }

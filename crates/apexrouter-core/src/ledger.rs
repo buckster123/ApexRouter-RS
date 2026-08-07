@@ -190,6 +190,39 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Append a **bookkeeping** `Destroyed` row for an instance that is no longer on the
+    /// live fleet (or a reservation that never got an id).
+    ///
+    /// This does **not** call vast.ai and does **not** stop a billing box — it only clears a
+    /// ledger lie. The operator must have already confirmed the instance is gone (or never
+    /// existed). `destroyed_at_unix` is set so [`Self::active`] drops the id.
+    ///
+    /// # Errors
+    /// I/O on the ledger file.
+    pub fn mark_gone(
+        &self,
+        instance_id: Option<InstanceId>,
+        note: impl Into<String>,
+    ) -> Result<u64> {
+        let now = now_unix();
+        self.append(&LedgerRow {
+            seq: 0,
+            at_unix: now,
+            instance_id,
+            state: LedgerState::Destroyed,
+            offer_id: None,
+            profile: None,
+            gpu: None,
+            num_gpus: None,
+            dph: None,
+            approved_max_dph: None,
+            approval_source: None,
+            destroyed_at_unix: Some(now),
+            est_cost: CostEstimate::Unknown,
+            note: Some(note.into()),
+        })
+    }
+
     /// Append `Reserved` and hand back the guard. Nothing has been billed yet.
     pub fn reserve(&self, req: &RentRequest, approval: &SpendApproval) -> Result<PendingLaunch> {
         let approved_max_dph = approval.max_usd_per_hour().as_usd();
@@ -503,6 +536,24 @@ mod tests {
         let rows = l.rows().expect("rows");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows.iter().map(|r| r.seq).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn mark_gone_drops_an_instance_from_active() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let l = ledger(dir.path());
+        l.append(&row(LedgerState::Confirmed, Some(46_509_449)))
+            .expect("confirm");
+        assert_eq!(l.active().expect("active").len(), 1);
+        l.mark_gone(
+            Some(InstanceId(46_509_449)),
+            "stale ledger: vast no longer lists this instance",
+        )
+        .expect("mark gone");
+        assert!(
+            l.active().expect("active").is_empty(),
+            "Destroyed + destroyed_at must clear the active query"
+        );
     }
 
     #[test]

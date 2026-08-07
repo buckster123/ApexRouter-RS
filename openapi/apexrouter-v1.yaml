@@ -1477,6 +1477,58 @@ paths:
           description: Destroyed.
         '409': { $ref: '#/components/responses/ControlError' }
 
+  /v1/vast/instances/{id}/forget:
+    post:
+      operationId: vastForgetInstance
+      x-listener: [control]
+      tags: [vast]
+      summary: Clear a stale ledger row. Bookkeeping only — refuses if the instance is still live.
+      parameters:
+        - $ref: '#/components/parameters/InstanceId'
+        - name: confirm
+          in: query
+          required: true
+          description: Must be true. Does not call vast destroy.
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: Ledger row marked Destroyed.
+          content:
+            application/json:
+              schema: { type: object }
+        '409': { $ref: '#/components/responses/ControlError' }
+
+  /v1/vast/orphans:
+    get:
+      operationId: vastListOrphans
+      x-listener: [control]
+      tags: [vast]
+      summary: Ledger vs live fleet disagreement (stale, untracked, unlinked).
+      responses:
+        '200':
+          description: Orphan report.
+          content:
+            application/json:
+              schema: { type: object }
+    post:
+      operationId: vastReconcileOrphans
+      x-listener: [control]
+      tags: [vast]
+      summary: Clear every stale ledger row and unlinked reservation. Bookkeeping only.
+      parameters:
+        - name: confirm
+          in: query
+          required: true
+          description: Must be true. Never forgets untracked live instances.
+          schema: { type: boolean }
+      responses:
+        '200':
+          description: What was cleared.
+          content:
+            application/json:
+              schema: { type: object }
+        '409': { $ref: '#/components/responses/ControlError' }
+
   /v1/vast/instances/{id}/log:
     get:
       operationId: vastInstanceLog
